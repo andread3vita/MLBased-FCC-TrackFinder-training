@@ -13,6 +13,7 @@ import torch
 import wandb
 import warnings
 import random
+from src.models.Gatr_withModifications import ExampleWrapper
 
 from torch.utils.data import DataLoader
 from src.utils.parser_args import parser
@@ -42,27 +43,22 @@ def main():
 
     args = parser.parse_args()
     
-    missing_files = 0
-    for i in args.data_train:
-        if not os.path.isfile(i):
-            print("Missing File!", i)
-            missing_files += 1
+    valid_files = []
+    for file_path in args.data_train:
+        if os.path.isfile(file_path):
+            valid_files.append(file_path)
+        else:
+            print("Missing File!", file_path)
 
-    if missing_files > 0:
-        print(f"{missing_files} missing files. Quit.")
-        sys.exit(1)   
+    args.data_train = valid_files
+
+    if len(args.data_train) == 0:
+        print("No valid input files remaining. Quit.")
+        sys.exit(1)
         
     args = get_samples_steps_per_epoch(args)
-    args.local_rank = 0
     training_mode = not args.predict
     
-    
-    if training_mode:
-        train_loader, val_loader, data_config, train_input_names = train_load(args)
-    else:
-        test_loaders, data_config = test_load(args)
-
-    model = model_setup(args, data_config)
     if args.gpus:
         gpus = [int(i) for i in args.gpus.split(",")]
     else:
@@ -81,9 +77,9 @@ def main():
         print("USING TRAINING MODE")
 
         checkpoint_callback = ModelCheckpoint(
-            dirpath=args.model_prefix,  # checkpoints_path, # <--- specify this on the trainer itself for version control
+            dirpath=args.model_prefix,
             filename="_{epoch}_{step}",
-            every_n_train_steps=500,
+            every_n_train_steps=2000,
             save_top_k=-1,  # <--- this is important!
             save_weights_only=True,
         )
@@ -94,31 +90,33 @@ def main():
             checkpoint_callback,
             lr_monitor,
         ]
-        # only needed for the GNN baseline
+
         gpus = [int(i) for i in args.gpus.split(",")]
-        print("Using GPUs:", gpus)
         trainer = L.Trainer(
             callbacks=callbacks,
             accelerator="gpu",
             devices=gpus,
             default_root_dir=args.model_prefix,
             logger=wandb_logger,
-            # max_epochs=5,
+            max_epochs=args.num_epochs,
             strategy="ddp",
-            # limit_train_batches=20,
-            # limit_train_batches=890,
-            # gradient_clip_val=1.0,
             accumulate_grad_batches=2,
-            limit_val_batches=5,
+            limit_val_batches=10
         )
+
         args.local_rank = trainer.global_rank
         train_loader, val_loader, data_config, train_input_names = train_load(args)
+
+        model = model_setup(args, data_config)
+        if args.load_model_weights:
+
+            print("Loading model checkpoint from",args.load_model_weights)
+            model = ExampleWrapper.load_from_checkpoint(args.load_model_weights, args=args)
 
         trainer.fit(
             model=model,
             train_dataloaders=train_loader,
             val_dataloaders=val_loader,
-            # ckpt_path=args.load_model_weights,
         )
 
     elif args.data_test:
@@ -127,10 +125,16 @@ def main():
             accelerator="gpu",
             devices=[0],
             default_root_dir=args.model_prefix,
-            logger=wandb_logger,
-            # limit_val_batches=5,
+            logger=wandb_logger
         )
+        
+        test_loaders, data_config = test_load(args)
 
+        model = model_setup(args, data_config)
+        if args.load_model_weights:
+
+            print("Loading model checkpoint from",args.load_model_weights)
+            model = ExampleWrapper.load_from_checkpoint(args.load_model_weights, args=args)
 
         for name, get_test_loader in test_loaders.items():
             test_loader = get_test_loader()
@@ -143,5 +147,4 @@ def main():
 
 
 if __name__ == "__main__":
-    
     main()

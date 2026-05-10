@@ -111,7 +111,7 @@ def _load_next(data_config, filelist, load_range, options):
             fid = int(match.group(1))
     
         fileIDs.extend([fid] * n_events)
-        eventIDs.extend(np.arange(n_events))
+        eventIDs = table["_mask"][:, 3, 0].astype(int)
 
     fileIDs = np.array(fileIDs)
     eventIDs = np.array(eventIDs)

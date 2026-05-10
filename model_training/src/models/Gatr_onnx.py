@@ -357,7 +357,7 @@ class ExampleWrapper(L.LightningModule):  # nn.Module L.LightningModule
                 predict=True,
             )
 
-   def configure_optimizers(self):
+    def configure_optimizers(self):
 
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.start_lr)
 

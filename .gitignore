@@ -6,3 +6,4 @@ std/
 __pycache__/
 Pythia/
 wandb/
+*.pyc

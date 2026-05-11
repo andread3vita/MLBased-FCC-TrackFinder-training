@@ -75,6 +75,7 @@ inputs:
          - [hit_mask, null]
          - [part_mask, null]
          - [produced_by_secondary, null]
+         - [event_number, null]
 
 labels:
   

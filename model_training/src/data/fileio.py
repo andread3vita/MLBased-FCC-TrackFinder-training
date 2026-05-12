@@ -4,7 +4,8 @@ import tqdm
 import traceback
 from src.data.tools import _concat
 from src.logger.logger import _logger
-
+import re
+import numpy as np
 
 def _read_hdf5(filepath, branches, load_range=None):
     import tables
@@ -78,6 +79,20 @@ def _read_files(filelist, branches, load_range=None, show_progressbar=False, **k
                 a = _read_hdf5(filepath, branches, load_range=load_range)
             elif ext == '.root':
                 a = _read_root(filepath, branches, load_range=load_range, treename=kwargs.get('treename', None))
+
+                base = os.path.basename(filepath)
+                match = re.search(r'(\d+)', base)
+                fid = 0
+                if match:
+                    fid = int(match.group(1))
+
+                if a is not None:
+                    a = ak.with_field(
+                        a,
+                        np.full(len(a), fid),
+                        "file_number"
+                    )
+
             elif ext == '.awkd':
                 a = _read_awkd(filepath, branches, load_range=load_range)
             elif ext == '.parquet':

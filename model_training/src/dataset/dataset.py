@@ -89,33 +89,46 @@ def _preprocess(table, data_config, options):
 
 
 def _load_next(data_config, filelist, load_range, options):
+
     table = _read_files(
         filelist, data_config.load_branches, load_range, treename=data_config.treename
     )
-    
+
     table, indices = _preprocess(table, data_config, options)
-    
+
     if table is None or len(indices) == 0:
         return table, indices, np.array([]), np.array([])
-    
+
     fileIDs = []
     eventIDs = []
 
-    for f in filelist:
-        n_events = len(table[next(iter(table))])
-        
-        base = os.path.basename(f)
-        match = re.search(r'(\d+)', base)
-        fid = 0
-        if match:
-            fid = int(match.group(1))
-    
-        fileIDs.extend([fid] * n_events)
-        eventIDs = table["_mask"][:, 3, 0].astype(int)
+    for idx in range(len(indices)):
+
+        fileIDs.append(int(table["_mask"][idx, 4, 0]))
+        eventIDs.append(int(table["_mask"][idx, 3, 0]))
 
     fileIDs = np.array(fileIDs)
     eventIDs = np.array(eventIDs)
-      
+    
+    
+    
+    # fileIDs = []
+    # eventIDs = []
+
+    # for f in filelist:
+    #     n_events = len(table[next(iter(table))])
+    #     base = os.path.basename(f)
+    #     match = re.search(r'(\d+)', base)
+    #     fid = 0
+    #     if match:
+    #         fid = int(match.group(1))
+
+    #     fileIDs.extend([fid] * n_events)
+    #     eventIDs.extend(np.arange(n_events))
+
+    # fileIDs = np.array(fileIDs)
+    # eventIDs = np.array(eventIDs)
+    
     return table, indices, fileIDs, eventIDs
 
 
@@ -345,7 +358,7 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
         load_range_and_fraction=None,
         extra_selection=None,
         fetch_by_files=False,
-        fetch_step=0.01,
+        fetch_step=1,
         file_fraction=1,
         remake_weights=False,
         up_sample=True,

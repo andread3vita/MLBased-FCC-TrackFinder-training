@@ -3,12 +3,15 @@ import torch.nn as nn
 import os
 import lightning as L
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-
+import sys
+import torch.distributed as dist
+import numpy as np
 from src.logger.logger_wandb import log_losses_wandb_tracking
 from src.layers.inference_oc_tracks import (
     evaluate_efficiency_tracks,
     store_at_batch_end,
-    store_at_batch_end_hits
+    store_at_batch_end_hits,
+    get_clustering
 )
 from src.layers.losses import object_condensation_loss_tracking
 from src.layers.batch_operations import obtain_batch_numbers
@@ -25,6 +28,10 @@ from xformers.ops.fmha import BlockDiagonalMask
 from src.gatr_v111.primitives.invariants import   compute_inner_product_mask
 from src.gatr_v111.primitives.linear import _compute_pin_equi_linear_basis
 from src.gatr_v111.primitives.attention import _build_dist_basis
+
+import wandb
+from src.logger.plotting_tools import (PlotCoordinates, efficiency_purity_plot)
+import pandas as pd
 
 class ExampleWrapper(L.LightningModule): 
     def __init__(
@@ -69,6 +76,7 @@ class ExampleWrapper(L.LightningModule):
         self.clustering = nn.Linear(16, self.output_dim - 1, bias=False)
         self.beta = nn.Linear(16, 1)
         self.vector_like_data = True
+        self.df_batch_buffer = []
 
     def load_basis(self):
 
@@ -99,9 +107,8 @@ class ExampleWrapper(L.LightningModule):
         vector = input[:, 4:]
         
         inputs = self.ScaledGooeyBatchNorm2_1(pos_hits_xyz)
-        velocities = embed_translation(vector)
-        embedded_inputs = embed_point(inputs) + embed_scalar(hit_type) + velocities
-       
+        embedded_inputs = embed_point(inputs) + embed_scalar(hit_type) + embed_translation(vector)
+
         embedded_inputs = embedded_inputs.unsqueeze(-2)
         scalars = torch.zeros((inputs.shape[0], 1))
         mask = self.build_attention_mask(g)
@@ -145,6 +152,9 @@ class ExampleWrapper(L.LightningModule):
         input_ = torch.cat((pos_hits_xyz, hit_type, vector), dim=1)
         
         model_output = self(batch_g, input_)
+        x_cluster_coord = model_output[:, :3]
+        beta = model_output[:, 3]
+        labels = get_clustering(beta, x_cluster_coord, 0.6, 0.3)
 
         (loss, losses) = object_condensation_loss_tracking(
             batch_g,
@@ -170,12 +180,52 @@ class ExampleWrapper(L.LightningModule):
         if self.trainer.is_global_zero:
             log_losses_wandb_tracking(True, batch_idx, 0, losses, loss)
 
+            if batch_idx % 1000 == 0:
+
+                batch_g.ndata["final_coords"] = batch_g.ndata["pos_hits_xyz"]
+                batch_g.ndata["reco_labels"] = labels
+                fig1 = PlotCoordinates(
+                    batch_g,
+                    path="final_coords",
+                    outdir=self.args.model_prefix,
+                    epoch=self.current_epoch,
+                    step_count=self.global_step,
+                )
+
+                batch_g.ndata["embedded_coords"] = x_cluster_coord
+                batch_g.ndata["beta"] = beta
+                fig2 = PlotCoordinates(
+                    batch_g,
+                    path="embedded_coords",
+                    outdir=self.args.model_prefix,
+                    epoch=self.current_epoch,
+                    step_count=self.global_step,
+                )
+
+                batch_g.ndata["original_coords"] = batch_g.ndata["pos_hits_xyz"]
+                fig3 = PlotCoordinates(
+                    batch_g,
+                    path="input_coords",
+                    outdir=self.args.model_prefix,
+                    epoch=self.current_epoch,
+                    step_count=self.global_step,
+                )
+
+               
+                html_string1 = fig1.to_html(full_html=False, auto_play=False)
+                html_string2 = fig2.to_html(full_html=False, auto_play=False)
+                html_string3 = fig3.to_html(full_html=False, auto_play=False)
+
+
+                wandb.log({"final_coords": wandb.Html(html_string1),
+                           "embedding_coords" :wandb.Html(html_string2),
+                           "true_coords": wandb.Html(html_string3)})
+
         return loss
 
     def validation_step(self, batch, batch_idx):
-        self.validation_step_outputs = []
+        
         y = batch[1]
-
         batch_g = batch[0]
 
         pos_hits_xyz = batch_g.ndata["pos_hits_xyz"]
@@ -216,27 +266,47 @@ class ExampleWrapper(L.LightningModule):
             prog_bar=True,
             sync_dist=True
         )
-            
-        if self.trainer.is_global_zero and self.args.predict:
-            df_batch, df_hits = evaluate_efficiency_tracks(
-                batch_g,
-                model_output,
-                y,
-                0,
-                batch_idx,
-                0,
-                path_save=self.args.model_prefix + "showers_df_evaluation",
-                store=True,
-                predict=False,
-                tau=self.args.tau
 
-            )
-            if self.args.predict:
-                if len(df_batch) > 0:
-                    self.df_showers.append(df_batch)
+        # Run evaluate_efficiency_tracks on ALL ranks
+        df_batch, df_hits = evaluate_efficiency_tracks(
+            batch_g,
+            model_output,
+            y,
+            0,
+            batch_idx,
+            0,
+            path_save=self.args.model_prefix + "showers_df_evaluation",
+            store=False,
+            predict=False,
+            tau=self.args.tau,
+        )
+
+        # Every rank accumulates its own batches
+        self.df_batch_buffer.append(df_batch)
+
+        # if self.trainer.is_global_zero and self.args.predict:
+
+        #     df_batch, df_hits = evaluate_efficiency_tracks(
+        #         batch_g,
+        #         model_output,
+        #         y,
+        #         0,
+        #         batch_idx,
+        #         0,
+        #         path_save=self.args.model_prefix + "showers_df_evaluation",
+        #         store=True,
+        #         predict=False,
+        #         tau=self.args.tau
+
+        #     )
+
+            
+        #     if self.args.predict:
+        #         if len(df_batch) > 0:
+        #             self.df_showers.append(df_batch)
                     
-                if len(df_hits) > 0:
-                    self.df_showers_hits.append(df_hits)
+        #         if len(df_hits) > 0:
+        #             self.df_showers_hits.append(df_hits)
 
     def on_validation_epoch_start(self):
         self.make_mom_zero()
@@ -250,24 +320,39 @@ class ExampleWrapper(L.LightningModule):
             self.ScaledGooeyBatchNorm2_1.momentum = 0
 
     def on_validation_epoch_end(self):
-        if self.args.predict:
-            store_at_batch_end(
-                self.args.model_prefix + "showers_df_evaluation",
-                self.df_showers,
-                0,
-                0,
-                0,
-                predict=True,
-            )
+
+        # if self.args.predict:
+        #     store_at_batch_end(
+        #         self.args.model_prefix + "showers_df_evaluation",
+        #         self.df_showers,
+        #         0,
+        #         0,
+        #         0,
+        #         predict=True,
+        #     )
             
-            store_at_batch_end_hits(
-                self.args.model_prefix + "showers_df_evaluation",
-                self.df_showers_hits,
-                0,
-                0,
-                0,
-                predict=True,
-            )
+        #     store_at_batch_end_hits(
+        #         self.args.model_prefix + "showers_df_evaluation",
+        #         self.df_showers_hits,
+        #         0,
+        #         0,
+        #         0,
+        #         predict=True,
+        #     )
+
+
+        df_batch_all = pd.concat(list(self.df_batch_buffer), ignore_index=True)
+        self.df_batch_buffer = []
+
+
+        torch.save(
+            df_batch_all,
+            self.args.model_prefix + "/df_batch_all.pt"
+        )
+
+        effPurPlot = efficiency_purity_plot(df_batch_all,0.1,60,0.2,True, minNumHits = 10, minTheta = 45, maxTheta = 135, genStatus=[1])
+        wandb.log({"efficiency_purity": wandb.Image(effPurPlot)})
+
 
     def configure_optimizers(self):
 

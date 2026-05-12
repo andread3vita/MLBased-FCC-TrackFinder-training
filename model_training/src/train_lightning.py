@@ -37,6 +37,11 @@ from src.utils.train_utils import (
 from src.utils.import_tools import import_module
 from src.utils.train_utils import get_samples_steps_per_epoch, model_setup, get_gpu_dev
 
+import warnings
+from dgl.base import DGLWarning
+
+warnings.simplefilter("ignore", DGLWarning)
+
 print("Using PyTorch version:", torch.__version__)
 
 def main():
@@ -101,7 +106,7 @@ def main():
             max_epochs=args.num_epochs,
             strategy="ddp",
             accumulate_grad_batches=2,
-            limit_val_batches=10
+            limit_val_batches=100
         )
 
         args.local_rank = trainer.global_rank

@@ -267,22 +267,22 @@ class ExampleWrapper(L.LightningModule):
             sync_dist=True
         )
 
-        # Run evaluate_efficiency_tracks on ALL ranks
-        df_batch, df_hits = evaluate_efficiency_tracks(
-            batch_g,
-            model_output,
-            y,
-            0,
-            batch_idx,
-            0,
-            path_save=self.args.model_prefix + "showers_df_evaluation",
-            store=False,
-            predict=False,
-            tau=self.args.tau,
-        )
+        # # Run evaluate_efficiency_tracks on ALL ranks
+        # df_batch, df_hits = evaluate_efficiency_tracks(
+        #     batch_g,
+        #     model_output,
+        #     y,
+        #     0,
+        #     batch_idx,
+        #     0,
+        #     path_save=self.args.model_prefix + "showers_df_evaluation",
+        #     store=False,
+        #     predict=False,
+        #     tau=self.args.tau,
+        # )
 
-        # Every rank accumulates its own batches
-        self.df_batch_buffer.append(df_batch)
+        # # Every rank accumulates its own batches
+        # self.df_batch_buffer.append(df_batch)
 
         # if self.trainer.is_global_zero and self.args.predict:
 
@@ -340,18 +340,17 @@ class ExampleWrapper(L.LightningModule):
         #         predict=True,
         #     )
 
+        # df_batch_all = pd.concat(list(self.df_batch_buffer), ignore_index=True)
+        # self.df_batch_buffer = []
 
-        df_batch_all = pd.concat(list(self.df_batch_buffer), ignore_index=True)
-        self.df_batch_buffer = []
 
+        # torch.save(
+        #     df_batch_all,
+        #     self.args.model_prefix + "/df_batch_all.pt"
+        # )
 
-        torch.save(
-            df_batch_all,
-            self.args.model_prefix + "/df_batch_all.pt"
-        )
-
-        effPurPlot = efficiency_purity_plot(df_batch_all,0.1,60,0.2,True, minNumHits = 10, minTheta = 45, maxTheta = 135, genStatus=[1])
-        wandb.log({"efficiency_purity": wandb.Image(effPurPlot)})
+        # effPurPlot = efficiency_purity_plot(df_batch_all,0.1,60,0.2,True, minNumHits = 10, minTheta = 45, maxTheta = 135, genStatus=[1])
+        # wandb.log({"efficiency_purity": wandb.Image(effPurPlot)})
 
 
     def configure_optimizers(self):

@@ -74,7 +74,7 @@ def main():
         project=args.wandb_projectname,
         entity=args.wandb_entity,
         name=args.wandb_displayname,
-        offline="True"
+        offline=True
     )
        
 

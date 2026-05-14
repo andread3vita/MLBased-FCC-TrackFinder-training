@@ -96,14 +96,34 @@ class geometric_attention(nn.Module):
 
     Uses grade-1 (vector) components for distance computation instead of
     PGA's trivector-based approach.
+
+    Channel counts (`num_mv_channels_qk`, `num_s_channels_qk`,
+    `num_mv_channels_v`, `num_s_channels_v`) can be passed at __init__
+    time. When supplied, the forward pass uses them as Python ints
+    instead of reading `tensor.shape[-2]` / `tensor.shape[-1]`. This
+    avoids `TracerWarning: Converting a tensor to a Python boolean`
+    during ONNX export — those shape reads return SymInts under tracing,
+    and the subsequent `max(...)` / arithmetic baked them in as
+    constants anyway (they're fixed by the model's hyperparameters, not
+    by input). We just make the constants explicit.
+
+    Legacy callers (single-event inference paths or older training code)
+    pass `None` for the channel counts and fall back to dynamic shape
+    reads — those still work, they just emit the warnings.
     """
 
-    def __init__(self, basis_q, basis_k):
+    def __init__(self, basis_q, basis_k,
+                 num_mv_channels_qk=None, num_s_channels_qk=None,
+                 num_mv_channels_v=None, num_s_channels_v=None):
         super().__init__()
         self.register_buffer("basis_q", basis_q)
         self.register_buffer("basis_k", basis_k)
         self._GRADE1_IDX = _GRADE1_IDX
         self._INNER_PRODUCT_WO_EXTREMES_IDX = _INNER_PRODUCT_WO_EXTREMES_IDX
+        self.num_mv_channels_qk = num_mv_channels_qk
+        self.num_s_channels_qk = num_s_channels_qk
+        self.num_mv_channels_v = num_mv_channels_v
+        self.num_s_channels_v = num_s_channels_v
 
     def forward(
         self,
@@ -144,10 +164,25 @@ class geometric_attention(nn.Module):
         k_s = to_nd(k_s, 4)
         v_s = to_nd(v_s, 4)
 
-        num_mv_channels_v = v_mv.shape[-2]
-        num_s_channels_v = v_s.shape[-1]
-        num_mv_channels_qk = q_mv.shape[-2]
-        num_s_channels_qk = q_s.shape[-1]
+        # Prefer cached Python ints (set at __init__ from SelfAttentionConfig)
+        # so the channel arithmetic below is pure Python and doesn't
+        # trip the tracer.  Fall back to `.shape[-]` for legacy callers.
+        num_mv_channels_v = (
+            self.num_mv_channels_v if self.num_mv_channels_v is not None
+            else v_mv.shape[-2]
+        )
+        num_s_channels_v = (
+            self.num_s_channels_v if self.num_s_channels_v is not None
+            else v_s.shape[-1]
+        )
+        num_mv_channels_qk = (
+            self.num_mv_channels_qk if self.num_mv_channels_qk is not None
+            else q_mv.shape[-2]
+        )
+        num_s_channels_qk = (
+            self.num_s_channels_qk if self.num_s_channels_qk is not None
+            else q_s.shape[-1]
+        )
 
         device = q_mv.device
         dtype = q_mv.dtype
@@ -199,20 +234,34 @@ class geometric_attention(nn.Module):
 
         # Scale keys to correct for zero padding
         k = k * math.sqrt(num_channels / num_channels_qk)
-        q, k, v = expand_pairwise(q, k, v, exclude_dims=(-2,))
 
-        # Use xformers for BlockDiagonalMask support, torch SDPA otherwise
+        # Three paths for the attention mask:
+        #   1. AttentionBias (xformers BlockDiagonalMask) — packed
+        #      multi-event training path used by v35. NOT exportable
+        #      to ONNX. Needs `expand_pairwise` because xformers'
+        #      `memory_efficient_attention` does NOT broadcast the
+        #      heads dim of K/V from 1 → num_heads automatically.
+        #   2. Plain Tensor (bool or float, shape broadcastable to
+        #      [B, heads, items_q, items_k]) — used by the batched
+        #      ONNX wrapper. Exported as a regular Where/Add in the
+        #      graph. SDPA broadcasts heads natively, so we SKIP
+        #      `expand_pairwise` here. (Skipping also removes a
+        #      `TracerWarning: Converting a tensor to a Python boolean`
+        #      that fires from the `max(s[d] for s in shapes)` line in
+        #      `gatr_v111.utils.tensors.expand_pairwise`.)
+        #   3. None — single-event path; attention is dense over the
+        #      one event. Same SDPA route as case 2.
         if isinstance(attn_mask, AttentionBias):
-            # xformers expects (batch, items, heads, features)
+            q, k, v = expand_pairwise(q, k, v, exclude_dims=(-2,))
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
             v_out = memory_efficient_attention(
                 q.contiguous(), k.contiguous(), v, attn_bias=attn_mask
             )
-            v_out = v_out.transpose(1, 2)  # back to (batch, heads, items, features)
+            v_out = v_out.transpose(1, 2)
         else:
-            v_out = scaled_dot_product_attention(q, k, v)
+            v_out = scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
         # Split output
         v_out_mv = rearrange(v_out[..., :num_mv_channels_v * 32], "... (c x) -> ... c x", x=32)

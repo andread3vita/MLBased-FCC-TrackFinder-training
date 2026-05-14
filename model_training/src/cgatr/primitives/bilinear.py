@@ -15,10 +15,13 @@ class geometric_product(nn.Module):
         self.register_buffer("gp", gp)  # (32, 32, 32)
 
     def forward(self, x, y):
-        # x, y: (..., batch, channels, 32)
-        # Two-step einsum for ONNX compatibility
-        outputs1 = torch.einsum("i j k, ab j-> abik", self.gp, x)
-        outputs = torch.einsum("abik, abk -> ab i", outputs1, y)
+        # x, y: (..., 32). Arbitrary leading dims supported via ellipsis
+        # so the same op handles single-event (items, channels, 32) and
+        # multi-event batched (B, N, channels, 32) inputs without a
+        # custom rank-2 prefix.
+        # Two-step einsum for ONNX compatibility.
+        outputs1 = torch.einsum("ijk, ...j -> ...ik", self.gp, x)
+        outputs = torch.einsum("...ik, ...k -> ...i", outputs1, y)
         return outputs
 
 
@@ -30,7 +33,7 @@ def outer_product(op, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     op : torch.Tensor with shape (32, 32, 32)
         Outer product Cayley table.
     x : torch.Tensor with shape (..., 32)
-        First input multivector.
+        First input multivector. Arbitrary leading dims supported.
     y : torch.Tensor with shape (..., 32)
         Second input multivector.
 
@@ -39,6 +42,6 @@ def outer_product(op, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     outputs : torch.Tensor with shape (..., 32)
         Wedge product result.
     """
-    outputs1 = torch.einsum("i j k, ab j-> abik", op, x)
-    outputs = torch.einsum("abik, abk -> ab i", outputs1, y)
+    outputs1 = torch.einsum("ijk, ...j -> ...ik", op, x)
+    outputs = torch.einsum("...ik, ...k -> ...i", outputs1, y)
     return outputs

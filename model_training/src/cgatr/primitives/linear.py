@@ -126,31 +126,43 @@ NUM_PIN_LINEAR_BASIS_ELEMENTS = 9
 def equi_linear(basis: torch.Tensor, x: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
     """Pin(4,1)-equivariant linear map.
 
-    f(x) = sum_{a} coeffs_{y,x,a} * basis_{a,i,j} * x_{l,x,j}
+    f(x) = sum_{a} coeffs_{y,x,a} * basis_{a,i,j} * x_{..., x, j}
 
     Parameters
     ----------
     basis : torch.Tensor with shape (9, 32, 32)
-    x : torch.Tensor with shape (l, x_channels, 32)
+    x : torch.Tensor with shape (..., x_channels, 32)
+        Arbitrary leading dims are supported (e.g. `(items, x_channels, 32)`
+        for single-event, `(B, N, x_channels, 32)` for batched).
     coeffs : torch.Tensor with shape (y_channels, x_channels, 9)
 
     Returns
     -------
-    result : torch.Tensor with shape (l, y_channels, 32)
+    result : torch.Tensor with shape (..., y_channels, 32)
+        Same leading dims as `x`.
     """
+    # NOTE: We deliberately don't assert `coeffs.shape[-1] == basis.shape[0]`
+    # here. That sanity check is structurally guaranteed by construction —
+    # `coeffs` is `nn.Parameter(empty(y, x, NUM_PIN_LINEAR_BASIS_ELEMENTS))`
+    # and `basis` is the precomputed pin-equivariant basis with the same
+    # leading dim. During tracing, the assertion would convert two
+    # SymInts to a Python bool and emit a TracerWarning. The ONNX
+    # exporter would happily bake the result in as a constant, but
+    # there's no upside.
     y, x_dim, a = coeffs.shape
     a_, i, j = basis.shape
-    l = x.shape[0]
-    assert a == a_
 
     # coeffs @ basis -> (y, x, i, j)
-    coeffs_flat = coeffs.reshape(-1, a)        # (y*x, a)
-    basis_flat = basis.reshape(a, -1)           # (a, i*j)
+    coeffs_flat = coeffs.reshape(-1, a)              # (y*x, a)
+    basis_flat = basis.reshape(a, -1)                # (a, i*j)
     c2_flat = torch.matmul(coeffs_flat, basis_flat)  # (y*x, i*j)
-    c2 = c2_flat.view(y, x_dim, i, j)          # (y, x, i, j)
-    c2 = c2.permute(0, 1, 3, 2)                # (y, x, j, i)
+    c2 = c2_flat.view(y, x_dim, i, j)                # (y, x, i, j)
+    c2 = c2.permute(0, 1, 3, 2)                      # (y, x, j, i)
 
-    result = torch.einsum("lxj,yxji->lyi", x, c2)
+    # Ellipsis lets `x` carry any leading-dim shape: 3-D (items, x, 32)
+    # for single-event inference, 4-D (B, N, x, 32) for multi-event
+    # batched ONNX, etc.
+    result = torch.einsum("...xj,yxji->...yi", x, c2)
     return result
 
 

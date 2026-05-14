@@ -216,46 +216,75 @@ class TokenBudgetBatchSampler(Sampler):
     """Batch sampler that packs events up to a token (hit) budget.
 
     Uses pre-computed n_total from IDEAParquetDataset._index to form
-    batches whose total hit count stays under max_tokens. Events larger
-    than max_tokens are placed in singleton batches.
+    batches whose total hit count stays under max_tokens.
 
-    DDP-aware: reads LOCAL_RANK/WORLD_SIZE at iteration time (after
-    Lightning initializes DDP). Use with Trainer(use_distributed_sampler=False).
+    DDP safety contract (v37 hardening):
+      1. The batch list is built once per epoch in `set_epoch()` and cached, so
+         `__len__` and `__iter__` agree byte-for-byte and the LR scheduler gets
+         the correct step count.
+      2. The global batch list is *truncated* to a multiple of world_size
+         BEFORE the per-rank slice, so every rank yields the exact same
+         number of batches. This eliminates the "one-rank-finishes-first"
+         class of NCCL deadlocks.
+      3. Events whose hit count exceeds `max_tokens` are admitted as singleton
+         batches by default (they exceed the budget but at least train on the
+         data). Pass `drop_oversized=True` to filter them, or raise
+         `--max_tokens` to cover the full distribution.
+      4. RNG seeded by epoch only — calling `__iter__` does NOT advance the
+         seed, so DataLoader prefetching / multiple iterations within one epoch
+         remain deterministic.
     """
 
     def __init__(self, dataset, max_tokens: int, shuffle: bool = True,
-                 drop_last: bool = True):
+                 drop_last: bool = True, drop_oversized: bool = False,
+                 verbose: bool = True):
         self.sizes = [entry[3] for entry in dataset._index]
         self.max_tokens = max_tokens
         self.shuffle = shuffle
         self.drop_last = drop_last
+        self.drop_oversized = drop_oversized
+        self.verbose = verbose
         self._epoch = 0
+        self._cached_batches = None
 
-    def set_epoch(self, epoch: int):
-        """Set epoch for deterministic shuffling (called by Lightning)."""
-        self._epoch = epoch
+        # Filter oversized events once. Singletons exceeding max_tokens are the
+        # main OOM risk under AMP + grad_checkpoint, and we cannot honour the
+        # token budget for them anyway.
+        if drop_oversized:
+            n_oversized = sum(1 for s in self.sizes if s > max_tokens)
+            if n_oversized > 0 and verbose:
+                rank = int(os.environ.get("LOCAL_RANK", 0))
+                if rank == 0:
+                    largest = max(self.sizes)
+                    print(
+                        f"  TokenBudgetBatchSampler: dropping {n_oversized}/"
+                        f"{len(self.sizes)} events with hits > max_tokens="
+                        f"{max_tokens} (largest={largest}). Increase "
+                        f"--max_tokens to keep them.",
+                        flush=True,
+                    )
 
     def _get_rank_info(self):
-        """Read DDP rank/world_size from env vars (set after DDP init)."""
         rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         return rank, world_size
 
-    def __iter__(self):
+    def _build_batches(self):
+        """Build the canonical (rank-sliced, equal-length) batch list for the
+        current epoch. Called lazily by both __iter__ and __len__ so they
+        agree."""
         rank, world_size = self._get_rank_info()
-
-        # Deterministic RNG per epoch, same across all ranks so sharding is consistent
         rng = random.Random(42 + self._epoch)
 
-        indices = list(range(len(self.sizes)))
-
-        # Sort by size so similar events are grouped (better GPU utilization)
+        indices = [
+            i for i, s in enumerate(self.sizes)
+            if (not self.drop_oversized) or s <= self.max_tokens
+        ]
+        # Sort by size so similar events group together (better GPU util).
         indices.sort(key=lambda i: self.sizes[i])
 
         if self.shuffle:
-            # Shuffle within size-buckets to add randomness while keeping
-            # similar-sized events together
-            bucket_size = max(80, 1)
+            bucket_size = 80
             buckets = [indices[i:i + bucket_size]
                        for i in range(0, len(indices), bucket_size)]
             rng.shuffle(buckets)
@@ -263,11 +292,10 @@ class TokenBudgetBatchSampler(Sampler):
                 rng.shuffle(bucket)
             indices = [idx for bucket in buckets for idx in bucket]
 
-        # Pack into batches respecting token budget
+        # Pack into batches respecting token budget.
         batches = []
         current_batch = []
         current_tokens = 0
-
         for idx in indices:
             event_size = self.sizes[idx]
             if current_batch and current_tokens + event_size > self.max_tokens:
@@ -276,7 +304,6 @@ class TokenBudgetBatchSampler(Sampler):
                 current_tokens = 0
             current_batch.append(idx)
             current_tokens += event_size
-
         if current_batch:
             if not self.drop_last or len(batches) == 0:
                 batches.append(current_batch)
@@ -284,17 +311,26 @@ class TokenBudgetBatchSampler(Sampler):
         if self.shuffle:
             rng.shuffle(batches)
 
-        # DDP: each rank takes every world_size-th batch
+        # DDP: truncate to multiple of world_size BEFORE per-rank slice so all
+        # ranks yield the exact same number of batches. This is the key
+        # invariant that prevents NCCL collective desync.
         if world_size > 1:
+            n_keep = (len(batches) // world_size) * world_size
+            batches = batches[:n_keep]
             batches = batches[rank::world_size]
+        return batches
 
-        self._epoch += 1
-        yield from batches
+    def set_epoch(self, epoch: int):
+        """Set epoch and rebuild the cached batch list."""
+        self._epoch = epoch
+        self._cached_batches = self._build_batches()
+
+    def __iter__(self):
+        if self._cached_batches is None:
+            self._cached_batches = self._build_batches()
+        yield from self._cached_batches
 
     def __len__(self):
-        _, world_size = self._get_rank_info()
-        total = sum(self.sizes)
-        n_batches = max(1, total // self.max_tokens)
-        if world_size > 1:
-            n_batches = max(1, n_batches // world_size)
-        return n_batches
+        if self._cached_batches is None:
+            self._cached_batches = self._build_batches()
+        return len(self._cached_batches)

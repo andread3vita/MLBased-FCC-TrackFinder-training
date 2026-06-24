@@ -1,0 +1,10 @@
+# PyTorch and torch_scatter must be installed separately -- see setup_env.sh.
+# torch_scatter needs the wheel matching your torch+CUDA build:
+#   pip install torch_scatter -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+lightning>=2.2
+polars>=0.20
+einops
+numpy
+matplotlib
+pyarrow
+scipy

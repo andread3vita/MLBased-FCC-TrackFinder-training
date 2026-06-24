@@ -44,7 +44,7 @@ pip install plotly
 
 ## 🧠 Model Training
 
-To train the model, go inside `model_training/` and use the script [`src/train_lightning.py`](model_training/src/train_lightning.py). This script supports extensive configuration through command-line arguments, which are defined in [`src/utils/parser_args.py`](model_training/src/utils/parser_args.py).
+To train the model, go inside `model_training/GATR` and use the script [`src/train_lightning.py`](model_training/src/train_lightning.py). This script supports extensive configuration through command-line arguments, which are defined in [`src/utils/parser_args.py`](model_training/src/utils/parser_args.py).
 
 ### 📌 Example Command
 

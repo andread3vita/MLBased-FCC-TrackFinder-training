@@ -5,7 +5,7 @@ TRAIN_OR_TEST=${2}
 SEED=${3}
 WORK_DIR=${4}
 KEY4HEP_VERSION=${5}
-NEV=500
+NEV=1
 
 ORIG_PARAMS=("$@")
 set --
@@ -14,9 +14,10 @@ set -- "${ORIG_PARAMS[@]}"
 
 cd $OUTDIR
 
+
 if [[ "${TRAIN_OR_TEST}" == "train" ]]
 then
-      
+      RANDOM=$((SEED))
       MIN=3
       MAX=10
       NPARTICLES=$(( RANDOM % ($MAX - $MIN + 1) + $MIN ))
@@ -36,7 +37,7 @@ fi
 
 if [[ "${TRAIN_OR_TEST}" == "test" ]]
 then
-
+      RANDOM=$((SEED))
       MIN=3
       MAX=10
       NPARTICLES=$(( RANDOM % ($MAX - $MIN + 1) + $MIN ))
@@ -55,8 +56,8 @@ then
             --part.keepAllParticles true 
 
 fi
-      
-k4run $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground/utils/runIDEAv4_o1_trackerDigitizer.py --inputFile out_sim_edm4hep_${SEED}.root --outputFile digi/output_IDEA_DIGI_${SEED}_${TRAIN_OR_TEST}.root
+
+k4run $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground/utils/runIDEA_v4o1_trackerDigitizer.py --inputFile out_sim_edm4hep_${SEED}.root --outputFile digi/output_IDEA_DIGI_${SEED}_${TRAIN_OR_TEST}.root
 rm out_sim_edm4hep_${SEED}.root
 
 python $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground/src/process_tree.py digi/output_IDEA_DIGI_${SEED}_${TRAIN_OR_TEST}.root graph/Graphs_${SEED}_${TRAIN_OR_TEST}.root

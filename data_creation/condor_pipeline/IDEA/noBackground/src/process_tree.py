@@ -19,9 +19,6 @@ rootfile = sys.argv[1]
 reader = root_io.Reader(rootfile)
 output_file = sys.argv[2]
 
-det_version = int(sys.argv[3])
-det_option = int(sys.argv[4])
-
 metadata = reader.get("metadata")[0]
 
 out_root = TFile(output_file, "RECREATE")
@@ -47,17 +44,12 @@ for event in reader.get("events"):
     clear_dic(dic)
     n_part[0] = 0
     
-    if (det_version == 3 and det_option == 1):
-        
-        n_hit, dic, list_of_MCs1 = store_hit_col_SenseWireHits(
+    n_hit, dic, list_of_MCs1 = store_hit_col_SenseWireHits(
             event,
             n_hit,
             dic,
             metadata
         )
-            
-    else:
-        print("Sense Wire Hit analyser not yet implemented!")
     
     n_hit, dic, list_of_MCs2 = store_hit_col_PlanarHits(
         event,

@@ -77,9 +77,15 @@ def test_cga_distance():
     print(f"[PASS] test_cga_distance (max error = {err:.2e})")
 
 
-def test_circle_is_grade3():
-    """Verify circle embedding produces grade-3 trivectors."""
-    from src.cgatr.interface.circle import embed_circle
+def test_circle_is_grade2():
+    """Verify the IPNS circle embedding C = S ∧ π is a pure grade-2 bivector.
+
+    The production model embeds drift hits via `embed_circle_ipns` (sphere ∧
+    plane = wedge of two grade-1 vectors), which lives entirely in grade 2
+    (indices [6..15]). This replaces the obsolete grade-3 OPNS construction
+    (P1 ∧ P2 ∧ P3) that an earlier `embed_circle` produced.
+    """
+    from src.cgatr.interface.circle import embed_circle_ipns
 
     _, op, metadata = _load_tables()
 
@@ -87,10 +93,10 @@ def test_circle_is_grade3():
     wire_dir = torch.tensor([[0.0, 0.0, 1.0]])  # Along z-axis
     drift_radius = torch.tensor([[0.5]])
 
-    circle = embed_circle(wire_pos, wire_dir, drift_radius, op)
+    circle = embed_circle_ipns(wire_pos, wire_dir, drift_radius, op)
 
     # Grade ranges: 0:[0], 1:[1-5], 2:[6-15], 3:[16-25], 4:[26-30], 5:[31]
-    # Only grade-3 should be nonzero
+    # Only grade-2 should be nonzero (wedge of two grade-1 vectors).
     grade0 = circle[..., 0:1].abs().max().item()
     grade1 = circle[..., 1:6].abs().max().item()
     grade2 = circle[..., 6:16].abs().max().item()
@@ -98,14 +104,14 @@ def test_circle_is_grade3():
     grade4 = circle[..., 26:31].abs().max().item()
     grade5 = circle[..., 31:32].abs().max().item()
 
-    assert grade3 > 1e-6, f"Grade-3 should be nonzero, got max={grade3:.2e}"
-    # Other grades should be zero (from outer product of grade-1 vectors)
+    assert grade2 > 1e-6, f"Grade-2 should be nonzero, got max={grade2:.2e}"
+    # All other grades vanish exactly for an outer product of two vectors.
     assert grade0 < 1e-5, f"Grade-0 should be ~0, got {grade0:.2e}"
     assert grade1 < 1e-5, f"Grade-1 should be ~0, got {grade1:.2e}"
+    assert grade3 < 1e-5, f"Grade-3 should be ~0, got {grade3:.2e}"
     assert grade4 < 1e-5, f"Grade-4 should be ~0, got {grade4:.2e}"
     assert grade5 < 1e-5, f"Grade-5 should be ~0, got {grade5:.2e}"
-    # Grade-2 may have small components from numerical precision of outer product
-    print(f"[PASS] test_circle_is_grade3 (grade3_max={grade3:.4f}, others<1e-5)")
+    print(f"[PASS] test_circle_is_grade2 (grade2_max={grade2:.4f}, others<1e-5)")
 
 
 def test_pin_equi_linear_basis():
@@ -138,6 +144,51 @@ def test_equi_linear():
     y = equi_linear(basis, x, coeffs)
     assert y.shape == (10, 8, 32), f"Output shape: {y.shape}"
     print(f"[PASS] test_equi_linear (output shape={y.shape})")
+
+
+def test_se3_equivariant_basis():
+    """The canonical SE(3) CGA linear basis is genuinely rotation-equivariant.
+
+    Independent of the null-space construction: we build a *finite* rotation
+    rotor R = cos(θ/2) − sin(θ/2) e₁₂ and verify every basis map φ commutes with
+    the sandwich action x ↦ R x R̃ (i.e. [D, φ] = 0, where D is the 32×32 matrix
+    of that rotation). This would fail for the old 3 Hodge cross-grade maps.
+    """
+    import math as _m
+    from src.cgatr.primitives.linear import _compute_se3_equi_linear_basis
+    from src.cgatr.primitives.bilinear import outer_product
+
+    gp, op, _ = _load_tables()
+    basis = _compute_se3_equi_linear_basis(gp)  # raises if its own check fails
+    assert basis.shape[1:] == (32, 32), f"basis shape {basis.shape}"
+    assert basis.shape[0] >= 6, f"expected >=6 equivariant maps, got {basis.shape[0]}"
+
+    gp64 = gp.double()
+
+    def _unit(i):
+        v = torch.zeros(32, dtype=torch.float64)
+        v[i] = 1.0
+        return v
+
+    e1, e2 = _unit(1), _unit(2)
+    e12 = outer_product(op.double(), e1.unsqueeze(0), e2.unsqueeze(0)).squeeze(0)
+    e12 = e12 / e12.abs().max()  # unit bivector (e12² = −1)
+
+    theta = 0.7
+    R = _m.cos(theta / 2) * _unit(0) - _m.sin(theta / 2) * e12
+    Rt = R.clone()
+    Rt[6:16] *= -1.0  # reverse: flip grade-2 sign  → R̃
+
+    L_R = torch.einsum("ikj,k->ij", gp64, R)    # left-multiply by R
+    R_Rt = torch.einsum("ijk,k->ij", gp64, Rt)  # right-multiply by R̃
+    D = R_Rt @ L_R                              # x ↦ R x R̃
+
+    b = basis.double()
+    comm = torch.einsum("ij,bjk->bik", D, b) - torch.einsum("bij,jk->bik", b, D)
+    max_resid = comm.abs().max().item()
+    assert max_resid < 1e-6, f"basis not rotation-equivariant: {max_resid:.2e}"
+    print(f"[PASS] test_se3_equivariant_basis "
+          f"(n_basis={basis.shape[0]}, resid={max_resid:.2e})")
 
 
 def test_cgatr_forward():
@@ -250,9 +301,10 @@ if __name__ == "__main__":
         test_table_shapes,
         test_cga_point_null,
         test_cga_distance,
-        test_circle_is_grade3,
+        test_circle_is_grade2,
         test_pin_equi_linear_basis,
         test_equi_linear,
+        test_se3_equivariant_basis,
         test_reversal_signs,
         test_grade_dropout,
         test_dual,

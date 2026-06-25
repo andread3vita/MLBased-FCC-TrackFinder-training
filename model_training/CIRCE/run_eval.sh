@@ -11,8 +11,8 @@ N_GPUS=${N_GPUS:-4}
 EMB_DIM=${EMB_DIM:-4}
 NUM_BLOCKS=${NUM_BLOCKS:-10}
 CPU_THREADS=${CPU_THREADS:-8}
-TB=${TB:-0.025}
-TD=${TD:-0.10}
+TB=${TB:-0.1}
+TD=${TD:-0.2}
 TAG=${TAG:-$(basename "$CKPT" .ckpt)}
 BASE=${BASE:-eval_results/$TAG}
 

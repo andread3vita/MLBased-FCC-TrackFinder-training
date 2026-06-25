@@ -12,7 +12,6 @@ set --
 source /cvmfs/sw-nightlies.hsf.org/key4hep/setup.sh -r ${KEY4HEP_VERSION} # if you need to fix a specific nightly: source /cvmfs/sw-nightlies.hsf.org/key4hep/setup.sh -r your_version
 set -- "${ORIG_PARAMS[@]}"
 
-
 cd $OUTDIR
 
 cp $WORK_DIR/data_creation/utils/Pythia_generation/Zcard.cmd Zcard_${SEED}.cmd
@@ -47,7 +46,7 @@ then
 fi        
 rm out_${SEED}.root
       
-k4run $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground/utils/runIDEAv4_o1_trackerDigitizer.py --inputFile out_sim_edm4hep_${SEED}.root --outputFile digi/output_IDEA_DIGI_${SEED}_${TRAIN_OR_TEST}.root
+k4run $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground/utils/runIDEA_v4o1_trackerDigitizer.py --inputFile out_sim_edm4hep_${SEED}.root --outputFile digi/output_IDEA_DIGI_${SEED}_${TRAIN_OR_TEST}.root
 rm out_sim_edm4hep_${SEED}.root
 
 python $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground/src/process_tree.py digi/output_IDEA_DIGI_${SEED}_${TRAIN_OR_TEST}.root graph/Graphs_${SEED}_${TRAIN_OR_TEST}.root

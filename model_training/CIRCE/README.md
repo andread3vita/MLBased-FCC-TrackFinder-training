@@ -68,9 +68,9 @@ Training checkpoints every 200 steps. Auto-resumes on SLURM requeue with
 
 | Variable | Default | Description |
 |---|---|---|
-| `MAX_TOKENS` | 16000 | Packed-batch token budget (total hits/batch). 16000 is safe on 80 GB H100 without grad checkpointing. Use 8000 on 32 GB V100s. |
+| `MAX_TOKENS` | 16000 | Packed-batch token budget (total hits/batch). Lower it if you hit GPU OOM; raise it (memory permitting) for better utilisation. Not a data cap — events larger than the budget are kept as singleton batches. |
 | `CPU_THREADS` | 4 | OMP/MKL/POLARS thread count. `run_eval.sh` uses half this value per shard (intentional: shards run in parallel). |
-| `GRAD_CKPT` | 0 | Set to 1 for gradient checkpointing (~30% slower, saves VRAM). Only needed if pushing MAX_TOKENS > 24000 on 80 GB GPUs. |
+| `GRAD_CKPT` | 0 | Set to 1 for gradient checkpointing (~30% slower, saves VRAM). Enable it if you want to push `MAX_TOKENS` beyond what your GPU memory allows. |
 | `NUM_EPOCHS` | 100 | Training epochs |
 | `PRECISION` | 32-true | PyTorch precision (`32-true`, `bf16-mixed`) |
 | `LIMIT_VAL` | 0.15 | Fraction of validation batches per epoch |

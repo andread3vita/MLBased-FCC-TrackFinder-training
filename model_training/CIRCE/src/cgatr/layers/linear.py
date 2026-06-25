@@ -39,6 +39,10 @@ class EquiLinear(nn.Module):
         super().__init__()
         self.register_buffer("basis", basis_pin)
         self._in_mv_channels = in_mv_channels
+        # Number of equivariant basis maps is read from the basis itself, so the
+        # layer works with both the legacy 9-element basis and the canonical
+        # SE(3) null-space basis (~21 elements).
+        self._n_basis = int(basis_pin.shape[0])
 
         if initialization == "unit_scalar":
             assert bias
@@ -47,10 +51,10 @@ class EquiLinear(nn.Module):
                     "unit_scalar initialization requires scalar inputs"
                 )
 
-        # MV -> MV weights: (out, in, 9)
+        # MV -> MV weights: (out, in, n_basis)
         self.weight = nn.Parameter(
             torch.empty(
-                (out_mv_channels, in_mv_channels, NUM_PIN_LINEAR_BASIS_ELEMENTS)
+                (out_mv_channels, in_mv_channels, self._n_basis)
             )
         )
 
@@ -130,9 +134,8 @@ class EquiLinear(nn.Module):
         self._init_multivectors(mv_component_factors, mv_factor, mvs_bias_shift)
         self._init_scalars(s_factor)
 
-    @staticmethod
     def _compute_init_factors(
-        initialization, gain, additional_factor, use_mv_heuristics
+        self, initialization, gain, additional_factor, use_mv_heuristics
     ):
         if initialization == "default":
             mv_factor = gain * additional_factor * np.sqrt(3)
@@ -153,14 +156,22 @@ class EquiLinear(nn.Module):
         else:
             raise ValueError(f"Unknown initialization: {initialization}")
 
-        if use_mv_heuristics:
-            # Heuristic correction factors for 9 CGA basis elements
-            # 6 grade projections + 3 cross-grade maps
+        if use_mv_heuristics and self._n_basis == NUM_PIN_LINEAR_BASIS_ELEMENTS:
+            # Legacy 9-element basis: per-grade heuristic
+            # (6 grade projections + 3 cross-grade maps).
             mv_component_factors = torch.sqrt(
                 torch.Tensor([1.0, 5.0, 10.0, 10.0, 5.0, 1.0, 0.5, 1.0, 0.5])
             )
+        elif use_mv_heuristics:
+            # Canonical SE(3) null-space basis (orthonormal maps): spread the
+            # legacy total init variance (~34) uniformly across the n_basis maps
+            # so the initial output scale matches the tuned 9-element baseline.
+            total_var = 34.0
+            mv_component_factors = torch.full(
+                (self._n_basis,), (total_var / self._n_basis) ** 0.5
+            )
         else:
-            mv_component_factors = torch.ones(NUM_PIN_LINEAR_BASIS_ELEMENTS)
+            mv_component_factors = torch.ones(self._n_basis)
 
         return mv_component_factors, mv_factor, mvs_bias_shift, s_factor
 

@@ -32,7 +32,7 @@ from src.cgatr.layers.mlp.config import MLPConfig
 from src.cgatr.interface.point import embed_point
 from src.cgatr.interface.scalar import embed_scalar
 from src.cgatr.interface.circle import embed_circle_ipns
-from src.cgatr.primitives.linear import _compute_pin_equi_linear_basis
+from src.cgatr.primitives.linear import _compute_se3_equi_linear_basis
 from src.cgatr.primitives.attention import _build_dist_basis, block_diagonal_bool_mask
 from src.cgatr.primitives.invariants import compute_inner_product_mask
 from src.cgatr.primitives.dual import _DualCache
@@ -62,7 +62,13 @@ class CGATrParquetModel(nn.Module):
         metadata = torch.load("cga_utils/cga_metadata.pt", weights_only=False)
         _DualCache.init_from_metadata(metadata, device=torch.device("cpu"))
 
-        pin_basis = _compute_pin_equi_linear_basis(device=torch.device("cpu"), dtype=torch.float32)
+        # Canonical SE(3)-equivariant CGA linear basis (de Haan et al. 2311.04744
+        # Sec. 3.3), computed as the null space of the Lie-algebra equivariance
+        # constraint. Replaces the old 9-element basis (which carried 3
+        # non-equivariant Hodge cross-grade maps). Self-verifies at construction.
+        pin_basis = _compute_se3_equi_linear_basis(
+            self.basis_gp, device=torch.device("cpu"), dtype=torch.float32
+        )
         basis_q, basis_k = _build_dist_basis(device=torch.device("cpu"), dtype=torch.float32)
         basis_ip_weights = compute_inner_product_mask(self.basis_gp, device=torch.device("cpu"))
 
@@ -120,6 +126,14 @@ class CGATrParquetModel(nn.Module):
         mv = mv + embed_scalar(hit_type)
 
         if self.args.normalize_mv_inputs:
+            # Euclidean per-hit normalization. This is ROTATION-equivariant (a
+            # rotation acts as a real orthogonal map on the 32 components, so the
+            # L2 norm is preserved) — which is the symmetry that matters for
+            # tracking. It is deliberately NOT translation-equivariant: the IP and
+            # detector sit at fixed positions, so absolute position is meaningful
+            # and translation is not a physical symmetry here. The equivariant CGA
+            # grade-wise norm cannot be used on the inputs because VTX hits are
+            # null vectors (<P,P> = 0), so their CGA norm is identically zero.
             mv_norm = torch.norm(mv, dim=-1, keepdim=True).clamp(min=1e-6)
             mv = mv / mv_norm
 

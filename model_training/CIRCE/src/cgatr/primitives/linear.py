@@ -86,6 +86,112 @@ def _compute_pin_equi_linear_basis(
     return catted_basis.to(device=device, dtype=dtype)
 
 
+def _compute_se3_equi_linear_basis(
+    gp: torch.Tensor,
+    device=torch.device("cpu"),
+    dtype=torch.float32,
+    tol: float = 1e-6,
+    verify: bool = True,
+) -> torch.Tensor:
+    """SE(3)-equivariant linear-map basis for CGA Cl(4,1).
+
+    Computed as the null space of the Lie-algebra equivariance constraint — the
+    numerical construction of de Haan et al. 2311.04744, Sec. 3.3 — rather than
+    hand-listed maps. This is the *correct* C-GATr linear layer: its span is
+    exactly the grade projections plus the e_inf (point-at-infinity)
+    multiplication maps the paper derives, with no ad-hoc Hodge cross-grade maps.
+
+    The generators of SE(3) ⊂ Spin(4,1) are the six bivectors
+        e1∧e2, e1∧e3, e2∧e3        (rotations)
+        e1∧∞,  e2∧∞,  e3∧∞         (translations,  ∞ = e+ + e-)
+    A linear map φ : Cl→Cl (a 32×32 matrix) is equivariant iff it commutes with
+    the algebra action dρ(B)·x = B x − x B of every generator B. We stack those
+    commutator constraints over all six generators and return an orthonormal
+    (Frobenius) basis of their null space.
+
+    We deliberately omit the extra mirror/parity constraint: a solenoidal B-field
+    makes track reconstruction chiral, so reflection equivariance is physically
+    inappropriate. The result is the SE(3) (proper rigid-motion) basis — a
+    superset of the full-E(3) one and the right inductive bias here.
+
+    Parameters
+    ----------
+    gp : torch.Tensor (32, 32, 32)
+        Geometric-product Cayley table.
+    verify : bool
+        If True, assert every returned map commutes with every generator.
+
+    Returns
+    -------
+    basis : torch.Tensor (n_basis, 32, 32)
+    """
+    n = NUM_MV_COMPONENTS
+    # Solve in float64 for a clean, well-separated null space.
+    gp64 = gp.to(device=device, dtype=torch.float64)
+
+    def _unit(idx: int) -> torch.Tensor:
+        v = torch.zeros(n, dtype=torch.float64, device=device)
+        v[idx] = 1.0
+        return v
+
+    e1, e2, e3 = _unit(1), _unit(2), _unit(3)
+    e_inf = _unit(4) + _unit(5)  # point at infinity ∞ = e+ + e-
+
+    def _gp_vec(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # geometric product of two multivectors: out_i = Σ_jk gp[i,j,k] a_j b_k
+        return torch.einsum("ijk,j,k->i", gp64, a, b)
+
+    generators = [
+        _gp_vec(e1, e2), _gp_vec(e1, e3), _gp_vec(e2, e3),        # so(3) rotations
+        _gp_vec(e1, e_inf), _gp_vec(e2, e_inf), _gp_vec(e3, e_inf),  # translations
+    ]
+
+    eye = torch.eye(n, dtype=torch.float64, device=device)
+    gen_matrices = []
+    # Accumulate the normal matrix G = Σ_B C_Bᵀ C_B (1024×1024). Its null space
+    # equals the common null space of all per-generator constraints C_B, but is
+    # far cheaper to factor than stacking them into a (6·1024, 1024) matrix.
+    G = torch.zeros(n * n, n * n, dtype=torch.float64, device=device)
+    for B in generators:
+        # dρ(B): x ↦ B x − x B, as a 32×32 matrix M.
+        m_left = torch.einsum("ikj,k->ij", gp64, B)   # (B x)_i = Σ_k gp[i,k,j] B_k
+        m_right = torch.einsum("ijk,k->ij", gp64, B)  # (x B)_i = Σ_k gp[i,j,k] B_k
+        M = m_left - m_right
+        gen_matrices.append(M)
+        # Operator on vec(φ): C(φ)[i,j] = Σ_kl T[i,j,k,l] φ[k,l] = (Mφ − φM)[i,j].
+        T = (torch.einsum("ik,lj->ijkl", M, eye)
+             - torch.einsum("ik,lj->ijkl", eye, M))
+        C = T.reshape(n * n, n * n)
+        G = G + C.T @ C
+
+    evals, evecs = torch.linalg.eigh(G)  # ascending eigenvalues; orthonormal cols
+    thresh = tol * (evals.abs().max() if evals.numel() else torch.tensor(1.0))
+    null_mask = evals < thresh
+    basis = evecs[:, null_mask].T.reshape(-1, n, n)  # (n_basis, 32, 32), orthonormal
+
+    if verify:
+        if basis.shape[0] == 0:
+            raise RuntimeError(
+                "SE(3)-equivariant CGA basis is empty — check the GP Cayley table."
+            )
+        for M in gen_matrices:
+            resid = (torch.einsum("ik,bkj->bij", M, basis)
+                     - torch.einsum("bik,kj->bij", basis, M))
+            max_resid = resid.abs().max().item()
+            if max_resid > 1e-6:
+                raise RuntimeError(
+                    f"CGA equivariance self-check failed: "
+                    f"max||[M_B, phi]|| = {max_resid:.2e} (expected ~0)."
+                )
+        print(
+            f"[cgatr] SE(3)-equivariant CGA linear basis: {basis.shape[0]} maps "
+            f"(verified, max residual {max_resid:.1e})",
+            flush=True,
+        )
+
+    return basis.to(dtype=dtype)
+
+
 def _compute_reversal(device=torch.device("cpu"), dtype=torch.float32) -> torch.Tensor:
     """Reversal signs for Cl(4,1): grade k gets sign (-1)^{k(k-1)/2}.
 

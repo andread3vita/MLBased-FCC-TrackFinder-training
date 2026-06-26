@@ -13,25 +13,13 @@ unzip cgatr_fcc_pkg.zip && cd cgatr_fcc_pkg
 # 2. Create conda environment (run once on login node, needs internet)
 bash setup_env.sh
 
-# 3. Edit train.slurm — fill in these SLURM headers:
-#      #SBATCH --partition=<your_partition>   # ask your cluster admins
-#      #SBATCH --gres=gpu:4
-#      #SBATCH --cpus-per-task=32
-#      #SBATCH --mem=256G
-#      #SBATCH --time=48:00:00
-#    Also set CONDA_PROFILE to your conda init script, e.g.:
-#      source /opt/conda/etc/profile.d/conda.sh
-#
-#    Data path is pre-filled:
-#      /eos/home-m/mcechovi/projects/cgatr/data_parquet_zqq_uds_v1
+# 3. Submit training
+./run_train.sh --data_dir /eos/experiment/fcc/ee/simulation/key4hep_2026_06_16/IDEA_v4_o1/Loopers/parquet --out_dir . --train_seed 1-800 --val_seed 801-1000
 
-# 4. Submit training
-sbatch train.slurm
-
-# 5. Monitor
+# 4. Monitor
 tail -f logs/slurm/cgatr_fcc_<JOBID>.out
 
-# 6. After training: run full evaluation (produces all plots)
+# 5. After training: run full evaluation (produces all plots)
 N_GPUS=4 bash run_eval.sh checkpoints/cgatr_fcc_prod/last.ckpt
 ```
 
@@ -48,21 +36,6 @@ DATA_DIR=/your/path sbatch train.slurm
 # or bare-metal:
 DATA_DIR=/your/path NUM_DEVICES=4 bash run_train.sh
 ```
-
-## Training
-
-**SLURM (recommended for 4xH100):**
-```bash
-sbatch train.slurm
-```
-
-**Bare-metal (4 GPUs directly):**
-```bash
-NUM_DEVICES=4 bash run_train.sh
-```
-
-Training checkpoints every 200 steps. Auto-resumes on SLURM requeue with
-`--resume_ckpt last` (picks up the latest `last.ckpt` or `last-v*.ckpt`).
 
 ## Tunables
 
@@ -107,5 +80,4 @@ but saves large amounts of activation memory.
 
 - PyTorch 2.5.1 + CUDA 12.1 (`cu121`)
 - `torch_scatter` must match the torch/CUDA wheel (see `setup_env.sh`)
-- H100 requires NVIDIA driver >= CUDA 12.1
 - `lightning >= 2.2` for DDP + SIGUSR1 requeue support

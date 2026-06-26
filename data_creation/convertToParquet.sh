@@ -19,7 +19,7 @@ PYTHON_SCRIPT="${REPO_DIR}/model_training/CIRCE/src/dataset/edm4hep_to_parquet.p
 mkdir -p "${OUTPUT_DIR}"
 
 find "${INPUT_DIR}" -type f -name "*.root" \
-    | sort \o
+    | sort \
     | parallel -j "${N_JOBS}" '
         file="{}"
         seed=$(basename "$file" | sed -n "s/.*DIGI_\([0-9]\+\)_train\.root/\1/p")

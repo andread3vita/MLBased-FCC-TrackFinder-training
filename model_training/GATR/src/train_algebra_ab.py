@@ -162,12 +162,6 @@ def parse_args():
 def main():
     a = parse_args()
 
-    if a.num_devices > 1 and a.max_tokens > 0:
-        raise SystemExit(
-            "--num_devices > 1 with a token budget would train every rank on identical "
-            "batches: the sampler does no rank slicing. See its docstring."
-        )
-
     # Disabled rather than absent: their training_step logs unconditionally.
     import wandb
     wandb.init(mode="disabled")
@@ -225,6 +219,9 @@ def main():
         accelerator="gpu",
         devices=a.num_devices,
         strategy="ddp" if a.num_devices > 1 else "auto",
+        # the token-budget sampler does its own rank slicing; Lightning must
+        # not try to wrap or replace it under DDP
+        use_distributed_sampler=False,
         logger=False,           # wandb is disabled and their module logs through it
         enable_progress_bar=False,
         enable_model_summary=True,

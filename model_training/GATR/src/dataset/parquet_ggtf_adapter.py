@@ -337,11 +337,12 @@ class TokenBudgetEventSampler(Sampler):
     derives its end-of-epoch validation trigger from the first epoch's batch count, so an epoch
     that packs even one batch shorter is never validated.
 
-    **Single-process only.** This does no rank slicing, so under DDP every rank would receive
-    the identical batch list and train on the same data while believing otherwise. Our own
-    `TokenBudgetBatchSampler` slices by rank and truncates to a multiple of world size to keep
-    the NCCL collectives aligned; port that first if the A/B ever needs more than one GPU per
-    arm. Running the two arms on two GPUs, one process each, needs none of it.
+    **DDP-aware.** Every rank builds the identical global batch list (the shuffle is seeded
+    by epoch only), truncates it to a multiple of world_size so all ranks step in lockstep
+    (no one-rank-finishes-first NCCL deadlocks), and takes the strided slice
+    `batches[rank::world_size]` -- each batch lands on exactly one rank. Ported from our own
+    `TokenBudgetBatchSampler`, which has run 4-GPU DDP all campaign. With WORLD_SIZE unset or
+    1 this is a no-op and the original single-process behavior is unchanged.
     """
 
     def __init__(self, sizes: List[int], max_tokens: int, shuffle: bool = True,
@@ -398,10 +399,20 @@ class TokenBudgetEventSampler(Sampler):
                       f"{min(counts)}-{max(counts)})", flush=True)
         return self._fixed
 
+    @staticmethod
+    def _rank_info():
+        rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        return rank, world_size
+
     def _build(self) -> List[List[int]]:
         batches = self._pack()
         if self.stable_epoch_length and self.shuffle:
             batches = batches[:self._target()]
+        rank, world = self._rank_info()
+        if world > 1:
+            usable = len(batches) - (len(batches) % world)
+            batches = batches[rank:usable:world]
         return batches
 
     def set_epoch(self, epoch: int) -> None:

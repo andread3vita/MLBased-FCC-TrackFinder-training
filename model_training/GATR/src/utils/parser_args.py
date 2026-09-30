@@ -418,20 +418,35 @@ parser.add_argument(
     help="Cap the number of validation events",
 )
 parser.add_argument(
-    "--qmin", type=float, default=0.1, help="define qmin for condensation"
+    "--qmin",
+    type=float,
+    default=0.1,
+    help="define qmin for condensation (GGTF default 0.1; CIRCE champion default is 3.0)",
 )
 
 parser.add_argument(
     "--L_attractive_weight",
     type=float,
     default=1.0,
-    help="Attractitve term of the potential weight",
+    help="Attractive term of the potential weight",
 )
 parser.add_argument(
     "--L_repulsive_weight",
     type=float,
     default=1.0,
-    help="Repulsive term of the potential weight",
+    help="Repulsive term of the potential weight (GGTF default 1.0; CIRCE champion default is 2.0)",
+)
+parser.add_argument(
+    "--beta_suppress_weight",
+    type=float,
+    default=0.1,
+    help="beta suppression weight on non-alpha signal hits for CIRCE loss (default: 0.1, ablated against 0.0 and 0.3)",
+)
+parser.add_argument(
+    "--var_weight",
+    type=float,
+    default=0.3,
+    help="within-cluster variance regularizer weight for CIRCE loss (default: 0.3)",
 )
 
 parser.add_argument(

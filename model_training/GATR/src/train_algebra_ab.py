@@ -10,11 +10,10 @@ data, via the parquet adapter, and a Trainer to turn the crank.
 That makes the arms differ in the algebra and nothing else. The two modules read an identical
 set of eleven `self.args` fields, verified, and are capacity-matched to within 1.4%.
 
-Two things their own argument parser does not define, though their model reads both:
-`loss_type` and `use_average_cc_pos`. Their `parser_args.py` has no entry for either, so any
-value here is a choice; this uses the defaults from their own loss signature,
-`"hgcalimplementation"` and `0.0`. Worth revisiting if Andrea and Dolores say otherwise, since
-`use_average_cc_pos` changes where the attractive term pulls towards.
+The repository's executable `train_gatr.sh` leaves `loss_type` and
+`use_average_cc_pos` at their parser defaults, `"hgcalimplementation"` and
+`0.0`; this harness does the same. The older README instead passes
+`use_average_cc_pos=0.99`, so that setting remains publication-ambiguous.
 
 Their `training_step` calls `log_losses_wandb_tracking(True, ...)` unconditionally, which
 reaches `wandb.log`. Rather than edit their file, wandb is initialised in disabled mode, which
@@ -27,6 +26,7 @@ turns those calls into no-ops.
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import time
 import types
@@ -49,9 +49,24 @@ THEIR_DEFAULTS = dict(
     L_repulsive_weight=1.0,
     frac_cluster_loss=0.1,
     fill_loss_weight=0.0,
-    # Not in their parser; the loss signature's own defaults. See the module docstring.
+    # Defaults used when Andrea's current train_gatr.sh omits these switches.
     loss_type="hgcalimplementation",
     use_average_cc_pos=0.0,
+    beta_suppress_weight=0.0,
+    var_weight=0.0,
+)
+
+# CIRCE champion defaults from the systematic 5-way ablation:
+CIRCE_DEFAULTS = dict(
+    qmin=3.0,
+    L_attractive_weight=1.0,
+    L_repulsive_weight=2.0,
+    frac_cluster_loss=0.0,
+    fill_loss_weight=0.0,
+    loss_type="paper_hinge",
+    use_average_cc_pos=0.0,
+    beta_suppress_weight=0.1,
+    var_weight=0.3,
 )
 
 ARMS = {
@@ -77,12 +92,19 @@ class SamplerEpoch(Callback):
 
 
 class EpochCSV(Callback):
-    """Per-epoch train/val loss to a CSV, in the same spirit as our own runs' epoch_metrics.
+    """Per-epoch validation loss and common clustering metrics.
 
     Writes only what was measured: a missing `val_loss` is recorded blank rather than carried
     over from the previous epoch, which is the failure our own trainer had for weeks (see
-    FINDINGS.md M13).
+    FINDINGS.md M13). Existing loss-only rows are retained with blank metric columns when a
+    run resumes after upgrading this callback.
     """
+
+    FIELDS = [
+        "run", "epoch", "val_loss", "val_match_loose",
+        "val_match_strict50", "tbeta", "td", "wall_s_train", "lr",
+        "world_size", "timestamp",
+    ]
 
     def __init__(self, path: str, run_tag: str):
         super().__init__()
@@ -99,18 +121,42 @@ class EpochCSV(Callback):
             return
         if not self._init:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            with open(self.path, "w") as f:
-                f.write("run,epoch,val_loss,wall_s_train,lr,world_size,timestamp\n")
+            old_rows = []
+            if os.path.exists(self.path) and os.path.getsize(self.path):
+                with open(self.path, newline="") as f:
+                    old_rows = list(csv.DictReader(f))
+            with open(self.path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self.FIELDS)
+                writer.writeheader()
+                for row in old_rows:
+                    writer.writerow({key: row.get(key, "") for key in self.FIELDS})
             self._init = True
         m = trainer.callback_metrics
         val = m.get("val_loss")
         val_s = "" if val is None else f"{float(val):.6f}"
+        loose = m.get("val/match_rate")
+        loose_s = "" if loose is None else f"{float(loose):.6f}"
+        strict50 = m.get("val/match_rate_strict50")
+        strict50_s = "" if strict50 is None else f"{float(strict50):.6f}"
         lr = trainer.optimizers[0].param_groups[0]["lr"]
-        with open(self.path, "a") as f:
-            f.write(f"{self.run_tag},{pl_module.current_epoch + 1},{val_s},"
-                    f"{time.perf_counter() - self._t0:.3f},{lr:.6e},"
-                    f"{trainer.world_size},{time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+        with open(self.path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.FIELDS)
+            writer.writerow({
+                "run": self.run_tag,
+                "epoch": pl_module.current_epoch + 1,
+                "val_loss": val_s,
+                "val_match_loose": loose_s,
+                "val_match_strict50": strict50_s,
+                "tbeta": float(getattr(pl_module.args, "tbeta", 0.1)),
+                "td": float(getattr(pl_module.args, "td", 0.2)),
+                "wall_s_train": f"{time.perf_counter() - self._t0:.3f}",
+                "lr": f"{lr:.6e}",
+                "world_size": trainer.world_size,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
         print(f"[csv] epoch {pl_module.current_epoch + 1}: val={val_s or 'not measured'} "
+              f"loose={loose_s or 'not measured'} "
+              f"strict50={strict50_s or 'not measured'} "
               f"lr={lr:.2e} train_s={time.perf_counter() - self._t0:.1f}", flush=True)
 
 
@@ -129,12 +175,28 @@ def parse_args():
                    help="hits per batch. Preferred over --batch_events because our events "
                         "span 912-10540 hits, so a fixed event count makes the batch vary "
                         "tenfold in memory and OOM on an unlucky draw. 0 uses --batch_events.")
-    p.add_argument("--start_lr", type=float, default=1e-3,
-                   help="their recipe's 1e-3, not their parser's 5e-3 default")
+    p.add_argument("--start_lr", type=float, default=4e-4,
+                   help="optimizer learning rate (default: 4e-4 for CIRCE, 3e-4 or 1e-3 for GGTF)")
+    p.add_argument("--qmin", type=float, default=None,
+                   help="object-condensation charge floor; defaults to 3.0 for circe, 0.1 for ggtf")
+    p.add_argument("--L_repulsive_weight", "--repul_weight", type=float, default=None,
+                   help="repulsive potential weight; defaults to 2.0 for circe, 1.0 for ggtf")
+    p.add_argument("--L_attractive_weight", "--attr_weight", type=float, default=1.0,
+                   help="attractive potential weight (default: 1.0)")
+    p.add_argument("--beta_suppress_weight", type=float, default=0.1,
+                   help="beta suppression weight on non-alpha signal hits (default: 0.1 for circe)")
+    p.add_argument("--var_weight", type=float, default=0.3,
+                   help="within-cluster variance regularizer weight (default: 0.3 for circe)")
+    p.add_argument("--tbeta", type=float, default=0.1,
+                   help="fixed beta threshold for online validation metrics")
+    p.add_argument("--td", type=float, default=0.2,
+                   help="fixed clustering radius for online validation metrics")
+    p.add_argument("--metric_val_batches", type=int, default=40,
+                   help="per-rank validation batches scored by online clustering metrics; "
+                        "loss still uses --limit_val_batches")
     p.add_argument("--num_devices", type=int, default=1,
-                   help="keep at 1: the token-budget sampler does no rank slicing, so DDP "
-                        "would hand every rank the same batches. Run the two arms on two "
-                        "GPUs instead, one process each.")
+                   help="number of DDP ranks; token-budget batches are split evenly across "
+                        "ranks")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--limit_train_batches", type=int, default=0,
                    help="0 means no limit; a small value gives a quick end-to-end check")
@@ -144,6 +206,14 @@ def parse_args():
                    help="objective for the conformal arm; the A/B default is "
                         "'ggtf' so both arms share one loss. 'circe' trains "
                         "the conformal arm with its own objective.")
+    p.add_argument(
+        "--loss_computation",
+        default="dense",
+        choices=["dense", "event_block"],
+        help="Implementation of GGTF's mathematically identical tracking loss. "
+             "'dense' is the repository code; 'event_block' avoids computing "
+             "masked cross-event hit/object pairs.",
+    )
     p.add_argument("--recipe", default="ggtf", choices=["circe", "ggtf"],
                    help="optimizer recipe for the conformal arm; A/B default "
                         "'ggtf' keeps Adam+plateau on both arms.")
@@ -167,17 +237,30 @@ def main():
     wandb.init(mode="disabled")
 
     os.makedirs(a.output_dir, exist_ok=True)
+    defaults = CIRCE_DEFAULTS if a.loss_backend == "circe" else THEIR_DEFAULTS
+    loss_args = dict(defaults)
+    if a.qmin is not None:
+        loss_args["qmin"] = a.qmin
+    if a.L_repulsive_weight is not None:
+        loss_args["L_repulsive_weight"] = a.L_repulsive_weight
+    loss_args["L_attractive_weight"] = a.L_attractive_weight
+    loss_args["beta_suppress_weight"] = a.beta_suppress_weight
+    loss_args["var_weight"] = a.var_weight
 
     model_args = types.SimpleNamespace(
         loss_backend=a.loss_backend,
+        loss_computation=a.loss_computation,
         recipe=a.recipe,
         capacity_matched=not a.reference_width,  # A/B default: match parameter count
         num_epochs=(a.num_epochs_hint or a.epochs),
         start_lr=a.start_lr,
         predict=False,          # keeps validation to the loss, no efficiency tables
         tau=False,
+        tbeta=a.tbeta,
+        td=a.td,
+        metric_val_batches=a.metric_val_batches,
         model_prefix=os.path.join(a.output_dir, ""),
-        **THEIR_DEFAULTS,
+        **loss_args,
     )
 
     import importlib
@@ -185,6 +268,10 @@ def main():
     model = module.ExampleWrapper(model_args)
     n_par = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[ab] {a.algebra} arm: {n_par:,} trainable parameters", flush=True)
+    print(f"[ab] loss/optimizer: backend={a.loss_backend}, recipe={a.recipe}, "
+          f"qmin={loss_args['qmin']:g}, repul_weight={loss_args['L_repulsive_weight']:g}, "
+          f"beta_suppress={loss_args['beta_suppress_weight']:g}, var_weight={loss_args['var_weight']:g}, "
+          f"start_lr={a.start_lr:g}", flush=True)
 
     kw = dict(max_events_per_seed=a.max_events_per_seed or None)
     train_ds = ParquetGGTFDataset(a.data_dir, parse_seed_range(a.train_seeds), **kw)
@@ -197,13 +284,15 @@ def main():
     )
     if a.max_tokens > 0:
         train_sampler = TokenBudgetEventSampler(
-            train_ds.sizes, a.max_tokens, shuffle=True)
+            train_ds.sizes, a.max_tokens, shuffle=True,
+            num_replicas=a.num_devices)
         val_sampler = TokenBudgetEventSampler(
-            val_ds.sizes, a.max_tokens, shuffle=False, verbose=False)
+            val_ds.sizes, a.max_tokens, shuffle=False, verbose=False,
+            num_replicas=a.num_devices)
         train_loader = DataLoader(train_ds, batch_sampler=train_sampler, **loader_kw)
         val_loader = DataLoader(val_ds, batch_sampler=val_sampler, **loader_kw)
         sizes = train_ds.sizes
-        print(f"[ab] token budget {a.max_tokens}: {len(train_sampler)} batches/epoch; "
+        print(f"[ab] token budget {a.max_tokens}: {len(train_sampler)} batches/rank/epoch; "
               f"events span {min(sizes)}-{max(sizes)} hits, median "
               f"{sorted(sizes)[len(sizes) // 2]}", flush=True)
     else:

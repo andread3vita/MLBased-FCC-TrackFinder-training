@@ -14,7 +14,9 @@ from src.layers.inference_oc_tracks import (
     get_clustering
 )
 from src.layers.losses import object_condensation_loss_tracking
+from src.layers.losses_per_event import object_condensation_loss_tracking_per_event
 from src.layers.batch_operations import obtain_batch_numbers
+from src.layers.validation_metrics import compute_batch_metrics_greedy
 
 from src.gatr_v111.nets.gatr import GATr
 from src.gatr_v111.layers.attention.config import SelfAttentionConfig
@@ -77,6 +79,7 @@ class ExampleWrapper(L.LightningModule):
         self.beta = nn.Linear(16, 1)
         self.vector_like_data = True
         self.df_batch_buffer = []
+        self._val_metrics = []
 
     def load_basis(self):
 
@@ -144,6 +147,31 @@ class ExampleWrapper(L.LightningModule):
             torch.bincount(batch_numbers.long()).tolist()
         )
 
+    def _tracking_loss(self, batch_g, model_output, y):
+        implementation = getattr(self.args, "loss_computation", "dense")
+        if implementation == "dense":
+            function = object_condensation_loss_tracking
+        elif implementation == "event_block":
+            function = object_condensation_loss_tracking_per_event
+        else:
+            raise ValueError(f"unknown GGTF loss computation: {implementation}")
+        return function(
+            batch_g,
+            model_output,
+            y,
+            clust_loss_only=True,
+            add_energy_loss=False,
+            calc_e_frac_loss=False,
+            q_min=self.args.qmin,
+            frac_clustering_loss=self.args.frac_cluster_loss,
+            attr_weight=self.args.L_attractive_weight,
+            repul_weight=self.args.L_repulsive_weight,
+            fill_loss_weight=self.args.fill_loss_weight,
+            use_average_cc_pos=self.args.use_average_cc_pos,
+            loss_type=self.args.loss_type,
+            tracking=True,
+        )
+
     def training_step(self, batch, batch_idx):
         y = batch[1]
         batch_g = batch[0]
@@ -164,22 +192,7 @@ class ExampleWrapper(L.LightningModule):
         #     clustering += 1
         # labels = clustering.long()
 
-        (loss, losses) = object_condensation_loss_tracking(
-            batch_g,
-            model_output,
-            y,
-            clust_loss_only=True,
-            add_energy_loss=False,
-            calc_e_frac_loss=False,
-            q_min=self.args.qmin,
-            frac_clustering_loss=self.args.frac_cluster_loss,
-            attr_weight=self.args.L_attractive_weight,
-            repul_weight=self.args.L_repulsive_weight,
-            fill_loss_weight=self.args.fill_loss_weight,
-            use_average_cc_pos=self.args.use_average_cc_pos,
-            loss_type= self.args.loss_type,
-            tracking=True,
-        )
+        loss, losses = self._tracking_loss(batch_g, model_output, y)
                 
         if torch.isnan(loss):
             print(f"Batch {batch_idx} returns NaN, skip.")
@@ -320,22 +333,7 @@ class ExampleWrapper(L.LightningModule):
         # sys.exit()
         batch_g.ndata["model_output"] = model_output
 
-        (loss, losses) = object_condensation_loss_tracking(
-            batch_g,
-            model_output,
-            y,
-            clust_loss_only=True,
-            add_energy_loss=False,
-            calc_e_frac_loss=False,
-            q_min=self.args.qmin,
-            frac_clustering_loss=self.args.frac_cluster_loss,
-            attr_weight=self.args.L_attractive_weight,
-            repul_weight=self.args.L_repulsive_weight,
-            fill_loss_weight=self.args.fill_loss_weight,
-            use_average_cc_pos=self.args.use_average_cc_pos,
-            loss_type=self.args.loss_type,
-            tracking=True,
-        )
+        loss, losses = self._tracking_loss(batch_g, model_output, y)
 
         if self.trainer.is_global_zero:
                 
@@ -405,6 +403,18 @@ class ExampleWrapper(L.LightningModule):
             prog_bar=True,
             sync_dist=True
         )
+
+        metric_batches = int(getattr(self.args, "metric_val_batches", 40))
+        if metric_batches <= 0 or batch_idx < metric_batches:
+            self._val_metrics.append(compute_batch_metrics_greedy(
+                model_output[:, :-1],
+                model_output[:, -1:],
+                batch_g.ndata["particle_number"],
+                batch_g.ndata["isSecondary"].view(-1),
+                batch_g.batch_num_nodes().tolist(),
+                tbeta=float(getattr(self.args, "tbeta", 0.1)),
+                td=float(getattr(self.args, "td", 0.2)),
+            ))
         
         # part_keys = [
         # "part_theta",    # 0
@@ -500,6 +510,7 @@ class ExampleWrapper(L.LightningModule):
 
     def on_validation_epoch_start(self):
         self.make_mom_zero()
+        self._val_metrics = []
         self.df_batch_buffer = []
         self.df_showers = []
         self.df_showers_hits = []
@@ -511,6 +522,19 @@ class ExampleWrapper(L.LightningModule):
             self.ScaledGooeyBatchNorm2_1.momentum = 0
 
     def on_validation_epoch_end(self):
+        loose = (
+            float(np.mean([m["match_rate"] for m in self._val_metrics]))
+            if self._val_metrics else 0.0
+        )
+        strict50 = (
+            float(np.mean([
+                m["match_rate_strict50"] for m in self._val_metrics
+            ]))
+            if self._val_metrics else 0.0
+        )
+        log_kwargs = dict(on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("val/match_rate", loose, **log_kwargs)
+        self.log("val/match_rate_strict50", strict50, **log_kwargs)
 
         if self.args.predict:
             store_at_batch_end(

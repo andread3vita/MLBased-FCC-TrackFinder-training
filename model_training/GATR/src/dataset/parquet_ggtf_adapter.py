@@ -347,16 +347,20 @@ class TokenBudgetEventSampler(Sampler):
 
     def __init__(self, sizes: List[int], max_tokens: int, shuffle: bool = True,
                  stable_epoch_length: bool = True, probe_epochs: int = 64,
-                 verbose: bool = True):
+                 verbose: bool = True, num_replicas: Optional[int] = None,
+                 rank: Optional[int] = None):
         self.sizes = list(sizes)
         self.max_tokens = max_tokens
         self.shuffle = shuffle
         self.stable_epoch_length = stable_epoch_length
         self.probe_epochs = probe_epochs
         self.verbose = verbose
+        self.num_replicas = num_replicas
+        self.rank = rank
         self._epoch = 0
         self._fixed: Optional[int] = None
         self._cached: Optional[List[List[int]]] = None
+        self._cached_context: Optional[Tuple[int, int, int]] = None
 
     def _pack(self) -> List[List[int]]:
         order = list(range(len(self.sizes)))
@@ -399,10 +403,15 @@ class TokenBudgetEventSampler(Sampler):
                       f"{min(counts)}-{max(counts)})", flush=True)
         return self._fixed
 
-    @staticmethod
-    def _rank_info():
-        rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+    def _rank_info(self):
+        rank = (int(os.environ.get("LOCAL_RANK", 0))
+                if self.rank is None else self.rank)
+        world_size = (int(os.environ.get("WORLD_SIZE", 1))
+                      if self.num_replicas is None else self.num_replicas)
+        if world_size < 1:
+            raise ValueError(f"num_replicas must be positive, got {world_size}")
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank {rank} outside world size {world_size}")
         return rank, world_size
 
     def _build(self) -> List[List[int]]:
@@ -418,15 +427,26 @@ class TokenBudgetEventSampler(Sampler):
     def set_epoch(self, epoch: int) -> None:
         self._epoch = epoch
         self._cached = self._build()
+        rank, world = self._rank_info()
+        self._cached_context = (self._epoch, rank, world)
+
+    def _ensure_cache(self) -> None:
+        rank, world = self._rank_info()
+        context = (self._epoch, rank, world)
+        # Lightning's direct-DDP launcher constructs rank 0 before setting
+        # WORLD_SIZE. A cache made in that phase is the unsliced global list.
+        # Rebuild when the distributed context changes so rank 0 cannot enter
+        # an epoch with twice as many batches as the spawned ranks.
+        if self._cached is None or self._cached_context != context:
+            self._cached = self._build()
+            self._cached_context = context
 
     def __iter__(self):
-        if self._cached is None:
-            self._cached = self._build()
+        self._ensure_cache()
         yield from self._cached
 
     def __len__(self) -> int:
-        if self._cached is None:
-            self._cached = self._build()
+        self._ensure_cache()
         return len(self._cached)
 
 

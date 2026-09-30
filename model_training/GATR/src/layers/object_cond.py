@@ -1,9 +1,11 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 import numpy as np
 import torch
 from torch_scatter import scatter_max, scatter_add, scatter_mean
 import dgl
 import sys
+
+from src.utils.track_weighting import pt_track_weights, weighted_mean
 
 def safe_index(arr, index):
     # One-hot index (or zero if it's not in the array)
@@ -20,6 +22,36 @@ def assert_no_nans(x):
     if torch.isnan(x).any():
         print(x)
     assert not torch.isnan(x).any()
+
+
+def second_highest_beta_loss(
+    signal_beta: torch.Tensor,
+    object_index: torch.Tensor,
+    index_alpha: torch.Tensor,
+    n_hits_per_object: torch.Tensor,
+    n_objects: int,
+    object_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Mean second-highest signal beta per truth object.
+
+    A single-hit object has no competing condensation point and therefore
+    contributes zero.  This reduction is called only when its loss weight is
+    non-zero.
+    """
+    second_candidates = signal_beta.clone()
+    second_candidates[index_alpha] = -1.0
+    second_beta = scatter_max(
+        second_candidates,
+        object_index,
+        dim=0,
+        dim_size=n_objects,
+    )[0]
+    second_beta = torch.where(
+        n_hits_per_object > 1,
+        second_beta,
+        torch.zeros_like(second_beta),
+    )
+    return weighted_mean(second_beta, object_weights)
 
 
 # FIXME: Use a logger instead of this
@@ -91,6 +123,14 @@ def calc_LV_Lbeta(
     repul_weight=1.0,
     fill_loss_weight=0.0,
     use_average_cc_pos=0.0,
+    beta_suppress_weight=0.0,
+    beta_second_weight=0.0,
+    var_weight=0.0,
+    hard_negative_weight=1.0,
+    hard_negative_max_weight=100.0,
+    pt_track_weighting=False,
+    pt_track_weight_bin_edges=(0.4, 0.9, 5.0),
+    pt_track_weight_bin_weights=(1.5, 1.2, 0.75, 2.0),
     loss_type="hgcalimplementation",
     hit_energies=None,
     tracking=False,
@@ -120,11 +160,14 @@ def calc_LV_Lbeta(
     """
     # remove dummy rows added for dataloader #TODO think of better way to do this
     device = beta.device
+    # Most loss tensors follow Lightning's precision policy.  The charge
+    # transformation is handled in float32 below because its 1e-4 clamp is not
+    # representable near one in bf16/float16.
     somethingIsNaN = False
     if torch.isnan(beta).any():
         print("There are nans in beta! L198", len(beta[torch.isnan(beta)]))
         somethingIsNaN = True
-    beta = torch.nan_to_num(beta, nan=0.0)
+    beta = torch.nan_to_num(beta, nan=0.0, posinf=1.0, neginf=0.0)
     assert_no_nans(beta)
     # ________________________________
 
@@ -138,13 +181,10 @@ def calc_LV_Lbeta(
     cluster_index, n_clusters_per_event = batch_cluster_indices(cluster_index_per_event, batch)
     # print("[DEBUG] cluster_index:", cluster_index)
     # print("[DEBUG] n_clusters_per_event:", n_clusters_per_event)
-    n_clusters = n_clusters_per_event.sum()
-    # print("[DEBUG] total number of clusters:", n_clusters)
-    
     # Cluster space coordinates
     n_hits, cluster_space_dim = cluster_space_coords.size()
     # print("[DEBUG] cluster_space_coords shape:", cluster_space_coords.shape)
-    batch_size = batch.max() + 1
+    batch_size = n_clusters_per_event.numel()
     # print("[DEBUG] batch size:", batch_size)
 
     n_hits_per_event = scatter_count(batch)
@@ -152,6 +192,8 @@ def calc_LV_Lbeta(
 
     # Index mapping clusters to events
     batch_cluster = scatter_counts_to_indices(n_clusters_per_event)
+    n_clusters = batch_cluster.numel()
+    # print("[DEBUG] total number of clusters:", n_clusters)
     # print("[DEBUG] batch_cluster shape:", batch_cluster.shape)
     # print("[DEBUG] batch_cluster sample:", batch_cluster)
     
@@ -164,7 +206,12 @@ def calc_LV_Lbeta(
     # print("[DEBUG] number of signal hits:", is_sig.sum())
 
     n_hits_sig = is_sig.sum()
-    n_sig_hits_per_event = scatter_count(batch[is_sig])
+    n_sig_hits_per_event = scatter_add(
+        torch.ones_like(batch[is_sig], dtype=torch.long),
+        batch[is_sig],
+        dim=0,
+        dim_size=batch_size,
+    )
     # print("[DEBUG] n_hits_sig:", n_hits_sig)
     # print("[DEBUG] n_sig_hits_per_event:", n_sig_hits_per_event)
 
@@ -174,14 +221,110 @@ def calc_LV_Lbeta(
     # print("[DEBUG] number of objects:", is_object.sum())
     # print("[DEBUG] number of noise clusters:", is_noise_cluster.sum())
 
-    # Object indices for hits
+    n_objects = int(is_object.sum().item())
+
+    # The noise-beta term is well-defined even when the batch has no truth
+    # objects.  Compute it before constructing object indices so an all-noise
+    # batch can return cleanly without reductions such as max() on empty
+    # tensors.
+    n_noise_hits_per_event = scatter_add(
+        torch.ones_like(batch[is_noise], dtype=torch.long),
+        batch[is_noise],
+        dim=0,
+        dim_size=batch_size,
+    ).clamp(min=1)
+    beta_noise_per_event = scatter_add(
+        beta[is_noise],
+        batch[is_noise],
+        dim=0,
+        dim_size=batch_size,
+    )
+    L_beta_noise = (
+        s_B * (beta_noise_per_event / n_noise_hits_per_event).sum() / batch_size
+    )
+
+    zero_embedding_loss = cluster_space_coords.sum() * 0.0
+    zero_beta_loss = beta.sum() * 0.0
+    if n_objects == 0:
+        L_V_attractive = zero_embedding_loss
+        L_V_repulsive = zero_embedding_loss
+        L_V = attr_weight * L_V_attractive + repul_weight * L_V_repulsive
+        L_beta_sig = zero_beta_loss
+        L_beta_suppress = zero_beta_loss
+        L_beta_second = zero_beta_loss
+        L_beta_second_contribution = zero_beta_loss
+        L_var = zero_embedding_loss
+        L_beta = (
+            L_beta_noise
+            + L_beta_sig
+            + L_beta_suppress
+            + L_beta_second_contribution
+            + var_weight * L_var
+        )
+        return (
+            L_V,
+            L_beta,
+            L_V_attractive,
+            L_V_repulsive,
+            L_beta_sig,
+            L_beta_noise,
+            L_beta_suppress,
+            L_var,
+            L_beta_second,
+            L_beta_second_contribution,
+        )
+
+    if pt_track_weighting and loss_type != "hgcalimplementation":
+        raise ValueError(
+            "pT track weighting is currently supported only for "
+            "loss_type=hgcalimplementation"
+        )
+
+    # Object indices for hits.  Build them from the complete cluster list,
+    # rather than calling batch_cluster_indices() on signal hits only.  The
+    # latter cannot represent an event that contains no signal objects.
     if noise_cluster_index != 0:
         raise NotImplementedError
-    object_index_per_event = cluster_index_per_event[is_sig] - 1
-    object_index, n_objects_per_event = batch_cluster_indices(object_index_per_event, batch[is_sig])
-    n_hits_per_object = scatter_count(object_index)
+    cluster_to_object = torch.full(
+        (n_clusters,), -1, dtype=torch.long, device=device
+    )
+    cluster_to_object[is_object] = torch.arange(n_objects, device=device)
+    object_index = cluster_to_object[cluster_index[is_sig]]
+    n_objects_per_event = scatter_add(
+        is_object.long(), batch_cluster, dim=0, dim_size=batch_size
+    )
+    n_hits_per_object = scatter_add(
+        torch.ones_like(object_index, dtype=torch.long),
+        object_index,
+        dim=0,
+        dim_size=n_objects,
+    )
     batch_object = batch_cluster[is_object]
-    n_objects = is_object.sum()
+
+    object_pt_weights = None
+    if pt_track_weighting:
+        if y is None or y.ndim != 2 or y.shape[1] <= 6:
+            raise ValueError(
+                "pT track weighting requires truth rows with pT in column 6"
+            )
+        if y.shape[0] != n_objects:
+            raise ValueError(
+                "pT track weighting requires one aligned truth row per object "
+                f"(got {y.shape[0]} rows for {n_objects} objects)"
+            )
+        if y.shape[1] > 7 and not torch.equal(
+            y[:, -1].long().to(device=batch_object.device), batch_object.long()
+        ):
+            raise ValueError(
+                "pT track weighting found truth rows that are not aligned with "
+                "the batched object ordering"
+            )
+        object_pt_weights = pt_track_weights(
+            y[:, 6].to(device=device),
+            pt_track_weight_bin_edges,
+            pt_track_weight_bin_weights,
+            dtype=cluster_space_coords.dtype,
+        )
 
     # Assertions
     # print("[DEBUG] object_index shape:", object_index.shape)
@@ -198,15 +341,23 @@ def calc_LV_Lbeta(
     # L_V term
 
     # Calculate q
+    beta_for_q = (
+        beta.float()
+        if beta.dtype in (torch.bfloat16, torch.float16)
+        else beta
+    )
     if loss_type == "hgcalimplementation" or loss_type == "vrepweighted":
-        q = (beta.clip(0.0, 1 - 1e-4).arctanh() / 1.01) ** 2 + qmin
+        q = (beta_for_q.clip(0.0, 1 - 1e-4).arctanh() / 1.01) ** 2 + qmin
     elif beta_stabilizing == "paper":
-        q = beta.arctanh() ** 2 + qmin
+        q = beta_for_q.arctanh() ** 2 + qmin
     elif beta_stabilizing == "clip":
-        beta = beta.clip(0.0, 1 - 1e-4)
-        q = beta.arctanh() ** 2 + qmin
+        beta_for_q = beta_for_q.clip(0.0, 1 - 1e-4)
+        q = beta_for_q.arctanh() ** 2 + qmin
     elif beta_stabilizing == "soft_q_scaling":
-        q = (beta.clip(0.0, 1 - 1e-4) / 1.002).arctanh() ** 2 + qmin
+        q = (
+            (beta_for_q.clip(0.0, 1 - 1e-4) / 1.002).arctanh() ** 2
+            + qmin
+        )
     else:
         raise ValueError(f"beta_stablizing mode {beta_stabilizing} is not known")
     assert_no_nans(q)
@@ -225,14 +376,17 @@ def calc_LV_Lbeta(
     if use_average_cc_pos > 0:
         #! this is a func of beta and q so maybe we could also do it with only q
         x_alpha_sum = scatter_add(
-            q[is_sig].view(-1, 1).repeat(1, 3) * cluster_space_coords[is_sig],
+            q[is_sig].view(-1, 1).repeat(1, cluster_space_dim)
+            * cluster_space_coords[is_sig],
             object_index,
             dim=0,
         )  # * beta[is_sig].view(-1, 1).repeat(1, 3)
         qbeta_alpha_sum = scatter_add(q[is_sig], object_index) + 1e-9  # * beta[is_sig]
         div_fac = 1 / qbeta_alpha_sum
         div_fac = torch.nan_to_num(div_fac, nan=0)
-        x_alpha_mean = torch.mul(x_alpha_sum, div_fac.view(-1, 1).repeat(1, 3))
+        x_alpha_mean = torch.mul(
+            x_alpha_sum, div_fac.view(-1, 1).repeat(1, cluster_space_dim)
+        )
         x_alpha = use_average_cc_pos * x_alpha_mean + (1 - use_average_cc_pos) * x_alpha
     if dis:
         phi_sum = scatter_add(
@@ -247,6 +401,14 @@ def calc_LV_Lbeta(
     assert x_alpha.size() == (n_objects, cluster_space_dim)
     assert beta_alpha.size() == (n_objects,)
 
+    # The training configuration uses the HGCAL-style potential.  Its dense
+    # implementation below materializes every hit/object pair in the complete
+    # mini-batch and masks cross-event pairs only afterwards.  Keep the legacy
+    # matrices for the other loss variants, but avoid constructing them for the
+    # HGCAL path.
+    eventwise_hgcal = loss_type == "hgcalimplementation"
+    compute_attractive = attr_weight != 0.0
+    compute_repulsive = repul_weight != 0.0
     # Connectivity matrix from hit (row) -> cluster (column)
     # Index to matrix, e.g.:
     # [1, 3, 1, 0] --> [
@@ -255,16 +417,17 @@ def calc_LV_Lbeta(
     #     [0, 1, 0, 0],
     #     [1, 0, 0, 0]
     #     ]
-    M = torch.nn.functional.one_hot(cluster_index).long()
+    if not eventwise_hgcal:
+        M = torch.nn.functional.one_hot(cluster_index).long()
 
-    # Anti-connectivity matrix; be sure not to connect hits to clusters in different events!
-    M_inv = get_inter_event_norms_mask(batch, n_clusters_per_event) - M
+        # Anti-connectivity matrix; be sure not to connect hits to clusters in different events!
+        M_inv = get_inter_event_norms_mask(batch, n_clusters_per_event) - M
 
-    # Throw away noise cluster columns; we never need them
-    M = M[:, is_object]
-    M_inv = M_inv[:, is_object]
-    assert M.size() == (n_hits, n_objects)
-    assert M_inv.size() == (n_hits, n_objects)
+        # Throw away noise cluster columns; we never need them
+        M = M[:, is_object]
+        M_inv = M_inv[:, is_object]
+        assert M.size() == (n_hits, n_objects)
+        assert M_inv.size() == (n_hits, n_objects)
 
     # -------
     # Attractive potential term
@@ -272,7 +435,41 @@ def calc_LV_Lbeta(
     # w.r.t. the object they belong to, i.e. no noise hits and no noise clusters.
     # First select all norms of all signal hits w.r.t. all objects, mask out later
 
-    if loss_type == "hgcalimplementation" or loss_type == "vrepweighted":
+    if eventwise_hgcal and compute_attractive:
+        # Only the distance from each signal hit to its own object contributes
+        # to the attractive potential.  Computing all N_signal x K distances
+        # and multiplying the unwanted entries by zero is unnecessary.
+        signal_coords = cluster_space_coords[is_sig]
+        norms_att = torch.sum(
+            torch.square(signal_coords - x_alpha[object_index]), dim=-1
+        )
+        if dis:
+            norms_att = norms_att / (
+                2 * phi_alpha[object_index].square() + 1e-6
+            )
+            norms_att = torch.log(
+                norms_att.new_tensor(np.e) * norms_att + 1
+            )
+        else:
+            norms_att = torch.log(
+                norms_att.new_tensor(np.e) * norms_att / 2 + 1
+            )
+
+        attractive_per_hit = (
+            q[is_sig] * q_alpha[object_index] * norms_att
+        )
+        attractive_per_object = scatter_add(
+            attractive_per_hit, object_index, dim=0
+        )
+        attractive_per_object = attractive_per_object / (
+            n_hits_per_object.to(attractive_per_object.dtype) + 1e-3
+        )
+        L_V_attractive = weighted_mean(
+            attractive_per_object, object_pt_weights
+        )
+    elif eventwise_hgcal:
+        L_V_attractive = zero_embedding_loss
+    elif loss_type == "hgcalimplementation" or loss_type == "vrepweighted":
         if dis:
             N_k = torch.sum(M, dim=0)  # number of hits per object
             norms = torch.sum(
@@ -283,7 +480,7 @@ def calc_LV_Lbeta(
             norms_att = norms_att / (2 * phi_alpha.unsqueeze(0) ** 2 + 1e-6)
             #! att func as in line 159 of object condensation
             norms_att = torch.log(
-                torch.exp(torch.Tensor([1]).to(norms_att.device)) * norms_att + 1
+                norms_att.new_tensor(np.e) * norms_att + 1
             )
         else:
             N_k = torch.sum(M, dim=0)  # number of hits per object
@@ -295,7 +492,7 @@ def calc_LV_Lbeta(
             #! att func as in line 159 of object condensation
 
             norms_att = torch.log(
-                torch.exp(torch.Tensor([1]).to(norms_att.device)) * norms_att / 2 + 1
+                norms_att.new_tensor(np.e) * norms_att / 2 + 1
             )
     elif huberize_norm_for_V_attractive:
         norms_att = norms[is_sig]
@@ -307,14 +504,18 @@ def calc_LV_Lbeta(
         norms_att = norms[is_sig]
         # Paper version is simply norms squared (no need for mask)
         norms_att = norms_att**2
-    assert norms_att.size() == (n_hits_sig, n_objects)
+    if not eventwise_hgcal:
+        assert norms_att.size() == (n_hits_sig, n_objects)
 
-    # Now apply the mask to keep only norms of signal hits w.r.t. to the object
-    # they belong to
-    norms_att *= M[is_sig]
+        # Now apply the mask to keep only norms of signal hits w.r.t. to the object
+        # they belong to
+        norms_att *= M[is_sig]
 
     # Sum over hits, then sum per event, then divide by n_hits_per_event, then sum over events
-    if loss_type == "hgcalimplementation":
+    if eventwise_hgcal:
+        # L_V_attractive was reduced directly per object above.
+        pass
+    elif loss_type == "hgcalimplementation":
         # Final potential term
         # (n_sig_hits, 1) * (1, n_objects) * (n_sig_hits, n_objects)
         V_attractive = q[is_sig].unsqueeze(-1) * q_alpha.unsqueeze(0) * norms_att
@@ -356,9 +557,9 @@ def calc_LV_Lbeta(
         V_attractive = q[is_sig].unsqueeze(-1) * q_alpha.unsqueeze(0) * norms_att
         assert V_attractive.size() == (n_hits_sig, n_objects)
         #! in comparison this works per hit
-        V_attractive = (
-            scatter_add(V_attractive.sum(dim=0), batch_object) / n_hits_per_event
-        )
+        V_attractive = scatter_add(
+            V_attractive.sum(dim=0), batch_object, dim=0, dim_size=batch_size
+        ) / n_hits_per_event
         assert V_attractive.size() == (batch_size,)
         L_V_attractive = V_attractive.sum()
 
@@ -370,28 +571,93 @@ def calc_LV_Lbeta(
     # We do however want to keep norms of noise hits w.r.t. objects
     # Power-scale the norms: Gaussian scaling term instead of a cone
     # Mask out the norms of hits w.r.t. the cluster they belong to
-    if loss_type == "hgcalimplementation" or loss_type == "vrepweighted" or loss_type == "weighted":
+    if eventwise_hgcal and compute_repulsive:
+        # Repulsion is defined only between hits and other truth objects in the
+        # same event.  Build one event block at a time instead of first forming
+        # an N_total x K_total matrix and masking its cross-event blocks.
+        repulsive_per_object_blocks = []
+        for event_index in range(len(n_hits_per_event)):
+            event_hit_mask = batch == event_index
+            event_object_mask = batch_object == event_index
+            event_centers = x_alpha[event_object_mask]
+            if event_centers.shape[0] == 0:
+                continue
+
+            event_coords = cluster_space_coords[event_hit_mask]
+            event_norms = torch.sum(
+                torch.square(
+                    event_coords.unsqueeze(1) - event_centers.unsqueeze(0)
+                ),
+                dim=-1,
+            )
+            if dis:
+                event_norms = event_norms / (
+                    2 * phi_alpha[event_object_mask].unsqueeze(0).square() + 1e-6
+                )
+
+            # Particle labels are local to each event: zero denotes noise and
+            # positive labels map consecutively onto that event's objects.
+            event_truth_object = (
+                cluster_index_per_event[event_hit_mask].long() - 1
+            )
+            local_object_ids = torch.arange(
+                event_centers.shape[0], device=device
+            )
+            repulsion_mask = (
+                event_truth_object.unsqueeze(1)
+                != local_object_ids.unsqueeze(0)
+            )
+            event_norms_rep = torch.exp(
+                -event_norms if dis else -event_norms / 2
+            ) * repulsion_mask
+            event_v_repulsive = (
+                q[event_hit_mask].unsqueeze(1)
+                * q_alpha[event_object_mask].unsqueeze(0)
+                * event_norms_rep
+            )
+            repulsive_counts = repulsion_mask.sum(dim=0).clamp(min=1)
+            repulsive_per_object_blocks.append(
+                event_v_repulsive.sum(dim=0)
+                / repulsive_counts.to(event_v_repulsive.dtype)
+            )
+
+        L_V_repulsive = torch.cat(repulsive_per_object_blocks)
+        delta_MC = calculate_delta_MC(
+            y, g, dtype=cluster_space_coords.dtype
+        )
+        weight_track = torch.pow(
+            delta_MC.clamp(min=0.001), -hard_negative_weight
+        ).clamp(max=hard_negative_max_weight)
+        if object_pt_weights is not None:
+            weight_track = weight_track * object_pt_weights
+        L_V_repulsive = torch.sum(
+            L_V_repulsive * weight_track.view(-1)
+        ) / torch.sum(weight_track)
+    elif eventwise_hgcal:
+        L_V_repulsive = zero_embedding_loss
+    elif loss_type == "hgcalimplementation" or loss_type == "vrepweighted" or loss_type == "weighted":
         if dis:
             norms = norms / (2 * phi_alpha.unsqueeze(0) ** 2 + 1e-6)
             norms_rep = torch.exp(-(norms)) * M_inv
-            norms_rep2 = torch.exp(-(norms) * 5) * M_inv
         else:
             norms_rep = torch.exp(-(norms) / 2) * M_inv
-            # norms_rep2 = torch.exp(-(norms) * 10) * M_inv
-            norms_rep2 = torch.exp(-(norms) * 10) * M_inv
     else:
         norms_rep = torch.exp(-4.0 * norms**2) * M_inv
 
     # (n_sig_hits, 1) * (1, n_objects) * (n_sig_hits, n_objects)
-    V_repulsive = q.unsqueeze(1) * q_alpha.unsqueeze(0) * norms_rep
+    if not eventwise_hgcal:
+        V_repulsive = q.unsqueeze(1) * q_alpha.unsqueeze(0) * norms_rep
 
-    # No need to apply a V = max(0, V); by construction V>=0
-    assert V_repulsive.size() == (n_hits, n_objects)
+        # No need to apply a V = max(0, V); by construction V>=0
+        assert V_repulsive.size() == (n_hits, n_objects)
 
     # Sum over hits, then sum per event, then divide by n_hits_per_event, then sum up events
-    nope = n_objects_per_event - 1
-    nope[nope == 0] = 1
-    if loss_type == "hgcalimplementation" or loss_type == "vrepweighted" or loss_type == "weighted":
+    nope = (n_objects_per_event - 1).clamp(min=1)
+    if eventwise_hgcal:
+        # L_V_repulsive was globally normalized above after concatenating the
+        # event-local per-object contributions in their original order.
+        pass
+    elif loss_type == "hgcalimplementation" or loss_type == "vrepweighted" or loss_type == "weighted":
         #! sum each object repulsive terms
         L_V_repulsive = V_repulsive.sum(dim=0)  # size number of objects
         number_of_repulsive_terms_per_object = torch.sum(M_inv, dim=0)
@@ -416,8 +682,15 @@ def calc_LV_Lbeta(
         
         else:
             # this needs to be done per graph
-            delta_MC = calculate_delta_MC(y, g)
-            weight_track = 1/(delta_MC+0.001)
+            delta_MC = calculate_delta_MC(
+                y, g, dtype=cluster_space_coords.dtype
+            )
+            # Nearby truth tracks are the difficult negatives. Periodic delta-R
+            # is used by calculate_delta_MC; the exponent controls how strongly
+            # these cases are emphasized and the cap prevents unstable spikes.
+            weight_track = torch.pow(
+                delta_MC.clamp(min=0.001), -hard_negative_weight
+            ).clamp(max=hard_negative_max_weight)
             #L_V_repulsive = torch.mean(L_V_repulsive)
             
             L_V_repulsive = torch.sum(L_V_repulsive * weight_track.view(-1))/torch.sum(weight_track)
@@ -425,24 +698,14 @@ def calc_LV_Lbeta(
             
     else:
         L_V_repulsive = (
-            scatter_add(V_repulsive.sum(dim=0), batch_object)
+            scatter_add(
+                V_repulsive.sum(dim=0), batch_object, dim=0, dim_size=batch_size
+            )
             / (n_hits_per_event * nope)
         ).sum()
 
     L_V = attr_weight * L_V_attractive + repul_weight * L_V_repulsive
 
-    
-    # --------
-    # L_beta noise term
-    n_noise_hits_per_event = scatter_count(batch[is_noise])
-    n_noise_hits_per_event[n_noise_hits_per_event == 0] = 1
-    L_beta_noise = (
-        s_B
-        * (
-            (scatter_add(beta[is_noise], batch[is_noise])) / n_noise_hits_per_event
-        ).sum()
-    )
-    L_beta_noise = L_beta_noise / batch_size
     
     # -------
     # L_beta signal term
@@ -451,8 +714,11 @@ def calc_LV_Lbeta(
 
         beta_alpha = beta[is_sig][index_alpha]
 
-        L_beta_sig = torch.mean(
+        beta_signal_per_object = (
             1 - beta_alpha + 1 - torch.clip(beta_per_object_c, 0, 1)
+        )
+        L_beta_sig = weighted_mean(
+            beta_signal_per_object, object_pt_weights
         )
 
     elif loss_type == "vrepweighted":
@@ -469,7 +735,10 @@ def calc_LV_Lbeta(
     elif beta_term_option == "paper":
         beta_alpha = beta[is_sig][index_alpha]
         L_beta_sig = torch.sum(  # maybe 0.5 for less aggressive loss
-            scatter_add((1 - beta_alpha), batch_object) / n_objects_per_event
+            scatter_add(
+                (1 - beta_alpha), batch_object, dim=0, dim_size=batch_size
+            )
+            / n_objects_per_event.clamp(min=1)
         )
         # print("L_beta_sig", L_beta_sig / batch_size)
         # beta_exp = beta[is_sig]
@@ -500,7 +769,10 @@ def calc_LV_Lbeta(
 
         # Sum over objects, divide by number of objects per event, then sum over events
         L_beta_norms_term = (
-            scatter_add(norms_beta_sig, batch_object) / n_objects_per_event
+            scatter_add(
+                norms_beta_sig, batch_object, dim=0, dim_size=batch_size
+            )
+            / n_objects_per_event.clamp(min=1)
         ).sum()
         assert L_beta_norms_term >= -batch_size and L_beta_norms_term <= 0.0
 
@@ -508,8 +780,13 @@ def calc_LV_Lbeta(
         # divide by n_objects_per_event, then sum over events (same pattern as above)
         # lower beta --> higher loss
         L_beta_logbeta_term = (
-            scatter_add(-0.2 * torch.log(beta_alpha + 1e-9), batch_object)
-            / n_objects_per_event
+            scatter_add(
+                -0.2 * torch.log(beta_alpha + 1e-9),
+                batch_object,
+                dim=0,
+                dim_size=batch_size,
+            )
+            / n_objects_per_event.clamp(min=1)
         ).sum()
 
         # Final L_beta term
@@ -521,7 +798,78 @@ def calc_LV_Lbeta(
             f'beta_term_option "{beta_term_option}" is not valid, choose from {valid_options}'
         )
 
-    L_beta = L_beta_noise + L_beta_sig
+    # Penalize additional high-beta signal hits.  The original signal term can
+    # saturate once the beta sum reaches one, which otherwise allows multiple
+    # condensation seeds and fragmented reconstructed tracks.
+    L_beta_suppress = beta.sum() * 0.0
+    if beta_suppress_weight > 0 and n_hits_sig > n_objects:
+        is_alpha_sig = torch.zeros(n_hits_sig, dtype=torch.bool, device=device)
+        is_alpha_sig[index_alpha] = True
+        non_alpha_beta = beta[is_sig][~is_alpha_sig]
+        if object_pt_weights is None:
+            L_beta_suppress = beta_suppress_weight * non_alpha_beta.mean()
+        else:
+            non_alpha_object_index = object_index[~is_alpha_sig]
+            non_alpha_sum = scatter_add(
+                non_alpha_beta,
+                non_alpha_object_index,
+                dim=0,
+                dim_size=n_objects,
+            )
+            non_alpha_count = scatter_add(
+                torch.ones_like(non_alpha_beta),
+                non_alpha_object_index,
+                dim=0,
+                dim_size=n_objects,
+            )
+            has_competing_hit = non_alpha_count > 0
+            suppress_per_object = (
+                non_alpha_sum[has_competing_hit]
+                / non_alpha_count[has_competing_hit]
+            )
+            L_beta_suppress = beta_suppress_weight * weighted_mean(
+                suppress_per_object,
+                object_pt_weights[has_competing_hit],
+            )
+
+    # Directly penalize the strongest competing condensation point in every
+    # truth object.  Unlike the all-non-alpha average above, this term is not
+    # diluted by objects containing many already-small beta values.  Keep the
+    # complete top-two reduction out of the graph when its weight is disabled.
+    L_beta_second = beta.sum() * 0.0
+    L_beta_second_contribution = beta.sum() * 0.0
+    if beta_second_weight != 0.0:
+        L_beta_second = second_highest_beta_loss(
+            beta[is_sig],
+            object_index,
+            index_alpha,
+            n_hits_per_object,
+            n_objects,
+            object_pt_weights,
+        )
+        L_beta_second_contribution = beta_second_weight * L_beta_second
+
+    # Compact truth objects around their centroid in the learned embedding.
+    # This complements the q-weighted attractive term and reduces long tails
+    # that are easily claimed by a neighbouring condensation point.
+    L_var = zero_embedding_loss
+    if var_weight != 0.0:
+        centroid = scatter_mean(cluster_space_coords[is_sig], object_index, dim=0)
+        variance_per_hit = torch.sum(
+            (cluster_space_coords[is_sig] - centroid[object_index]) ** 2, dim=1
+        )
+        variance_per_object = scatter_mean(
+            variance_per_hit, object_index, dim=0
+        )
+        L_var = weighted_mean(variance_per_object, object_pt_weights)
+
+    L_beta = (
+        L_beta_noise
+        + L_beta_sig
+        + L_beta_suppress
+        + L_beta_second_contribution
+        + var_weight * L_var
+    )
   
     if (somethingIsNaN):
         print("[DEBUG] Loss values")
@@ -561,6 +909,10 @@ def calc_LV_Lbeta(
             L_V_repulsive,
             L_beta_sig,
             L_beta_noise,
+            L_beta_suppress,
+            L_var,
+            L_beta_second,
+            L_beta_second_contribution,
         )
 
 
@@ -1048,7 +1400,8 @@ def L_clusters_calc(batch, cluster_space_coords, cluster_index, frac_combination
     return L_clusters
 
 
-def calculate_delta_MC(y, batch_g):
+def _calculate_delta_MC_debug(y, batch_g):
+    """Verbose diagnostic variant retained for manual loss debugging."""
     graphs = dgl.unbatch(batch_g)
     batch_id = y[:, -1].view(-1)  # event IDs per hit
     df_list = []
@@ -1063,14 +1416,31 @@ def calculate_delta_MC(y, batch_g):
         print(f"  Hits in event: {mask.sum()}")
         print(f"  y_i shape: {y_i.shape}")
 
-        pseudorapidity = -torch.log(torch.tan(y_i[:, 0] / 2))
-        phi = y_i[:, 1]
-        x1 = torch.cat((pseudorapidity.view(-1, 1), phi.view(-1, 1)), dim=1)
+        theta = y_i[:, 0].float()
+        phi = y_i[:, 1].float()
+        valid_direction = (
+            torch.isfinite(theta)
+            & torch.isfinite(phi)
+            & (theta > 0)
+            & (theta < torch.pi)
+        )
+        theta_safe = torch.nan_to_num(
+            theta, nan=torch.pi / 2, posinf=torch.pi / 2, neginf=torch.pi / 2
+        ).clamp(1e-6, torch.pi - 1e-6)
+        phi_safe = torch.nan_to_num(phi, nan=0.0, posinf=0.0, neginf=0.0)
+        pseudorapidity = -torch.log(torch.tan(theta_safe / 2))
+        x1 = torch.stack((pseudorapidity, phi), dim=1)
 
         print(f"  x1 (eta, phi) shape: {x1.shape}")
         print(f"  x1:\n{x1}")
 
-        distance_matrix = torch.cdist(x1, x1, p=2)
+        delta_eta = pseudorapidity[:, None] - pseudorapidity[None, :]
+        delta_phi = torch.remainder(
+            phi_safe[:, None] - phi_safe[None, :] + torch.pi, 2 * torch.pi
+        ) - torch.pi
+        distance_matrix = torch.sqrt(delta_eta.square() + delta_phi.square())
+        valid_pairs = valid_direction[:, None] & valid_direction[None, :]
+        distance_matrix = distance_matrix.masked_fill(~valid_pairs, float("inf"))
         shape_d = distance_matrix.shape[0]
 
         print(f"  distance_matrix shape: {distance_matrix.shape}")
@@ -1087,6 +1457,12 @@ def calculate_delta_MC(y, batch_g):
         else:
             delta_MC = torch.ones((shape_d, 1)).view(-1).to(y_i.device)
 
+        # Invalid directions, or events with no second valid truth track, get
+        # neutral hard-negative weight instead of propagating NaN/inf.
+        delta_MC = torch.nan_to_num(
+            delta_MC, nan=1.0, posinf=1.0, neginf=1.0
+        )
+
         print(f"  delta_MC shape: {delta_MC.shape}")
         print(f"  delta_MC: {delta_MC}")
 
@@ -1095,7 +1471,7 @@ def calculate_delta_MC(y, batch_g):
     delta_MC = torch.cat(df_list)
     print(f"\nFinal delta_MC shape: {delta_MC.shape}")
     return delta_MC
-def calculate_delta_MC(y, batch_g):
+def calculate_delta_MC(y, batch_g, dtype=None):
     graphs = dgl.unbatch(batch_g)
     batch_id = y[:, -1].view(-1)  # event IDs per hit
     df_list = []
@@ -1110,14 +1486,31 @@ def calculate_delta_MC(y, batch_g):
         # print(f"  Particles in event: {mask.sum()}")
         # print(f"  y_i shape: {y_i.shape}")
 
-        pseudorapidity = -torch.log(torch.tan(y_i[:, 0] / 2))
-        phi = y_i[:, 1]
-        x1 = torch.cat((pseudorapidity.view(-1, 1), phi.view(-1, 1)), dim=1)
+        direction_dtype = y_i.dtype if dtype is None else dtype
+        theta = y_i[:, 0].to(dtype=direction_dtype)
+        phi = y_i[:, 1].to(dtype=direction_dtype)
+        valid_direction = (
+            torch.isfinite(theta)
+            & torch.isfinite(phi)
+            & (theta > 0)
+            & (theta < torch.pi)
+        )
+        theta_safe = torch.nan_to_num(
+            theta, nan=torch.pi / 2, posinf=torch.pi / 2, neginf=torch.pi / 2
+        ).clamp(1e-6, torch.pi - 1e-6)
+        phi_safe = torch.nan_to_num(phi, nan=0.0, posinf=0.0, neginf=0.0)
+        pseudorapidity = -torch.log(torch.tan(theta_safe / 2))
 
         # print(f"  x1 (eta, phi) shape: {x1.shape}")
         # print(f"  x1:\n{x1}")
 
-        distance_matrix = torch.cdist(x1, x1, p=2)
+        delta_eta = pseudorapidity[:, None] - pseudorapidity[None, :]
+        delta_phi = torch.remainder(
+            phi_safe[:, None] - phi_safe[None, :] + torch.pi, 2 * torch.pi
+        ) - torch.pi
+        distance_matrix = torch.sqrt(delta_eta.square() + delta_phi.square())
+        valid_pairs = valid_direction[:, None] & valid_direction[None, :]
+        distance_matrix = distance_matrix.masked_fill(~valid_pairs, float("inf"))
         shape_d = distance_matrix.shape[0]
 
         values, _ = torch.sort(distance_matrix, dim=1)
@@ -1126,6 +1519,12 @@ def calculate_delta_MC(y, batch_g):
             delta_MC = values[:, 1]
         else:
             delta_MC = torch.ones((shape_d, 1)).view(-1).to(y_i.device)
+
+        # Invalid directions, or events with no second valid truth track, get
+        # neutral hard-negative weight instead of propagating NaN/inf.
+        delta_MC = torch.nan_to_num(
+            delta_MC, nan=1.0, posinf=1.0, neginf=1.0
+        )
 
         # print(f"  delta_MC shape: {delta_MC.shape}")
         # print(f"  delta_MC: {delta_MC}")

@@ -40,12 +40,17 @@ def evaluate_efficiency_tracks(
     predict=False,
     ct=False,
     clustering_mode="clustering_normal",
-    tau=False
+    tau=False,
+    embedding_dim=3,
+    tbeta=0.1,
+    td=0.1,
+    min_hits=3,
+    matching_metric="double_majority",
 ):
     number_of_showers_total = 0
     if not ct:
-        batch_g.ndata["coords"] = model_output[:, :-1]
-        batch_g.ndata["beta"] = model_output[:, -1]
+        batch_g.ndata["coords"] = model_output[:, :embedding_dim]
+        batch_g.ndata["beta"] = model_output[:, embedding_dim]
     else:
         batch_g.ndata["model_output"] = model_output
         
@@ -80,25 +85,14 @@ def evaluate_efficiency_tracks(
         else:
             if clustering_mode == "clustering_normal":
                 
-                clustering1 = get_clustering(betas, X, tbeta=0.5, td=0.007)
-                # clustering1 = DPC_custom(X, betas, model_output.device)
-                map_from = list(np.unique(clustering1.detach().cpu()))
-                cluster_id = map(lambda x: map_from.index(x), clustering1)
-                clustering_ordered = (
-                    torch.Tensor(list(cluster_id)).long().to(model_output.device)
-                )
-                
-                if torch.unique(clustering1)[0] != -1:
-                    clustering = clustering_ordered + 1
-                else:
-                    clustering = clustering_ordered
-
-                labels = clustering.view(-1).long()
+                labels = get_clustering(
+                    betas, X, tbeta=tbeta, td=td, min_hits=min_hits
+                ).view(-1).long()
             elif clustering_mode == "dbscan":
                 labels = hfdb_obtain_labels(X, betas.device)
         
-        pids, partIndices, deltaMCs, energies, pTs, thetas, genStatus, numSIhits, numCDChits, trackLabels, hitEfficiencies, hitPurities, fakeTrackIndices, siliconHits_fakeTracks, driftHits_fakeTracks, tracks_dict, fileIDs, eventIDs, = match_tracks(labels, dic) 
-        
+        pids, partIndices, deltaMCs, energies, pTs, thetas, genStatus, numSIhits, numCDChits, trackLabels, hitEfficiencies, hitPurities, fakeTrackIndices, siliconHits_fakeTracks, driftHits_fakeTracks, tracks_dict, fileIDs, eventIDs, = match_tracks(labels, dic, matching_metric=matching_metric)
+
         df_event = generate_tracks_dataframe(fileIDs, eventIDs, pids, partIndices, deltaMCs, energies, pTs, thetas, genStatus, numSIhits, numCDChits, trackLabels, hitEfficiencies, hitPurities, fakeTrackIndices, siliconHits_fakeTracks, driftHits_fakeTracks, tracks_dict)
         df_list.append(df_event)
 
@@ -127,7 +121,7 @@ def evaluate_efficiency_tracks(
     
     return df_batch, df_batch_hits
         
-def match_tracks(labels, dic):
+def match_tracks(labels, dic, matching_metric="double_majority"):
     
     pids = []
     partIndices = []
@@ -161,16 +155,23 @@ def match_tracks(labels, dic):
         "part_p_t",      # 6
         "gen_status",    # 7
         "part_parent",   # 8
-        "batch_id"       # 9
+        "part_vertex_x", # 9
+        "part_vertex_y", # 10
+        "part_vertex_z", # 11
+        "batch_id"       # 12
     ]
     partInfo = {key: part_true[:, i] for i, key in enumerate(part_keys)}
     
     particle_number_nomap = graphInfo.ndata["particle_number_nomap"]  # particle index
 
     unique_labels, counts = torch.unique(labels, return_counts=True)
+    valid_reco = unique_labels >= 0
+    unique_labels, counts = unique_labels[valid_reco], counts[valid_reco]
     numHits_tracks = {int(label): int(count) for label, count in sorted(zip(unique_labels, counts), key=lambda x: x[0])}
     
     unique_particles, counts = torch.unique(particle_number_nomap, return_counts=True)
+    valid_truth = unique_particles >= 0
+    unique_particles, counts = unique_particles[valid_truth], counts[valid_truth]
     numHits_particle = {int(p): int(c) for p, c in zip(unique_particles, counts)}
     
     
@@ -248,29 +249,35 @@ def match_tracks(labels, dic):
     labels_matched_set = set()
 
     for p in unique_particles:
-        matched = False
-        matched_eff = []
-        matched_purity = []
-        matched_labels = []
-        
-        for l in unique_labels:
-            eff = efficiency[int(p)][int(l)]
-            pur = purity[int(p)][int(l)]
-            
-            # if eff > 0.5 and pur > 0.5:
-            if pur > 0.75:
-                matched = True
-                matched_eff.append(eff)
-                matched_purity.append(pur)
-                matched_labels.append(int(l))
-                labels_matched_set.add(int(l))
-        
         particle_matches[int(p)] = {
-            "matched": matched,
-            "track": matched_labels,
-            "efficiency": matched_eff,
-            "purity": matched_purity
+            "matched": False, "track": [], "efficiency": [], "purity": []
         }
+    if len(unique_particles) and len(unique_labels):
+        overlap = np.array([
+            [particle_label_counts[int(p)][int(l)] for l in unique_labels]
+            for p in unique_particles
+        ], dtype=np.float64)
+        valid = np.zeros_like(overlap, dtype=bool)
+        for i, p in enumerate(unique_particles):
+            for j, l in enumerate(unique_labels):
+                eff = efficiency[int(p)][int(l)]
+                pur = purity[int(p)][int(l)]
+                valid[i, j] = (
+                    pur >= 0.75 if matching_metric == "idea"
+                    else pur >= 0.50 and eff >= 0.50
+                ) and overlap[i, j] > 0
+        rows, columns = linear_sum_assignment(-np.where(valid, overlap, 0.0))
+        for i, j in zip(rows, columns):
+            if not valid[i, j]:
+                continue
+            p, l = int(unique_particles[i]), int(unique_labels[j])
+            particle_matches[p] = {
+                "matched": True,
+                "track": [l],
+                "efficiency": [efficiency[p][l]],
+                "purity": [purity[p][l]],
+            }
+            labels_matched_set.add(l)
 
         
     # fakeTracks
@@ -595,7 +602,9 @@ def store_at_batch_end_hits(
         df_batch = pd.concat(df_batch)
         df_batch.to_pickle(path_save_)
 
-def get_clustering(betas: torch.Tensor, X: torch.Tensor, tbeta=0.025, td=0.1):
+def get_clustering(
+    betas: torch.Tensor, X: torch.Tensor, tbeta=0.025, td=0.1, min_hits=3
+):
     """
     Returns a clustering of hits -> cluster_index, based on the GravNet model
     output (predicted betas and cluster space coordinates) and the clustering
@@ -614,12 +623,19 @@ def get_clustering(betas: torch.Tensor, X: torch.Tensor, tbeta=0.025, td=0.1):
     # Points unassigned at the end are bkg (-1)
     unassigned = torch.arange(n_points).to(betas.device)
     clustering = -1 * torch.ones(n_points, dtype=torch.long).to(betas.device)
+    next_label = 0
     while len(indices_condpoints) > 0 and len(unassigned) > 0:
         index_condpoint = indices_condpoints[0]
         d = torch.norm(X[unassigned] - X[index_condpoint][0], dim=-1)
         assigned_to_this_condpoint = unassigned[d < td]
-        clustering[assigned_to_this_condpoint] = index_condpoint[0]
-        unassigned = unassigned[~(d < td)]
+        if len(assigned_to_this_condpoint) >= min_hits:
+            clustering[assigned_to_this_condpoint] = next_label
+            next_label += 1
+            unassigned = unassigned[~(d < td)]
+        else:
+            # This seed cannot form a reconstructable candidate; prevent an
+            # infinite loop while leaving neighbouring hits for later seeds.
+            unassigned = unassigned[unassigned != index_condpoint[0]]
         
         # calculate indices_codpoints again
         indices_condpoints = find_condpoints(betas, unassigned, tbeta)

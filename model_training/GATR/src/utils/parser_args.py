@@ -177,6 +177,16 @@ parser.add_argument(
     default=None,
     help="initialize model with pre-trained weights",
 )
+parser.add_argument(
+    "--weights-source",
+    choices=("raw", "ema"),
+    default="ema",
+    help=(
+        "weights used for non-resume checkpoint loads: 'ema' reproduces "
+        "validation/inference weights and requires ema_state_dict; 'raw' uses "
+        "the regular state_dict (ignored for a full checkpoint resume)"
+    ),
+)
 parser.add_argument("--num-epochs", type=int, default=20, help="number of epochs")
 parser.add_argument(
     "--steps-per-epoch",
@@ -191,6 +201,20 @@ parser.add_argument(
     default=None,
     help="number of steps (iterations) per epochs for validation; "
     "if neither of `--steps-per-epoch-val` or `--samples-per-epoch-val` is set, each epoch will run over all loaded samples",
+)
+parser.add_argument(
+    "--limit-val-batches",
+    type=int,
+    default=50,
+    help="maximum validation batches per rank; use -1 to process all events",
+)
+parser.add_argument(
+    "--validate-before-training",
+    action="store_true",
+    help=(
+        "run one standalone validation pass before trainer.fit(); disabled by "
+        "default and independent of the regular epoch-end validation"
+    ),
 )
 parser.add_argument(
     "--samples-per-epoch",
@@ -209,9 +233,9 @@ parser.add_argument(
 parser.add_argument(
     "--optimizer",
     type=str,
-    default="ranger",
-    choices=["adam", "adamW", "radam", "ranger"],  # TODO: add more
-    help="optimizer for the training",
+    default="adamW",
+    choices=["adam", "adamW", "radam"],
+    help="optimizer for training (default: adamW)",
 )
 parser.add_argument(
     "--optimizer-option",
@@ -224,22 +248,29 @@ parser.add_argument(
     "--lr-scheduler",
     type=str,
     default="flat+decay",
-    choices=[
-        "none",
-        "steps",
-        "flat+decay",
-        "flat+linear",
-        "flat+cos",
-        "one-cycle",
-        "reduceplateau",
-    ],
-    help="learning rate scheduler",
+    choices=["none", "flat+decay", "reduceplateau"],
+    help=(
+        "learning-rate schedule: none, epoch warmup plus cosine decay "
+        "(flat+decay), or validation-metric ReduceLROnPlateau"
+    ),
 )
 parser.add_argument(
-    "--warmup-steps",
+    "--plateau-factor",
+    type=float,
+    default=0.5,
+    help="multiplicative LR reduction used by the reduceplateau scheduler",
+)
+parser.add_argument(
+    "--plateau-patience",
     type=int,
-    default=0,
-    help="number of warm-up steps, only valid for `flat+linear` and `flat+cos` lr schedulers",
+    default=2,
+    help="validation epochs without val_pareto_f1 improvement before reducing LR",
+)
+parser.add_argument(
+    "--plateau-threshold",
+    type=float,
+    default=1e-3,
+    help="relative val_pareto_f1 improvement required by the reduceplateau scheduler",
 )
 parser.add_argument(
     "--load-epoch",
@@ -250,28 +281,46 @@ parser.add_argument(
 parser.add_argument("--start-lr", type=float, default=5e-3, help="start learning rate")
 parser.add_argument("--batch-size", type=int, default=128, help="batch size")
 parser.add_argument(
-    "--use-amp",
-    action="store_true",
-    default=False,
-    help="use mixed precision training (fp16)",
+    "--accumulate-grad-batches",
+    type=int,
+    default=2,
+    help="mini-batches accumulated before each optimizer step",
+)
+parser.add_argument(
+    "--checkpoint-every-n-train-steps",
+    type=int,
+    default=5000,
+    help="optimizer-step interval for weights-only checkpoints",
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=42,
+    help="root seed used for model initialization and all DataLoader workers",
 )
 parser.add_argument(
     "--gpus",
     type=str,
     default="0",
-    help='device for the training/testing; to use CPU, set to empty string (""); to use multiple gpu, set it as a comma separated list, e.g., `1,2,3,4`',
-)
-parser.add_argument(
-    "--predict-gpus",
-    type=str,
-    default=None,
-    help='device for the testing; to use CPU, set to empty string (""); to use multiple gpu, set it as a comma separated list, e.g., `1,2,3,4`; if not set, use the same as `--gpus`',
+    help=(
+        "required comma-separated CUDA device IDs for training/testing, "
+        "for example 0 or 0,1; CPU execution is not supported"
+    ),
 )
 parser.add_argument(
     "--num-workers",
     type=int,
     default=1,
-    help="number of threads to load the dataset; memory consumption and disk access load increases (~linearly) with this numbers",
+    help=(
+        "number of spawned DataLoader subprocesses per rank; memory use and "
+        "disk-access load increase approximately linearly"
+    ),
+)
+parser.add_argument(
+    "--prefetch-factor",
+    type=int,
+    default=2,
+    help="batches prefetched by each DataLoader worker (used when --num-workers > 0)",
 )
 parser.add_argument(
     "--predict",
@@ -321,9 +370,12 @@ parser.add_argument(
 parser.add_argument(
     "--backend",
     type=str,
-    choices=["gloo", "nccl", "mpi"],
+    choices=["nccl"],
     default=None,
-    help="backend for distributed training",
+    help=(
+        "PyTorch distributed backend used for multi-GPU training "
+        "(default: nccl); ignored for single-GPU training"
+    ),
 )
 parser.add_argument(
     "--cross-validation",
@@ -332,7 +384,8 @@ parser.add_argument(
     help="enable k-fold cross validation; input format: `variable_name%k`",
 )
 parser.add_argument(
-    "--log-wandb", action="store_true", default=False, help="use wandb for loging"
+    "--log-wandb", action="store_true", default=False,
+    help="enable Weights & Biases logging",
 )
 parser.add_argument(
     "--wandb-displayname",
@@ -351,7 +404,40 @@ parser.add_argument(
 parser.add_argument(
     "--clustering_and_energy_loss", "-clust_en", action="store_true", default=False
 )
-parser.add_argument("--clustering_space_dim", "-clust_dim", type=int, default=2)
+parser.add_argument(
+    "--clustering_space_dim", "--embedding-dim", "-clust_dim",
+    type=int, default=5,
+    help="number of learned object-condensation coordinates",
+)
+parser.add_argument("--gatr-blocks", type=int, default=10)
+parser.add_argument("--hidden-mv-channels", type=int, default=16)
+parser.add_argument("--hidden-s-channels", type=int, default=64)
+parser.add_argument(
+    "--use-detector-features",
+    action="store_true",
+    default=False,
+    help=(
+        "feed the four computed detector-specific scalar channels from the detector "
+        "data config into GATr; omit this flag for geometry-only training"
+    ),
+)
+parser.add_argument(
+    "--layers-per-superlayer",
+    type=int,
+    nargs=14,
+    default=[8] * 14,
+    metavar="N",
+    help=(
+        "number of local layers in each of the 14 superlayers; used to compute "
+        "global_layer from cumulative offsets"
+    ),
+)
+parser.add_argument("--position-scale", type=float, default=1000.0)
+parser.add_argument(
+    "--attention-phi-sectors", type=int, default=1,
+    help="experimental sparse mode: isolate this many phi sectors per event; 1 is full attention",
+)
+parser.add_argument("--gradient-checkpointing", action="store_true", default=False)
 parser.add_argument(
     "--n-noise",
     "-n-noise",
@@ -413,7 +499,7 @@ parser.add_argument(
     "--frac_cluster_loss",
     type=float,
     default=0.1,
-    help="Fraction of total pairs to use for the clustering loss",
+    help="deprecated compatibility option; the active OC loss uses all object interactions",
 )
 parser.add_argument(
     "--condensation",
@@ -434,7 +520,7 @@ parser.add_argument(
     "--fill_loss_weight",
     default=0.0,
     type=float,
-    help="weight for the fill loss to try to prevent mode collapse",
+    help="deprecated compatibility option; use --var-weight instead",
 )
 
 parser.add_argument(
@@ -454,10 +540,84 @@ parser.add_argument(
 
 parser.add_argument(
     "--losstype",
+    dest="loss_type",
     type=str,
     default="hgcalimplementation",
     help="use the hgcal loss",
 )
+
+parser.add_argument(
+    "--beta-suppress-weight", type=float, default=0.1,
+    help="penalty on non-alpha signal betas to reduce duplicate seeds",
+)
+parser.add_argument(
+    "--beta-second-weight", type=float, default=0.0,
+    help="weight for the mean second-highest signal beta per truth object",
+)
+parser.add_argument(
+    "--var-weight", type=float, default=0.3,
+    help="within-truth-track embedding compactness weight",
+)
+parser.add_argument("--var-warmup-epochs", type=int, default=5)
+parser.add_argument(
+    "--hard-negative-weight", type=float, default=1.0,
+    help="exponent for inverse nearest-truth-track delta-R repulsion weighting",
+)
+parser.add_argument("--hard-negative-max-weight", type=float, default=100.0)
+parser.add_argument(
+    "--pt-track-weighting",
+    action="store_true",
+    default=False,
+    help="weight per-truth-track loss reductions using piecewise pT bins",
+)
+parser.add_argument(
+    "--pt-track-weight-bin-edges",
+    type=str,
+    default="0.4,0.9,5.0",
+    help="comma-separated pT bin edges in GeV for optional track weighting",
+)
+parser.add_argument(
+    "--pt-track-weight-bin-weights",
+    type=str,
+    default="1.5,1.2,0.75,2.0",
+    help="comma-separated positive track weights; requires len(edges)+1 values",
+)
+parser.add_argument(
+    "--helix-loss-weight", type=float, default=0.1,
+    help="auxiliary inverse-pT and direction regression weight",
+)
+parser.add_argument("--weight-decay", type=float, default=1e-4)
+parser.add_argument("--min-lr", type=float, default=1e-6)
+parser.add_argument("--warmup-epochs", type=float, default=2.0)
+parser.add_argument("--ema-decay", type=float, default=0.999)
+
+# Cheap post-inference validation sweep. These are strings so a complete grid
+# is recorded verbatim in CLI metadata and checkpoints.
+parser.add_argument(
+    "--sweep-tbeta-grid", type=str,
+    default="0.35,0.45,0.5,0.6,0.7,0.8",
+)
+parser.add_argument(
+    "--sweep-td-grid", type=str,
+    default="0.15,0.2,0.3,0.4,0.5,0.6",
+)
+parser.add_argument("--sweep-min-hits-grid", type=str, default="3,4")
+parser.add_argument(
+    "--rejected-seed-policy",
+    choices=("discard", "keep", "attach-after-accept"),
+    default="discard",
+    help=(
+        "handling of a condensation-point seed whose candidate has fewer than "
+        "min_hits: discard it, keep it available to later clusters, or attach "
+        "it only after a later cluster independently reaches min_hits"
+    ),
+)
+parser.add_argument(
+    "--sweep-match-metric", choices=("idea", "double_majority"),
+    default="double_majority",
+)
+parser.add_argument("--sweep-truth-min-hits", type=int, default=3)
+parser.add_argument("--validation-sweep-max-events", type=int, default=500)
 parser.add_argument(
     "--loss-regularization",
     action="store_true",

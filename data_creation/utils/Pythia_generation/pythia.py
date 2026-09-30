@@ -27,7 +27,7 @@ ApplicationMgr().TopAlg += [eventHeaderCreator]
 from Configurables import GaussSmearVertex
 smeartool = GaussSmearVertex()
 smeartool.xVertexSigma = 5.96e-3 * units.mm
-smeartool.yVertexSigma = 23.8E-6 * units.mm
+smeartool.yVertexSigma = 23.8e-6 * units.mm
 smeartool.zVertexSigma = 0.397 * units.mm
 smeartool.tVertexSigma = 36.3 * units.picosecond
 
@@ -51,6 +51,15 @@ pythia8gen.SignalProvider = pythia8gentool
 pythia8gen.VertexSmearingTool = smeartool
 pythia8gen.hepmc.Path = "hepmc"
 ApplicationMgr().TopAlg += [pythia8gen]
+
+# Store the generated event as HepMC3 as well as EDM4hep.  HepMC3 is used as
+# the ddsim input because it preserves displaced production and decay vertices
+# with Key4hep/DD4hep versions whose EDM4hep input reader collapses them.
+from Configurables import HepMCFileWriter
+hepmc_writer = HepMCFileWriter("HepMCFileWriter")
+hepmc_writer.hepmc.Path = "hepmc"
+hepmc_writer.Filename = "output_pythia.hepmc"
+ApplicationMgr().TopAlg += [hepmc_writer]
 
 ### Reads an HepMC::GenEvent from the data service and writes a collection of EDM Particles
 from Configurables import HepMCToEDMConverter

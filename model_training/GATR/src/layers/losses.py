@@ -20,19 +20,34 @@ def object_condensation_loss_tracking(
     use_average_cc_pos=0.0,
     loss_type="hgcalimplementation",
     output_dim=4,
+    embedding_dim=None,
+    beta_suppress_weight=0.0,
+    beta_second_weight=0.0,
+    var_weight=0.0,
+    hard_negative_weight=1.0,
+    hard_negative_max_weight=100.0,
+    pt_track_weighting=False,
+    pt_track_weight_bin_edges=(0.4, 0.9, 5.0),
+    pt_track_weight_bin_weights=(1.5, 1.2, 0.75, 2.0),
     clust_space_norm="none",
     tracking=False,
     CLD=False,
 ):
 
     _, S = pred.shape
-    if clust_loss_only:
+    if embedding_dim is not None:
+        clust_space_dim = int(embedding_dim)
+    elif clust_loss_only:
         clust_space_dim = output_dim - 1
     else:
         clust_space_dim = output_dim - 28
 
     xj = pred[:, 0:clust_space_dim]  # xj: cluster space coords
-    bj = torch.sigmoid(torch.reshape(pred[:, clust_space_dim], [-1, 1]))  # 3: betas
+    # Keep beta and its charge transformation in float32.  In bf16/float16,
+    # both sigmoid(large_logit) and ``1 - 1e-4`` round to exactly one, so the
+    # later atanh clamp cannot prevent atanh(1) == inf.
+    beta_logits = pred[:, clust_space_dim].float()
+    bj = torch.sigmoid(torch.reshape(beta_logits, [-1, 1]))  # 3: betas
     
     original_coords = batch.ndata["pos_hits_xyz"]  # [:, 0:clust_space_dim]
     
@@ -67,6 +82,14 @@ def object_condensation_loss_tracking(
         repul_weight=repul_weight,
         fill_loss_weight=fill_loss_weight,
         use_average_cc_pos=use_average_cc_pos,
+        beta_suppress_weight=beta_suppress_weight,
+        beta_second_weight=beta_second_weight,
+        var_weight=var_weight,
+        hard_negative_weight=hard_negative_weight,
+        hard_negative_max_weight=hard_negative_max_weight,
+        pt_track_weighting=pt_track_weighting,
+        pt_track_weight_bin_edges=pt_track_weight_bin_edges,
+        pt_track_weight_bin_weights=pt_track_weight_bin_weights,
         loss_type=loss_type,
         tracking=tracking,
         CLD=CLD,

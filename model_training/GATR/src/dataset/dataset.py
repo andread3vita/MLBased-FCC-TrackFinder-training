@@ -20,8 +20,13 @@ from src.data.preprocess import (
     AutoStandardizer,
     WeightMaker,
 )
+from src.utils.data_sharding import shard_event_indices
 
 from src.dataset.functions_graph_tracking import create_graph_tracking_global
+from src.utils.detector_features import (
+    DEFAULT_LAYERS_PER_SUPERLAYER,
+    validate_layers_per_superlayer,
+)
 
 def _finalize_inputs(table, data_config):
     
@@ -40,11 +45,11 @@ def _finalize_inputs(table, data_config):
             len(names) == 1
             and data_config.preprocess_params[names[0]]["length"] is None
         ):
-            output["_" + k] = ak.to_numpy(ak.values_astype(table[names[0]], "float32"))
+            output["_" + k] = ak.to_numpy(table[names[0]])
         else:
             output["_" + k] = ak.to_numpy(
                 np.stack(
-                    [ak.to_numpy(table[n]).astype("float32") for n in names], axis=1
+                    [ak.to_numpy(table[n]) for n in names], axis=1
                 )
             )
     # copy monitor variables
@@ -71,7 +76,10 @@ def _preprocess(table, data_config, options):
         else data_config.test_time_selection,
     )
     if len(table) == 0:
-        return []
+        # Keep the return contract identical to the non-empty path so
+        # _load_next() can skip an empty selected chunk without failing while
+        # unpacking its result.
+        return None, np.empty(0, dtype=np.int64)
     # table = _padlabel(table,data_config)
     # define new variables
     table = _build_new_variables(table, data_config.var_funcs)
@@ -99,10 +107,19 @@ def _load_next(data_config, filelist, load_range, options):
     if table is None or len(indices) == 0:
         return table, indices, np.array([]), np.array([])
 
+    num_rows = len(table["_mask"])
+    indices = shard_event_indices(
+        indices,
+        options.get("event_shard_rank", 0),
+        options.get("event_num_shards", 1),
+    )
+
     fileIDs = []
     eventIDs = []
 
-    for idx in range(len(indices)):
+    # These arrays are indexed by the original table index in get_data(), so
+    # retain one entry for every row even when this rank yields only a shard.
+    for idx in range(num_rows):
 
         fileIDs.append(int(table["_mask"][idx, 4, 0]))
         eventIDs.append(int(table["_mask"][idx, 3, 0]))
@@ -158,13 +175,14 @@ class _SimpleIter(object):
         self.cursor = 0
 
         self._seed = None
+        iteration_index = int(kwargs.get("_iteration_index", 0))
         worker_info = torch.utils.data.get_worker_info()
         file_dict = self._init_file_dict.copy()
+        base_seed = int(self._base_seed)
         if worker_info is not None:
             # in a worker process
             self._name += "_worker%d" % worker_info.id
-            self._seed = worker_info.seed & 0xFFFFFFFF
-            np.random.seed(self._seed)
+            base_seed = int(worker_info.seed)
             # split workload by files
             new_file_dict = {}
             for name, files in file_dict.items():
@@ -172,6 +190,12 @@ class _SimpleIter(object):
                 assert len(new_files) > 0
                 new_file_dict[name] = new_files
             file_dict = new_file_dict
+        base_seed %= 2**64
+        seed_sequence = np.random.SeedSequence(
+            [base_seed & 0xFFFFFFFF, base_seed >> 32, iteration_index]
+        )
+        self._seed = int(seed_sequence.generate_state(1, dtype=np.uint32)[0])
+        np.random.seed(self._seed)
         self.worker_file_dict = file_dict
         self.worker_filelist = sum(file_dict.values(), [])
         self.worker_info = worker_info
@@ -319,11 +343,18 @@ class _SimpleIter(object):
         get_vtx = self._data_config.graph_config.get("VTX", False)
         vector = self._data_config.graph_config.get("vector", False)
         overlay = self._data_config.graph_config.get("overlay", False)
-        
         fileID = self.fileIDs[i]
         eventID = self.eventIDs[i]
-        
-        [g, features_partnn], graph_empty = create_graph_tracking_global(X, fileID, eventID, get_vtx, vector, overlay)
+
+        [g, features_partnn], graph_empty = create_graph_tracking_global(
+            X,
+            fileID,
+            eventID,
+            get_vtx,
+            vector,
+            overlay,
+            self.layers_per_superlayer,
+        )
     
         return [g, features_partnn], graph_empty
 
@@ -348,6 +379,12 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
             So set this to a large enough value to avoid getting an imbalanced minibatch (due to reweighting/sampling), especially when ``fetch_by_files`` set to ``True``.
             Will load all events (files) at once if set to non-positive value.
         file_fraction (float): fraction of files to load.
+        shuffle (bool or None): override the mode's default event shuffling.
+        reweight (bool or None): override the mode's default event reweighting.
+        event_shard_rank (int): rank receiving this deterministic event shard.
+        event_num_shards (int): number of disjoint event shards.
+        restart_on_iter (bool): create a fresh iterator whenever the DataLoader
+            starts a new pass, including when ``infinity_mode`` is enabled.
     """
 
     def __init__(
@@ -368,6 +405,7 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
         infinity_mode=False,
         in_memory=False,
         name="",
+        seed=0,
         laplace=False,
         edges=False,
         diffs=False,
@@ -376,8 +414,21 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
         synthetic=False,
         synthetic_npart_min=2,
         synthetic_npart_max=5,
+        shuffle=None,
+        reweight=None,
+        event_shard_rank=0,
+        event_num_shards=1,
+        restart_on_iter=False,
+        layers_per_superlayer=DEFAULT_LAYERS_PER_SUPERLAYER,
     ):
-        self._iters = {} if infinity_mode or in_memory else None
+        # Infinite training iterators intentionally continue across epochs so
+        # successive epochs do not repeatedly consume the same prefix.  A
+        # deterministic validation loader instead needs to restart from its
+        # first event on every validation pass, even when infinity_mode keeps
+        # a short validation dataset long enough for limit_val_batches.
+        self._iters = (
+            None if restart_on_iter else ({} if infinity_mode or in_memory else None)
+        )
         _init_args = set(self.__dict__.keys())
         self._init_file_dict = file_dict
         self._init_load_range_and_fraction = load_range_and_fraction
@@ -388,6 +439,7 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
         self._infinity_mode = infinity_mode
         self._in_memory = in_memory
         self._name = name
+        self._base_seed = int(seed)
         self.laplace = laplace
         self.edges = edges
         self.diffs = diffs
@@ -396,6 +448,9 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
         self.synthetic_npart_max = synthetic_npart_max
         self.dataset_cap = dataset_cap  # used to cap the dataset to some fixed number of events - used for debugging purposes
         self.n_noise = n_noise
+        self.layers_per_superlayer = validate_layers_per_superlayer(
+            layers_per_superlayer
+        )
         # ==== sampling parameters ====
         self._sampler_options = {
             "up_sample": up_sample,
@@ -407,6 +462,14 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
             self._sampler_options.update(training=True, shuffle=True, reweight=True)
         else:
             self._sampler_options.update(training=False, shuffle=False, reweight=False)
+        if shuffle is not None:
+            self._sampler_options["shuffle"] = bool(shuffle)
+        if reweight is not None:
+            self._sampler_options["reweight"] = bool(reweight)
+        self._sampler_options.update(
+            event_shard_rank=int(event_shard_rank),
+            event_num_shards=int(event_num_shards),
+        )
 
         # discover auto-generated reweight file
         if ".auto.yaml" in data_config_file:
@@ -460,21 +523,24 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
 
         # derive all variables added to self.__dict__
         self._init_args = set(self.__dict__.keys()) - _init_args
+        self._iterator_counts = {}
 
     @property
     def config(self):
         return self._data_config
 
     def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        iteration_index = self._iterator_counts.get(worker_id, 0)
+        self._iterator_counts[worker_id] = iteration_index + 1
+        kwargs = {k: copy.deepcopy(self.__dict__[k]) for k in self._init_args}
+        kwargs["_iteration_index"] = iteration_index
         if self._iters is None:
-            kwargs = {k: copy.deepcopy(self.__dict__[k]) for k in self._init_args}
             return _SimpleIter(**kwargs)
         else:
-            worker_info = torch.utils.data.get_worker_info()
-            worker_id = worker_info.id if worker_info is not None else 0
             try:
                 return self._iters[worker_id]
             except KeyError:
-                kwargs = {k: copy.deepcopy(self.__dict__[k]) for k in self._init_args}
                 self._iters[worker_id] = _SimpleIter(**kwargs)
                 return self._iters[worker_id]

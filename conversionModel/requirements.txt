@@ -1,0 +1,13 @@
+# GATr itself is deliberately not installed: the converters import the
+# repository's vendored v1.4.2 source tree directly.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+numpy==1.26.4
+einops==0.8.0
+opt_einsum==3.3.0
+xformers==0.0.29.post3
+onnx==1.17.0
+onnxscript>=0.3.0,<0.5.0
+onnx-ir>=0.1.0
+onnxruntime==1.20.1
+pyarrow==12.0.1

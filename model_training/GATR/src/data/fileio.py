@@ -1,11 +1,16 @@
 import math
+import os
+import time
 import awkward as ak
 import tqdm
-import traceback
 from src.data.tools import _concat
 from src.logger.logger import _logger
 import re
 import numpy as np
+from functools import lru_cache
+
+
+_READ_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
 
 def _read_hdf5(filepath, branches, load_range=None):
     import tables
@@ -55,54 +60,135 @@ def _read_awkd(filepath, branches, load_range=None):
     return ak.Array(outputs)
 
 
+@lru_cache(maxsize=None)
+def _parquet_layout(filepath):
+    """Cache the small footer information needed for row-group pruning."""
+    metadata = ak.metadata_from_parquet(filepath)
+    columns = frozenset(name.split(".", 1)[0] for name in metadata["columns"])
+    return tuple(metadata["col_counts"]), columns
+
+
 def _read_parquet(filepath, branches, load_range=None):
-    outputs = ak.from_parquet(filepath, columns=branches)
-    if load_range is not None:
-        start = math.trunc(load_range[0] * len(outputs))
-        stop = max(start + 1, math.trunc(load_range[1] * len(outputs)))
-        outputs = outputs[start:stop]
-    return outputs
+    """Read only the row groups overlapping ``load_range``.
+
+    ``ak.from_parquet`` is eager. The old implementation read every row group
+    and sliced afterwards, which multiplied I/O when ``fetch_step < 1``.
+    """
+    row_counts, available_columns = _parquet_layout(filepath)
+    read_branches = [
+        name
+        for name in branches
+        if name in available_columns or name != "file_number"
+    ]
+
+    if load_range is None:
+        return ak.from_parquet(filepath, columns=read_branches)
+
+    offsets = np.concatenate(([0], np.cumsum(row_counts, dtype=np.int64)))
+    num_rows = int(offsets[-1])
+    if num_rows == 0:
+        return ak.from_parquet(filepath, columns=read_branches)
+
+    start = min(math.trunc(load_range[0] * num_rows), num_rows)
+    stop = min(num_rows, max(start + 1, math.trunc(load_range[1] * num_rows)))
+    if start >= stop:
+        return ak.from_parquet(filepath, columns=read_branches, row_groups=[])
+
+    first_group = int(np.searchsorted(offsets[1:], start, side="right"))
+    last_group = int(np.searchsorted(offsets[1:], stop - 1, side="right")) + 1
+    row_groups = list(range(first_group, last_group))
+    outputs = ak.from_parquet(
+        filepath, columns=read_branches, row_groups=row_groups
+    )
+
+    local_start = start - int(offsets[first_group])
+    local_stop = stop - int(offsets[first_group])
+    return outputs[local_start:local_stop]
+
+
+def _read_file_with_retries(filepath, branches, load_range=None, treename=None):
+    """Read one file strictly, retrying transient failures before giving up.
+
+    There are five total attempts.  Failures before the final attempt wait for
+    1, 2, 4, and 8 seconds respectively.  A permanently unreadable or empty
+    file is never silently omitted from the dataset: the final RuntimeError is
+    chained from the original reader exception so DataLoader reports its cause.
+    """
+    ext = os.path.splitext(filepath)[1]
+    if ext not in ('.h5', '.root', '.awkd', '.parquet'):
+        raise RuntimeError(
+            'File %s of type `%s` is not supported!' % (filepath, ext)
+        )
+
+    max_attempts = len(_READ_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if ext == '.h5':
+                result = _read_hdf5(filepath, branches, load_range=load_range)
+            elif ext == '.root':
+                result = _read_root(
+                    filepath,
+                    branches,
+                    load_range=load_range,
+                    treename=treename,
+                )
+            elif ext == '.awkd':
+                result = _read_awkd(filepath, branches, load_range=load_range)
+            else:
+                result = _read_parquet(
+                    filepath, branches, load_range=load_range
+                )
+
+            if result is None or len(result) == 0:
+                raise RuntimeError(
+                    f'Reader returned zero entries for {filepath!r} '
+                    f'with `load_range`={load_range}'
+                )
+            return result
+        except Exception as error:
+            if attempt == max_attempts:
+                raise RuntimeError(
+                    f'Failed to read {filepath!r} after {max_attempts} attempts '
+                    f'with `load_range`={load_range}'
+                ) from error
+
+            delay = _READ_RETRY_DELAYS_SECONDS[attempt - 1]
+            _logger.warning(
+                'Read attempt %d/%d failed for %s with %s: %s; '
+                'retrying in %d second(s)',
+                attempt,
+                max_attempts,
+                filepath,
+                type(error).__name__,
+                error,
+                delay,
+            )
+            time.sleep(delay)
 
 
 def _read_files(filelist, branches, load_range=None, show_progressbar=False, **kwargs):
-    import os
     branches = list(branches)
     table = []
     if show_progressbar:
         filelist = tqdm.tqdm(filelist)
     for filepath in filelist:
-        ext = os.path.splitext(filepath)[1]
-        if ext not in ('.h5', '.root', '.awkd', '.parquet'):
-            raise RuntimeError('File %s of type `%s` is not supported!' % (filepath, ext))
-        try:
-            if ext == '.h5':
-                a = _read_hdf5(filepath, branches, load_range=load_range)
-            elif ext == '.root':
-                a = _read_root(filepath, branches, load_range=load_range, treename=kwargs.get('treename', None))
+        a = _read_file_with_retries(
+            filepath,
+            branches,
+            load_range=load_range,
+            treename=kwargs.get('treename', None),
+        )
 
-                base = os.path.basename(filepath)
-                match = re.search(r'(\d+)', base)
-                fid = 0
-                if match:
-                    fid = int(match.group(1))
-
-                if a is not None:
-                    a = ak.with_field(
-                        a,
-                        np.full(len(a), fid),
-                        "file_number"
-                    )
-
-            elif ext == '.awkd':
-                a = _read_awkd(filepath, branches, load_range=load_range)
-            elif ext == '.parquet':
-                a = _read_parquet(filepath, branches, load_range=load_range)
-        except Exception as e:
-            a = None
-            _logger.error('When reading file %s:', filepath)
-            _logger.error(traceback.format_exc())
-        if a is not None:
-            table.append(a)
+        # New Parquet files store this column. Keep filename inference for
+        # legacy ROOT/Parquet inputs so mixed-format validation still works.
+        if "file_number" not in a.fields:
+            base = os.path.basename(filepath)
+            match = re.search(r'(\d+)', base)
+            fid = int(match.group(1)) if match else 0
+            a = ak.with_field(
+                a, np.full(len(a), fid, dtype=np.int32), "file_number"
+            )
+        table.append(a)
     table = _concat(table)  # ak.Array
     if len(table) == 0:
         raise RuntimeError(f'Zero entries loaded when reading files {filelist} with `load_range`={load_range}.')

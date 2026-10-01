@@ -75,7 +75,12 @@ $$
 A central finding from our 100-seed matched ablation (Pilot E) explains why GGTF could run without $\beta$-suppression while CIRCE benefits from $w_\text{suppress} = 0.1$:
 - **In GGTF**: The infinite-range Gaussian potential $\exp(-d^2/2)$ exerts continuous, global pushback across the entire event. Stray secondary high-$\beta$ hits are pushed away by all other tracks, providing an implicit soft regularization.
 - **In CIRCE**: The compact hinge $\max(0, 1 - d)$ has zero gradient outside $d \ge 1.0$. Because IDEA drift chamber tracks are long helices (50 to 150 hits), distant hits on the same physical particle experience zero external repulsion.
-- **Ablation Evidence**: Without explicit suppression ($w_{\mathrm{suppress}} = 0.0$), multiple hits on the same track predict high $\beta$, causing latent track spread to balloon by $2.2\times$ ($0.060 \to 0.131$), cluster collision rate to spike to $59.5\%$, and tracking efficiency to drop by $-7.47\%$. Adding $w_{\mathrm{suppress}} = 0.1$ with $\mathcal{L}_\beta^{\mathrm{suppress}} = \frac{1}{N_{\mathrm{non}\text{-}\alpha}} \sum_{i \notin \{\alpha(k)\}} \beta_i$ enforces exactly one condensation seed per track, cleanly solving track fragmentation.
+- **Ablation Evidence ($\beta$-Suppression)**: Without explicit suppression ($w_{\text{suppress}} = 0.0$), multiple hits on the same track predict high $\beta$, causing latent track spread to balloon by $2.2\times$ ($0.060 \to 0.131$), cluster collision rate to spike to $59.5\%$, and tracking efficiency to drop by $-7.47\%$. Adding $w_{\text{suppress}} = 0.1$:
+  ```math
+  \mathcal{L}_\beta^{\text{suppress}} = \frac{1}{N_{\text{non-}\alpha}} \sum_{i \notin \{\alpha(k)\}} \beta_i
+  ```
+  enforces exactly one condensation seed per track, cleanly eliminating competing condensation points on long drift helices.
+- **Ablation Evidence (Repulsion Weight $w_{\text{rep}} = 2.0$)**: At nominal $w_{\text{rep}} = 1.0$, bulk separation is healthy (median nearest-neighbour distance $\sim 0.88$), but $10.5\%$ of tracks have their nearest condensation seed within $d < 0.11$ (and $25\%$ within $d < 0.46$) in dense, collimated jet cores. Increasing to $w_{\text{rep}} = 2.0$ doubles the outward repulsive force at the compact hinge boundary ($\max(0, 1 - d)$), cleanly pushing collimated jet tracks past the $t_d = 0.10$ clustering threshold and reducing cluster merges from $19.5\%$ to $12.5\%$ without inflating intra-cluster spread.
 
 ## Data path
 

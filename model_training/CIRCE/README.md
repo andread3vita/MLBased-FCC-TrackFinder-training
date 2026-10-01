@@ -33,8 +33,6 @@ Evaluated on the full 100-seed `eval-keepall` holdout (1,672,188 targets) under 
 |---|---|:---:|:---:|:---:|
 | **Tracking Efficiency ($N_\mathrm{hits} > 10$)** | Standard IDEA benchmark tracks | **97.28%** | $> 90.0\%$ | **Exceeded (+7.28%)** |
 | **Tracking Efficiency ($N_\mathrm{hits} > 3$)** | Inclusive track recovery down to 4 hits | **96.12%** | — | High inclusive recovery |
-| **All-Track Efficiency ($N_\mathrm{hits} > 10$)** | All reconstructable tracks across detector volume | **93.88%** | $> 90.0\%$ | **Exceeded (+3.88%)** |
-| **All-Track Efficiency ($N_\mathrm{hits} > 3$)** | Inclusive tracks across detector volume | **91.58%** | — | Robust recovery |
 | **Fake Rate** | Unmatched non-merged candidates / all candidates | **3.74%** | $< 8.0\%$ | **Exceeded (2.1x lower)** |
 | **Merge Rate** | Multi-track candidate coverage ($>75\%$ purity) | **12.50%** | — | Clean separation |
 | **Candidates / Event** | Full detector acceptance | **36.14** | — | Clean multiplicity |

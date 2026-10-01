@@ -105,20 +105,12 @@ python -u src/eval/fcc_cache_parallel.py \
     > "$BASE/fcc_cache.log" 2>&1
 
 # ---- STAGE 4: Plot unmerged ----
-echo "[eval] Stage 4: plotting unmerged and benchmark suites..."
+echo "[eval] Stage 4: plotting unmerged..."
 mkdir -p "$BASE/fcc_unmerged/plots"
 python -u src/eval/plot_fcc_metrics.py \
     --cache_dir "$BASE/fcc_unmerged" \
     --output_dir "$BASE/fcc_unmerged/plots" \
     --tag "$TAG"
-
-if [ -f "$BASE/fcc_unmerged/cache.parquet" ]; then
-    python -u src/eval/plot_fcc_production_suite.py \
-        --prod-rows "$BASE/fcc_unmerged/cache.parquet" \
-        --outdir "$BASE/fcc_unmerged/plots" \
-        --sample-name "Zqq_uds_keepAllParticles ($EVAL_SEEDS)" \
-        --prod-label "CIRCE ($TAG)"
-fi
 
 echo "[eval] Unmerged plots: $BASE/fcc_unmerged/plots/"
 

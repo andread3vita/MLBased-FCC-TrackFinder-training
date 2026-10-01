@@ -56,7 +56,7 @@ $$
 where condensation charge is defined from predicted $\beta_i \in [0, 1]$:
 
 $$
-q_i = \operatorname{arctanh}^2(\beta_i) + q_{\text{min}}
+q_i = \mathrm{arctanh}^2(\beta_i) + q_{\mathrm{min}}
 $$
 
 ### 2. Side-by-Side Comparison

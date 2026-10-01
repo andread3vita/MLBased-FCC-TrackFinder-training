@@ -30,6 +30,36 @@ from src.model import (
 )
 
 
+def relabel_small_targets(mc_index_loss, batch_ids, noise_index, min_hits):
+    """GGTF's `create_garbage_label(..., minNumHits)`, expressed as relabelling.
+
+    A particle with fewer than `min_hits` hits *in its own event* stops being a target and
+    becomes noise. Its hits stay in the input: deleting them would be the looper filter,
+    which is a different and non-deployable thing (M23).
+
+    Theirs runs during graph construction and drops the particles from `y_data_graph`
+    (`functions_graph_tracking.py:156`), so their loss never sees a sub-3-hit target. Ours
+    had the rule only in the scorer, so we trained against 146.6 primaries an event where
+    they train against 33.2 — roughly 113 one-hit stubs an event that their model learns to
+    suppress and ours learned to reconstruct. See M33.
+
+    `min_hits` of 0 or 1 is a no-op, which is the behaviour of every run before 2026-08-08.
+    """
+    if min_hits <= 1:
+        return mc_index_loss
+
+    signal = mc_index_loss != noise_index
+    if not bool(signal.any()):
+        return mc_index_loss
+
+    # Keyed on (event, particle): the same index in two events is two different particles.
+    pair = torch.stack([batch_ids[signal], mc_index_loss[signal]], dim=1)
+    _, inverse, counts = torch.unique(pair, dim=0, return_inverse=True, return_counts=True)
+    undersized = counts[inverse] < min_hits
+    mc_index_loss[torch.nonzero(signal, as_tuple=True)[0][undersized]] = noise_index
+    return mc_index_loss
+
+
 class EMAShadow:
     """EMA over the full state_dict (parameters + BN running stats).
 
@@ -132,7 +162,45 @@ class CGATrV35LightningModule(L.LightningModule):
 
         ed = self.args.embed_dim
         mc_index_loss = mc_index.clone()
-        mc_index_loss[is_secondary] = 0
+        # A no-op on this dataset, kept because the column is part of the schema.
+        # produced_by_secondary is zero for all 16M hits checked across eight
+        # seeds and both subdetectors, so there is no secondary population to
+        # relabel and no --keep_secondaries flag is needed to match GGTF, whose
+        # active path keeps secondaries as targets.
+        #
+        # `noise_index` is where `--fix_particle_zero` acts. The dataset has no
+        # unassociated hits whatsoever -- every one of 2.0M checked maps to a real
+        # particle in its own event -- so treating index 0 as noise does not label
+        # noise, it labels *particle 0*, which is a generator-status-1 particle
+        # present in every event and charged in about a fifth of them. Those are
+        # full tracks, a median 122 hits at a median 0.84 GeV, and the default
+        # trains against them: excluded from the attractive term and from signal
+        # beta, repelled from every object, and beta actively suppressed by
+        # L_beta_noise. Moving the sentinel to -1, a value no hit carries, makes
+        # them targets and empties the noise class, which is what the data says it
+        # should be. Off by default only so the in-flight ladder stays internally
+        # comparable; see FINDINGS.md M20.
+        noise_index = -1 if getattr(self.args, "fix_particle_zero", False) else 0
+        mc_index_loss[is_secondary] = noise_index
+
+        # GGTF's `create_garbage_label(..., minNumHits=3)`, on our side of the fence.
+        #
+        # Theirs runs during graph construction (`functions_graph_tracking.py:156`) and then
+        # drops those particles from `y_data_graph`, so their loss never sees a target with
+        # fewer than three hits, while the hits themselves stay in the graph as noise. We had
+        # the rule only in the scorer, which meant we trained against 146.6 primaries an event
+        # where they train against 33.2 -- about 113 one-hit stubs an event that their model
+        # learns to suppress and ours learned to reconstruct. That is the likeliest source of
+        # the fragmentation in M27, since a model rewarded for one-hit clusters emits them and
+        # each becomes a fake or a clone under their counting. See M33.
+        #
+        # Relabelling, never deleting: dropping the hits would be the looper filter, which is a
+        # different and non-deployable thing (M23). The hits stay in the input, they simply
+        # stop being objects the loss has to condense.
+        mc_index_loss = relabel_small_targets(
+            mc_index_loss, batch_ids, noise_index,
+            int(getattr(self.args, "min_target_hits", 0) or 0),
+        )
 
         coords = output[:, :ed].float()
         if self.args.cosine_norm:
@@ -148,14 +216,33 @@ class CGATrV35LightningModule(L.LightningModule):
             "seq_lens": seq_lens,
             "batch_ids": batch_ids,
             "output": output,
+            "noise_index": noise_index,
+            "track_separation_weight": batch.get("track_separation_weight"),
         }
 
     # ---- training step ------------------------------------------------------
     def _dummy_ddp_step(self) -> torch.Tensor:
-        """Zero-loss forward on a 2-hit dummy event. Keeps DDP allreduce balanced."""
+        """Zero-loss forward on a 2-hit dummy event. Keeps DDP allreduce balanced.
+
+        The width has to follow the model's own flags rather than being fixed at 10.
+        `--use_time` adds a column and GGTF's projective encoding adds three more for the
+        drift direction, and that encoding raises outright when they are absent -- so a
+        fixed-width dummy turns an empty batch, which this method exists to survive, into
+        a crash on exactly the arms that need it most. The empty batches come from
+        `--drop_loopers` filtering an event below four hits, which is Phase 1, whose
+        projective arm carries that encoding.
+        """
         params = next(self.model.parameters())
-        dummy = torch.zeros(2, 10, device=params.device, dtype=params.dtype)
+        n_cols = (10
+                  + (1 if getattr(self.model, "use_time", False) else 0)
+                  + (3 if getattr(self.model, "needs_drift_dir", False) else 0))
+        dummy = torch.zeros(2, n_cols, device=params.device, dtype=params.dtype)
         dummy[:, 3] = 1.0
+        if getattr(self.model, "needs_drift_dir", False):
+            # A unit drift direction. Zeros would survive the 1e-8 guard in the encoding
+            # but leave the hit at the wire, which is a degenerate geometry to hand a
+            # backbone even for a discarded step.
+            dummy[:, -1] = 1.0
         out = self.model(dummy, [2])
         return out.sum() * 0.0
 
@@ -172,7 +259,7 @@ class CGATrV35LightningModule(L.LightningModule):
         n_events = len(s["seq_lens"])
         vw = _compute_var_weight(self.current_epoch + 1, self.args)  # 1-indexed
 
-        if (s["mc_index_loss"] != 0).sum() < 4:
+        if (s["mc_index_loss"] != s["noise_index"]).sum() < 4:
             return (s["coords"].sum() + s["beta_val"].sum()) * 0.0
 
         loss, comp = object_condensation_loss(
@@ -180,6 +267,7 @@ class CGATrV35LightningModule(L.LightningModule):
             beta=s["beta_val"],
             mc_index=s["mc_index_loss"].long(),
             batch=s["batch_ids"].long(),
+            noise_index=s["noise_index"],
             qmin=self.args.qmin,
             attr_weight=self.args.attr_weight,
             repul_weight=self.args.repul_weight,
@@ -188,6 +276,8 @@ class CGATrV35LightningModule(L.LightningModule):
             beta_suppress_weight=self.args.beta_suppress_weight,
             var_weight=vw,
             return_components=True,
+            oc_mode=self.args.oc_mode,
+            track_separation_weight=s["track_separation_weight"],
         )
 
         if torch.isnan(loss).any() or torch.isinf(loss).any():
@@ -207,6 +297,10 @@ class CGATrV35LightningModule(L.LightningModule):
         self.log("train/loss", loss_d, prog_bar=True, **log_kwargs)
         self.log("train/L_att", comp["L_V_att"].detach(), **log_kwargs)
         self.log("train/L_rep", comp["L_V_rep"].detach(), **log_kwargs)
+        self.log("train/L_beta_sig", comp["L_beta_sig"].detach(), **log_kwargs)
+        self.log("train/L_beta_noise", comp["L_beta_noise"].detach(), **log_kwargs)
+        self.log("train/L_beta_suppress",
+                 comp["L_beta_suppress"].detach(), **log_kwargs)
         self.log("train/L_var", comp["L_var"].detach(), **log_kwargs)
         self.log("train/var_weight", float(vw), **log_kwargs)
         self.log("lr", self.trainer.optimizers[0].param_groups[0]["lr"],
@@ -231,27 +325,36 @@ class CGATrV35LightningModule(L.LightningModule):
             return
         s = self._shared_step(batch)
 
-        if (s["mc_index_loss"] != 0).sum() >= 4:
+        if (s["mc_index_loss"] != s["noise_index"]).sum() >= 4:
             loss = object_condensation_loss(
                 coords=s["coords"],
                 beta=s["beta_val"],
                 mc_index=s["mc_index_loss"].long(),
                 batch=s["batch_ids"].long(),
+                noise_index=s["noise_index"],
                 qmin=self.args.qmin,
                 attr_weight=self.args.attr_weight,
                 repul_weight=self.args.repul_weight,
+                beta_suppress_weight=self.args.beta_suppress_weight,
                 var_weight=float(self.args.var_weight),
+                oc_mode=self.args.oc_mode,
+                track_separation_weight=s["track_separation_weight"],
             )
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 self._val_loss_sum += float(loss.item())
                 self._val_loss_n += 1
 
         ed = self.args.embed_dim
+        # `mc_index_loss`, not the raw column, so the metric scores the same target set the
+        # loss was trained on. With no relabelling flags the two are identical on this dataset
+        # (no secondaries, no unassociated hits), so this changes nothing retroactively -- it
+        # is what makes `--min_target_hits` visible to strict50 rather than only to the loss.
         m = _compute_batch_metrics_greedy(
             s["output"][:, :ed], s["output"][:, ed:ed + 1],
-            s["mc_index"], s["is_secondary"], s["seq_lens"],
+            s["mc_index_loss"], s["is_secondary"], s["seq_lens"],
             tbeta=self.args.tbeta, td=self.args.td,
             cosine_norm=self.args.cosine_norm,
+            noise_index=s["noise_index"],
         )
         self._val_metrics.append(m)
 
@@ -358,12 +461,20 @@ class CGATrV35LightningModule(L.LightningModule):
 
         _prec = str(getattr(self.args, "precision", "32-true"))
         _use_fused = not _prec.startswith("16")
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=float(self.args.start_lr),
-            weight_decay=float(getattr(self.args, "weight_decay", 1e-4)),
-            fused=_use_fused,
-        )
+        # Adam rather than AdamW exists for the GGTF parity runs: their training
+        # uses plain Adam, and decoupled weight decay is not a neutral
+        # difference when the comparison is meant to be to their recipe.
+        _opt = str(getattr(self.args, "optimizer", "adamw")).lower()
+        if _opt == "adam":
+            optimizer = torch.optim.Adam(
+                self.parameters(), lr=float(self.args.start_lr), fused=_use_fused)
+        else:
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=float(self.args.start_lr),
+                weight_decay=float(getattr(self.args, "weight_decay", 1e-4)),
+                fused=_use_fused,
+            )
 
         total_steps = self.args.num_epochs * steps_per_epoch
         warmup_steps = (
@@ -375,7 +486,16 @@ class CGATrV35LightningModule(L.LightningModule):
         # Stored for the manual warmup in optimizer_step (plateau schedule).
         self._lr_schedule = str(getattr(self.args, "lr_schedule", "cosine"))
         self._base_lr = float(self.args.start_lr)
+        self._min_lr = float(self.args.min_lr)
         self._warmup_steps = int(warmup_steps)
+        self._terminal_anneal_epochs = int(
+            getattr(self.args, "terminal_anneal_epochs", 0) or 0
+        )
+        if self._terminal_anneal_epochs < 0:
+            raise ValueError("--terminal_anneal_epochs must be non-negative")
+        if self._terminal_anneal_epochs >= int(self.args.num_epochs):
+            raise ValueError(
+                "--terminal_anneal_epochs must be smaller than --num_epochs")
 
         if self._lr_schedule == "plateau":
             # Linear warmup (applied in optimizer_step) then drop-on-plateau:
@@ -404,6 +524,26 @@ class CGATrV35LightningModule(L.LightningModule):
 
         min_ratio = float(self.args.min_lr) / max(float(self.args.start_lr), 1e-12)
 
+        if self._lr_schedule == "step":
+            # GGTF's schedule: multiply the LR by a constant factor every N
+            # epochs, floored at min_lr, with no warmup. Their run goes 1e-3 to
+            # 1e-6 in factor-0.1 steps.
+            step_epochs = int(getattr(self.args, "lr_step_epochs", 4))
+            step_factor = float(getattr(self.args, "lr_step_factor", 0.1))
+
+            def step_lambda(step: int) -> float:
+                epoch = step // max(steps_per_epoch, 1)
+                return max(min_ratio, step_factor ** (epoch // max(step_epochs, 1)))
+
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": LambdaLR(optimizer, step_lambda),
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
+
         def lr_lambda(step: int) -> float:
             if step < warmup_steps:
                 return step / max(warmup_steps, 1)
@@ -430,4 +570,22 @@ class CGATrV35LightningModule(L.LightningModule):
                 scale = float(gs + 1) / float(ws)
                 for pg in optimizer.param_groups:
                     pg["lr"] = scale * self._base_lr
+            else:
+                terminal_epochs = getattr(self, "_terminal_anneal_epochs", 0)
+                terminal_start = int(self.args.num_epochs) - terminal_epochs
+                if terminal_epochs and epoch >= terminal_start:
+                    # A deterministic upper bound on LR: never undo an earlier
+                    # ReduceLROnPlateau drop, but guarantee a half-cosine
+                    # refinement to min_lr by the final optimizer step.
+                    epoch_fraction = float(batch_idx + 1) / max(
+                        int(self._steps_per_epoch), 1)
+                    progress = (
+                        float(epoch) + epoch_fraction - terminal_start
+                    ) / float(terminal_epochs)
+                    progress = min(max(progress, 0.0), 1.0)
+                    cap = self._min_lr + 0.5 * (
+                        self._base_lr - self._min_lr
+                    ) * (1.0 + math.cos(math.pi * progress))
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = min(float(pg["lr"]), cap)
         super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)

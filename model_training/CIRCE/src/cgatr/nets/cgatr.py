@@ -63,6 +63,7 @@ class CGATr(nn.Module):
         reinsert_s_channels: Optional[Tuple[int]] = None,
         checkpoint_blocks: bool = False,
         dropout_prob: Optional[float] = None,
+        norm_epsilon_mode: str = "clamp",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -99,6 +100,7 @@ class CGATr(nn.Module):
                 attention=attention,
                 mlp=mlp,
                 dropout_prob=dropout_prob,
+                norm_epsilon_mode=norm_epsilon_mode,
             )
             for _ in range(num_blocks)
         ])
@@ -135,7 +137,12 @@ class CGATr(nn.Module):
         outputs_mv : torch.Tensor (..., items, out_mv_channels, 32)
         outputs_s : torch.Tensor or None
         """
-        reference_mv = self._construct_dual_reference(multivectors)
+        # The equivariant-join branch was removed (de Haan 2311.04744 Prop. 1:
+        # the non-degenerate CGA needs only the geometric product), and the
+        # geometric-product MLP ignores `reference_mv`. We therefore no longer
+        # build the dual reference (the old per-event mean over items+channels);
+        # passing None is bit-for-bit identical and saves a reduction per call.
+        reference_mv = None
         additional_qk_features_mv = None
         additional_qk_features_s = None
 
@@ -170,15 +177,3 @@ class CGATr(nn.Module):
 
         outputs_mv, outputs_s = self.linear_out(h_mv, scalars=h_s)
         return outputs_mv, outputs_s
-
-    @staticmethod
-    def _construct_dual_reference(inputs: torch.Tensor) -> torch.Tensor:
-        """Construct reference multivector for equivariant join from input mean.
-
-        For input shape (N_items, channels, 32), averages over items AND channels
-        to get a single reference (1, 1, 32) that broadcasts with any channel count.
-        """
-        # Average over all dims except the last (MV components)
-        # Input: (N, channels, 32) -> mean over N and channels -> (1, 1, 32)
-        mean_dim = tuple(range(0, len(inputs.shape) - 1))
-        return torch.mean(inputs, dim=mean_dim, keepdim=True)

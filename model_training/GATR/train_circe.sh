@@ -23,7 +23,7 @@ TRAIN_SEEDS=${4:-"1-980"}
 VAL_SEEDS=${5:-"981-1000"}
 
 python -u -m src.train_algebra_ab \
-  --algebra conformal \
+  --algebra circe \
   --loss_backend circe \
   --recipe circe \
   --reference_width \

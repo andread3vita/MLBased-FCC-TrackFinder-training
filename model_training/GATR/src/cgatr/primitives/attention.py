@@ -20,7 +20,12 @@ from einops import rearrange
 from torch import Tensor, nn
 from torch.nn.functional import scaled_dot_product_attention
 
-from src.gatr_v111.utils.tensors import to_nd
+
+def to_nd(tensor: Tensor, d: int) -> Tensor:
+    """Prepend singleton dimensions until `tensor` has dimension `d`."""
+    while len(tensor.shape) < d:
+        tensor = tensor.unsqueeze(0)
+    return tensor
 
 # Optional xformers memory-efficient attention. Used for the packed-batch
 # training path: it is block-sparse and O(M) in memory (never materialises the

@@ -32,10 +32,16 @@ class EquiLayerNorm(nn.Module):
         mv_channel_dim=-2,
         scalar_channel_dim=-1,
         epsilon: float = 0.01,
+        epsilon_mode: str = "clamp",
     ):
         super().__init__()
+        if epsilon_mode not in ("clamp", "add"):
+            raise ValueError(
+                f"unknown LayerNorm epsilon mode: {epsilon_mode!r}"
+            )
         self.mv_channel_dim = mv_channel_dim
         self.epsilon = epsilon
+        self.epsilon_mode = epsilon_mode
         self.register_buffer("ip_weights", ip_weights)
         self.hidden_s_channels = hidden_s_channels
         # M1: grade-wise norm is permanently enabled (de Haan 2311.04744 Sec 3.4).
@@ -63,6 +69,7 @@ class EquiLayerNorm(nn.Module):
             channel_dim=self.mv_channel_dim,
             epsilon=self.epsilon,
             gradewise=True,  # M1: permanently enabled
+            epsilon_mode=self.epsilon_mode,
         )
         outputs_s = torch.nn.functional.layer_norm(
             scalars, normalized_shape=[self.hidden_s_channels]

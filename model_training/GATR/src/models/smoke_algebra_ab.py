@@ -43,18 +43,31 @@ def run_arm(label: str, wrapper_module: str, g, inp, y, device):
     import importlib
 
     mod = importlib.import_module(wrapper_module)
-    args = types.SimpleNamespace(start_lr=1e-3, predict=False, capacity_matched=True)
+    args = types.SimpleNamespace(
+        start_lr=1e-3,
+        predict=False,
+        capacity_matched=True,
+        clustering_space_dim=3,
+        lr_scheduler="none",
+        optimizer="adam",
+        num_epochs=1,
+        qmin=0.1,
+        L_attractive_weight=1.0,
+        L_repulsive_weight=1.0,
+        use_average_cc_pos=0.0,
+        loss_type="hgcalimplementation",
+    )
     model = mod.GraphTransformerNetWrapper(args, device).to(device)
     n_par = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     out = model.mod(g, inp)
-    assert out.shape == (g.num_nodes(), 4), f"{label}: {out.shape}"
+    assert out.shape[0] == g.num_nodes() and out.shape[1] >= 4, f"{label}: {out.shape}"
     assert torch.isfinite(out).all(), f"{label}: non-finite output"
 
     from src.layers.losses import object_condensation_loss_tracking
 
     loss, _ = object_condensation_loss_tracking(
-        g, out, y,
+        g, out[:, :4], y,
         clust_loss_only=True, add_energy_loss=False, calc_e_frac_loss=False,
         q_min=0.1, frac_clustering_loss=0.0, attr_weight=1.0, repul_weight=1.0,
         fill_loss_weight=0.0, use_average_cc_pos=0.0, loss_type="hgcalimplementation",

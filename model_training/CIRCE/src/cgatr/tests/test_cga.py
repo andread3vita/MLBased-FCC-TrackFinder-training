@@ -114,8 +114,12 @@ def test_circle_is_grade2():
     print(f"[PASS] test_circle_is_grade2 (grade2_max={grade2:.4f}, others<1e-5)")
 
 
-def test_pin_equi_linear_basis():
-    """Verify the Pin(4,1)-equivariant linear basis has correct shape and properties."""
+def test_legacy_nine_map_basis_shape():
+    """The retained legacy helper remains shape-compatible with old scripts.
+
+    This is deliberately not an equivariance claim: de Haan's CGA basis has
+    20 E(3) maps, while nine is the published PGA count.
+    """
     from src.cgatr.primitives.linear import _compute_pin_equi_linear_basis
 
     basis = _compute_pin_equi_linear_basis()
@@ -127,7 +131,7 @@ def test_pin_equi_linear_basis():
         # Should be approximately diagonal within the grade block
         assert proj.abs().max() > 0, f"Grade {g} projection is zero"
 
-    print(f"[PASS] test_pin_equi_linear_basis (shape={basis.shape})")
+    print(f"[PASS] test_legacy_nine_map_basis_shape (shape={basis.shape})")
 
 
 def test_equi_linear():
@@ -189,6 +193,47 @@ def test_se3_equivariant_basis():
     assert max_resid < 1e-6, f"basis not rotation-equivariant: {max_resid:.2e}"
     print(f"[PASS] test_se3_equivariant_basis "
           f"(n_basis={basis.shape[0]}, resid={max_resid:.2e})")
+
+
+def test_e3_equivariant_basis():
+    """Reproduce de Haan et al.'s published 20-map CGA basis."""
+    from src.cgatr.primitives.linear import (
+        _compute_e3_equi_linear_basis,
+        _mirror_action_matrix,
+    )
+
+    gp, _, metadata = _load_tables()
+    e_inf = torch.zeros(32)
+    e_inf[4] = -1.0
+    e_inf[5] = 1.0
+    basis = _compute_e3_equi_linear_basis(
+        gp,
+        metadata["grade_involution_signs"],
+        spatial_idx=(1, 2, 3),
+        translation_vec=e_inf,
+        mirror_vector_idx=1,
+        expected_count=20,
+        label="CGA",
+    ).double()
+    assert basis.shape == (20, 32, 32)
+
+    mirror = _mirror_action_matrix(
+        gp, metadata["grade_involution_signs"], vector_idx=1
+    )
+    residual = (
+        torch.einsum("ik,bkj->bij", mirror, basis)
+        - torch.einsum("bik,kj->bij", basis, mirror)
+    )
+    assert residual.abs().max().item() < 1e-6
+
+    flat = basis.reshape(20, -1)
+    torch.testing.assert_close(
+        flat @ flat.T,
+        torch.eye(20, dtype=flat.dtype),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    print("[PASS] test_e3_equivariant_basis (shape=(20, 32, 32))")
 
 
 def test_cgatr_forward():
@@ -302,9 +347,10 @@ if __name__ == "__main__":
         test_cga_point_null,
         test_cga_distance,
         test_circle_is_grade2,
-        test_pin_equi_linear_basis,
+        test_legacy_nine_map_basis_shape,
         test_equi_linear,
         test_se3_equivariant_basis,
+        test_e3_equivariant_basis,
         test_reversal_signs,
         test_grade_dropout,
         test_dual,

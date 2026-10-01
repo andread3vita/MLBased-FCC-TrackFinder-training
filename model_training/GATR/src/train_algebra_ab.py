@@ -72,6 +72,7 @@ CIRCE_DEFAULTS = dict(
 ARMS = {
     "projective": "src.models.Gatr_withModifications",
     "conformal": "src.models.Cgatr_withModifications",
+    "circe": "src.models.Cgatr_withModifications",
 }
 
 
@@ -258,6 +259,9 @@ def main():
         tau=False,
         tbeta=a.tbeta,
         td=a.td,
+        clustering_space_dim=3,
+        lr_scheduler="reduceplateau" if a.recipe == "ggtf" else "flat+decay",
+        optimizer="adam" if a.recipe == "ggtf" else "adamw",
         metric_val_batches=a.metric_val_batches,
         model_prefix=os.path.join(a.output_dir, ""),
         **loss_args,

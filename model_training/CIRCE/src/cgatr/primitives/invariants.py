@@ -14,7 +14,7 @@ import torch
 from src.cgatr.primitives.linear import _compute_reversal, grade_project
 
 
-def compute_inner_product_mask(gp, device=torch.device("cpu")) -> torch.Tensor:
+def compute_inner_product_mask(gp, device=torch.device("cpu"), reversal=None) -> torch.Tensor:
     """Compute inner product mask from GP table.
 
     For non-degenerate Cl(4,1), ALL components contribute (unlike PGA).
@@ -31,7 +31,12 @@ def compute_inner_product_mask(gp, device=torch.device("cpu")) -> torch.Tensor:
     ip_weights : torch.Tensor with shape (32,)
         Weights for inner product: ip(x,y) = sum_i weights_i * x_i * y_i
     """
-    reversal = _compute_reversal(device=device, dtype=torch.float32)
+    # `reversal` is supplied by the projective arm, whose 16 blades have their
+    # own reversal signs; left None it falls back to the Cl(4,1) defaults.
+    if reversal is None:
+        reversal = _compute_reversal(device=device, dtype=torch.float32)
+    else:
+        reversal = reversal.to(device=device, dtype=torch.float32)
     # gp[0, i, i] gives the scalar component of blade_i * blade_i
     metric_diag = torch.diag(gp[0].to(device))
     ip_weights = reversal * metric_diag
@@ -49,7 +54,7 @@ def compute_inner_product_indices(gp, device=torch.device("cpu")) -> torch.Tenso
         Indices where inner product weight is nonzero.
     """
     weights = compute_inner_product_mask(gp, device=device)
-    return torch.arange(32, device=device)[weights.abs() > 1e-10]
+    return torch.arange(weights.shape[0], device=device)[weights.abs() > 1e-10]
 
 
 def inner_product(

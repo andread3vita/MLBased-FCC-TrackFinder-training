@@ -36,6 +36,10 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
+
+# Same switch as `eval/ggtf_assign.py` and `eval/forward_pass.py`, read from the environment
+# so every stage of one report agrees on whether particle 0 is a target. See FINDINGS.md M20.
+MIN_SIGNAL_MC = 0 if os.environ.get("FIX_PARTICLE_ZERO") == "1" else 1
 import polars as pl
 import torch
 
@@ -55,7 +59,10 @@ def per_track_records(pred_labels, mc_index_signal, n_hits_total_map):
     detector hit count (including secondaries) for the reconstructable cut.
     """
     unique_true = np.unique(mc_index_signal)
-    unique_true = unique_true[unique_true > 0]
+    # `MIN_SIGNAL_MC` is 1 by default and 0 under FIX_PARTICLE_ZERO=1, which admits
+    # particle 0 -- a real particle that the default silently drops (FINDINGS.md M20).
+    # Negative values are the garbage label and are never targets.
+    unique_true = unique_true[unique_true >= MIN_SIGNAL_MC]
     rows = []
     for tid in unique_true:
         tmask = mc_index_signal == tid
@@ -80,7 +87,7 @@ def per_track_records(pred_labels, mc_index_signal, n_hits_total_map):
             "cluster_size": int(cluster_size),
             "efficiency_per_hit": float(eff),
             "purity_of_match": float(purity),
-            "matched": bool(purity >= 0.75 and best_match > 0),
+            "matched": bool(purity > 0.75 and best_match > 0),
         })
     return rows
 
@@ -103,11 +110,18 @@ def per_cluster_records(pred_labels, mc_index_signal):
         cluster_size = int(cmask.sum())
         if cluster_size == 0:
             continue
-        # all entries of cluster_mc are guaranteed > 0 since mc_index_signal
-        # comes from sig_mask (mc_index != 0), but bincount needs non-negative
-        counts = np.bincount(cluster_mc.astype(np.int64))
-        matched_mc = int(counts.argmax())
-        best_match = int(counts.max())
+        # Negative entries mark hits that are in the input but are not targets: GGTF's
+        # `create_garbage_label` relabels a particle with too few hits to noise while
+        # keeping its hits in the graph, and `--min_target_hits` reproduces that. Such
+        # hits still count towards `cluster_size`, because the candidate really does
+        # contain them, but they cannot be the match -- and `bincount` rejects them.
+        signal_mc = cluster_mc[cluster_mc >= 0]
+        if len(signal_mc) == 0:
+            matched_mc, best_match = -1, 0
+        else:
+            counts = np.bincount(signal_mc.astype(np.int64))
+            matched_mc = int(counts.argmax())
+            best_match = int(counts.max())
         purity = best_match / cluster_size
         rows.append({
             "cluster_id": int(pid),
@@ -236,7 +250,8 @@ def add_reconstructable_masks(joined: pl.DataFrame) -> pl.DataFrame:
 
     joined = joined.with_columns([
         (
-            (pl.col("n_hits_total") > 10)
+            (pl.col("pt") > 0.1)
+            & (pl.col("n_hits_total") > 10)
             & (pl.col("theta_deg") > 15.0)
             & (pl.col("theta_deg") < 165.0)
             & pl.col("gen_status").is_in([0, 1])

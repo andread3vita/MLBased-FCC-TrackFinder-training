@@ -41,6 +41,11 @@ class GeometricAttention(nn.Module):
             num_s_channels_qk=h_s,
             num_mv_channels_v=h_mv,
             num_s_channels_v=h_s,
+            grade1_idx=config.grade1_idx,
+            ip_idx=config.ip_idx,
+            num_blades=config.num_blades,
+            ip_weights=config.ip_weights,
+            pga_dist_idx=config.pga_dist_idx,
         )
 
     def forward(self, q_mv, k_mv, v_mv, q_s, k_s, v_s, attention_mask=None):

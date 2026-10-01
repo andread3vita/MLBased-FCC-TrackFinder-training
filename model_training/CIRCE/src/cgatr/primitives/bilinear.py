@@ -3,8 +3,15 @@
 All operations use 32-component multivectors and (32, 32, 32) Cayley tables.
 """
 
+import os
+
 import torch
 from torch import nn
+
+from src.cgatr.primitives.bilinear_triton import (
+    cayley_sparse_tables,
+    sparse_geometric_product,
+)
 
 
 class _GeometricProductFn(torch.autograd.Function):
@@ -47,12 +54,36 @@ class geometric_product(nn.Module):
     def __init__(self, gp) -> None:
         super().__init__()
         self.register_buffer("gp", gp)  # (32, 32, 32)
+        sparse_requested = os.environ.get("CGATR_SPARSE_GP", "").strip().lower()
+        self._use_sparse = (
+            sparse_requested in ("1", "true", "yes")
+            and tuple(gp.shape) == (32, 32, 32)
+        )
+        tables = (
+            cayley_sparse_tables(gp)
+            if self._use_sparse
+            else (None, None, None, None)
+        )
+        # Purely derived from gp, so old and new checkpoints remain identical.
+        self.register_buffer("_pair_output", tables[0], persistent=False)
+        self.register_buffer("_pair_coeff", tables[1], persistent=False)
+        self.register_buffer("_forward_left", tables[2], persistent=False)
+        self.register_buffer("_forward_coeff", tables[3], persistent=False)
 
     def forward(self, x, y):
         # x, y: (..., 32). Arbitrary leading dims supported via ellipsis
         # so the same op handles single-event (items, channels, 32) and
         # multi-event batched (B, N, channels, 32) inputs without a
         # custom rank-2 prefix.
+        if self._use_sparse and x.is_cuda:
+            return sparse_geometric_product(
+                self._pair_output,
+                self._pair_coeff,
+                self._forward_left,
+                self._forward_coeff,
+                x,
+                y,
+            )
         if torch.is_grad_enabled() and (x.requires_grad or y.requires_grad):
             # Training: memory-frugal custom backward (no (...,32,32) saved).
             return _GeometricProductFn.apply(self.gp, x, y)

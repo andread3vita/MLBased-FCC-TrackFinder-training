@@ -39,11 +39,20 @@ class CGATrBlock(nn.Module):
         attention: SelfAttentionConfig,
         mlp: MLPConfig,
         dropout_prob: Optional[float] = None,
+        norm_epsilon_mode: str = "clamp",
     ) -> None:
         super().__init__()
 
-        self.norm = EquiLayerNorm(ip_weights, hidden_s_channels=s_channels)
-        self.norm2 = EquiLayerNorm(ip_weights, hidden_s_channels=s_channels)
+        self.norm = EquiLayerNorm(
+            ip_weights,
+            hidden_s_channels=s_channels,
+            epsilon_mode=norm_epsilon_mode,
+        )
+        self.norm2 = EquiLayerNorm(
+            ip_weights,
+            hidden_s_channels=s_channels,
+            epsilon_mode=norm_epsilon_mode,
+        )
 
         # Self-attention
         attention = replace(

@@ -29,13 +29,15 @@ A systematic 5-way factorial ablation over 50,000 matched events established CIR
 
 Evaluated on the full 100-seed `eval-keepall` holdout (1,672,188 targets) under standard benchmark definitions ($15^\circ < \theta < 165^\circ, p_\mathrm{T} > 0.1$ GeV at $t_\beta = 0.60, t_d = 0.10$):
 
-| Metric | Selection / Condition | CIRCE (July Production) | Benchmark Target | Status |
-|---|---|:---:|:---:|:---:|
-| **Tracking Efficiency ($N_\mathrm{hits} > 10$)** | Standard IDEA benchmark tracks | **97.28%** | $> 90.0\%$ | **Exceeded (+7.28%)** |
-| **Tracking Efficiency ($N_\mathrm{hits} > 3$)** | Inclusive track recovery down to 4 hits | **96.12%** | — | High inclusive recovery |
-| **Fake Rate** | Unmatched non-merged candidates / all candidates | **3.74%** | $< 8.0\%$ | **Exceeded (2.1x lower)** |
-| **Merge Rate** | Multi-track candidate coverage ($>75\%$ purity) | **12.50%** | — | Clean separation |
-| **Candidates / Event** | Full detector acceptance | **36.14** | — | Clean multiplicity |
+| Metric | Selection / Condition | CIRCE Results |
+|---|---|:---:|
+| **Tracking Efficiency ($N_\mathrm{hits} > 10$)** | Standard IDEA benchmark tracks | **97.28%** |
+| **Tracking Efficiency ($N_\mathrm{hits} > 3$)** | Inclusive track recovery down to 4 hits | **96.12%** |
+| **Tracking Efficiency (1-to-1 Hungarian)** | Double Majority (purity $\ge 50\%$, hit eff $\ge 50\%$) | **94.65%** |
+| **Fake Rate (Non-Merged)** | Unmatched non-merged candidates / all candidates | **3.74%** |
+| **Fake Rate (1-to-1 Hungarian)** | Unassigned candidates in 1-to-1 match | **10.69%** |
+| **Merge Rate** | Multi-track candidate coverage ($>75\%$ purity) | **12.50%** |
+| **Candidates / Event** | Full detector acceptance | **36.14** |
 
 Benchmark plots are available in `plots/`:
 - `plots/head_to_head_keepall_efficiency.png` (and `.pdf`): Tracking Efficiency vs $p_\mathrm{T}$ and Polar Angle $\theta$.

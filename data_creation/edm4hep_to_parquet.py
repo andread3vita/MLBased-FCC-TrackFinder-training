@@ -239,11 +239,17 @@ def extract_mc_particles(event):
     return particles
 
 
+UNSIGNED_COLUMNS = {"cell_id"}  # EDM4hep cellID is uint64; values with the top
+                                # bit set overflow pyarrow's signed int64 path
+
+
 def dicts_to_arrow_table(dicts):
     """Convert dict of lists to a PyArrow table."""
     arrays = {}
     for k, v in dicts.items():
-        if isinstance(v[0], str) if len(v) > 0 else False:
+        if k in UNSIGNED_COLUMNS:
+            arrays[k] = pa.array(v, type=pa.uint64())
+        elif isinstance(v[0], str) if len(v) > 0 else False:
             arrays[k] = pa.array(v, type=pa.string())
         elif isinstance(v[0], int) if len(v) > 0 else False:
             arrays[k] = pa.array(v, type=pa.int64())
@@ -252,74 +258,75 @@ def dicts_to_arrow_table(dicts):
     return pa.table(arrays)
 
 
+FLUSH_EVERY = 20  # events per row-group flush
+
+
 def process_file(input_path, output_dir, seed, split):
-    """Process one edm4hep digitized ROOT file into Parquet tables."""
-    print(f"Processing: {input_path}")
+    """Process one file, streaming row groups to disk every FLUSH_EVERY events.
+
+    Memory-efficient streaming conversion using pq.ParquetWriter. Keeps only
+    FLUSH_EVERY events buffered in memory and writes through temporary files,
+    preventing out-of-memory errors on large samples (such as keepAllParticles)
+    and avoiding truncated output on interrupted jobs.
+    """
+    print(f"Processing: {input_path}", flush=True)
     reader = root_io.Reader(input_path)
     metadata = reader.get("metadata")[0]
 
-    all_dc = []
-    all_vtx = []
-    all_mc = []
+    seed_dir = os.path.join(output_dir, f"seed_{seed}")
+    os.makedirs(seed_dir, exist_ok=True)
+
+    names = ("dc_hits", "vtx_hits", "mc_particles")
+    finals = {n: os.path.join(seed_dir, f"{n}_{split}.parquet") for n in names}
+    tmps = {n: finals[n] + ".tmp" for n in names}
+    writers = {n: None for n in names}
+    schemas = {n: None for n in names}
+    buf = {n: [] for n in names}
+    rows = {n: 0 for n in names}
+
+    def flush():
+        for n in names:
+            if not buf[n]:
+                continue
+            merged = {k: [] for k in buf[n][0]}
+            for d in buf[n]:
+                for k in merged:
+                    merged[k].extend(d[k])
+            table = dicts_to_arrow_table(merged)
+            if writers[n] is None:
+                schemas[n] = table.schema
+                writers[n] = pq.ParquetWriter(tmps[n], schemas[n])
+            writers[n].write_table(table.cast(schemas[n]))
+            rows[n] += table.num_rows
+            buf[n] = []
 
     for event_id, event in enumerate(reader.get("events")):
         dc = extract_dc_hits(event, metadata)
         vtx = extract_vtx_silicon_hits(event)
         mc = extract_mc_particles(event)
-
-        n_dc = len(dc["hit_x"])
-        n_vtx = len(vtx["hit_x"])
-        n_mc = len(mc["mc_index"])
-
-        # Add event/file identifiers
-        dc["event_id"] = [event_id] * n_dc
-        dc["seed"] = [seed] * n_dc
-        dc["hit_type"] = [0] * n_dc  # 0 = drift chamber
-
-        vtx["event_id"] = [event_id] * n_vtx
-        vtx["seed"] = [seed] * n_vtx
-        vtx["hit_type"] = [1] * n_vtx  # 1 = vertex/silicon
-
-        mc["event_id"] = [event_id] * n_mc
-        mc["seed"] = [seed] * n_mc
-
-        if n_dc > 0:
-            all_dc.append(dc)
-        if n_vtx > 0:
-            all_vtx.append(vtx)
-        if n_mc > 0:
-            all_mc.append(mc)
-
-    # Merge all events for this file
-    def merge_dicts(dict_list):
-        if not dict_list:
-            return {}
-        merged = {k: [] for k in dict_list[0]}
-        for d in dict_list:
-            for k in merged:
-                merged[k].extend(d[k])
-        return merged
-
-    seed_dir = os.path.join(output_dir, f"seed_{seed}")
-    os.makedirs(seed_dir, exist_ok=True)
-
-    dc_merged = merge_dicts(all_dc)
-    if dc_merged:
-        dc_table = dicts_to_arrow_table(dc_merged)
-        pq.write_table(dc_table, os.path.join(seed_dir, f"dc_hits_{split}.parquet"))
-        print(f"  DC hits: {len(dc_merged['hit_x'])} rows")
-
-    vtx_merged = merge_dicts(all_vtx)
-    if vtx_merged:
-        vtx_table = dicts_to_arrow_table(vtx_merged)
-        pq.write_table(vtx_table, os.path.join(seed_dir, f"vtx_hits_{split}.parquet"))
-        print(f"  VTX/Si hits: {len(vtx_merged['hit_x'])} rows")
-
-    mc_merged = merge_dicts(all_mc)
-    if mc_merged:
-        mc_table = dicts_to_arrow_table(mc_merged)
-        pq.write_table(mc_table, os.path.join(seed_dir, f"mc_particles_{split}.parquet"))
-        print(f"  MC particles: {len(mc_merged['mc_index'])} rows")
+        for n, d, hit_type in (("dc_hits", dc, 0),
+                               ("vtx_hits", vtx, 1),
+                               ("mc_particles", mc, None)):
+            key0 = "mc_index" if n == "mc_particles" else "hit_x"
+            cnt = len(d[key0])
+            if cnt == 0:
+                continue
+            d["event_id"] = [event_id] * cnt
+            d["seed"] = [seed] * cnt
+            if hit_type is not None:
+                d["hit_type"] = [hit_type] * cnt
+            buf[n].append(d)
+        if (event_id + 1) % FLUSH_EVERY == 0:
+            flush()
+        if (event_id + 1) % 100 == 0:
+            print(f"  ... {event_id + 1} events", flush=True)
+    flush()
+    for n in names:
+        if writers[n] is not None:
+            writers[n].close()
+            os.replace(tmps[n], finals[n])
+    print(f"  DC hits: {rows['dc_hits']} rows; VTX/Si hits: {rows['vtx_hits']} rows; "
+          f"MC particles: {rows['mc_particles']} rows", flush=True)
 
 
 def main():

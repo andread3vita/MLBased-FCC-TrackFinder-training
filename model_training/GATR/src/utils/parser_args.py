@@ -245,31 +245,6 @@ parser.add_argument(
     help="options to pass to the optimizer class constructor, e.g., `--optimizer-option weight_decay 1e-4`",
 )
 parser.add_argument(
-    "--capacity-matched",
-    action="store_true",
-    help="size the conformal (CGA) model to match Gatr_withModifications' "
-         "924,488 parameters (within 1.4%%) instead of CIRCE's reference "
-         "width, for algebra A/B runs. Ignored by the GATR model.",
-)
-parser.add_argument(
-    "--recipe",
-    type=str,
-    default="circe",
-    choices=["circe", "ggtf"],
-    help="optimizer recipe for the conformal (CGA) model: 'circe' (AdamW, "
-         "warmup, half-cosine anneal - the reference settings) or 'ggtf' "
-         "(Adam + ReduceLROnPlateau). Ignored by the GATR model.",
-)
-parser.add_argument(
-    "--loss-backend",
-    type=str,
-    default="circe",
-    choices=["circe", "ggtf"],
-    help="objective for the conformal (CGA) model: 'circe' (its own loss, default) "
-         "or 'ggtf' (the shared object-condensation loss, for algebra A/B runs). "
-         "Ignored by the GATR model.",
-)
-parser.add_argument(
     "--lr-scheduler",
     type=str,
     default="flat+decay",
@@ -504,35 +479,20 @@ parser.add_argument(
     help="Cap the number of validation events",
 )
 parser.add_argument(
-    "--qmin",
-    type=float,
-    default=0.1,
-    help="define qmin for condensation (GGTF default 0.1; CIRCE champion default is 3.0)",
+    "--qmin", type=float, default=0.1, help="define qmin for condensation"
 )
 
 parser.add_argument(
     "--L_attractive_weight",
     type=float,
     default=1.0,
-    help="Attractive term of the potential weight",
+    help="Attractitve term of the potential weight",
 )
 parser.add_argument(
     "--L_repulsive_weight",
     type=float,
     default=1.0,
-    help="Repulsive term of the potential weight (GGTF default 1.0; CIRCE champion default is 2.0)",
-)
-parser.add_argument(
-    "--beta_suppress_weight",
-    type=float,
-    default=0.1,
-    help="beta suppression weight on non-alpha signal hits for CIRCE loss (default: 0.1, ablated against 0.0 and 0.3)",
-)
-parser.add_argument(
-    "--var_weight",
-    type=float,
-    default=0.3,
-    help="within-cluster variance regularizer weight for CIRCE loss (default: 0.3)",
+    help="Repulsive term of the potential weight",
 )
 
 parser.add_argument(

@@ -77,6 +77,7 @@ inputs:
          - [produced_by_secondary, null]
          - [event_number, null]
          - [file_number, null]
+         # - [overlay, null]
 
 labels:
   

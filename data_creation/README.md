@@ -8,6 +8,6 @@ This repository is designed to be used with Condor, but you can adapt it to best
 Inside the `condor_pipeline/` directory, you will find several detector configurations.  
 You can choose whether to include background or not.  
 
-At the moment, the only fully tested configuration is `IDEA/noBackground`.  
+At the moment, the only fully tested configuration is `IDEA/noBackground_parquet`.
 
 You can run the script `scriptDatasetCreation.sh`, which submits Condor jobs to generate the dataset.

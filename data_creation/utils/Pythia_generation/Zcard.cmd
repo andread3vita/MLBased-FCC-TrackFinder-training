@@ -19,12 +19,9 @@ Beams:eCM = 91              ! CM energy of collision
 
 Beams:allowMomentumSpread  = off
 
-! Vertex smearing :
-! Beams:allowVertexSpread = on
-! Beams:sigmaVertexX = 5.96e-3   !  5.96 um
-! Beams:sigmaVertexY = 23.8E-6   !  23.8 nm
-! Beams:sigmaVertexZ = 0.397     !  0.397 mm
-! Beams:sigmaTime    = 
+! The interaction-point smearing is applied by GaussSmearVertex in pythia.py:
+! sigmaX = 5.96 um, sigmaY = 23.8 nm, sigmaZ = 0.397 mm.
+! Do not also enable Pythia vertex spreading, which would smear twice.
 
 PartonLevel:ISR = on               ! initial-state radiation
 PartonLevel:FSR = on               ! final-state radiation

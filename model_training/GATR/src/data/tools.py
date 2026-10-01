@@ -22,36 +22,45 @@ def _stack(arrays, axis=1):
         return ak.concatenate(arrays, axis=axis)
 
 
-def _pad_vector(a, value=-1, dtype="float32"):
+def _pad_vector(a, value=-1, dtype=None):
     maxlen = 2000
     maxlen2 = 5
 
-    x = (np.ones((len(a), maxlen, maxlen2)) * value).astype(dtype)
+    source_dtype = dtype
+    if source_dtype is None:
+        source_dtype = ak.to_numpy(ak.flatten(a, axis=None)).dtype
+    x = np.full((len(a), maxlen, maxlen2), value, dtype=source_dtype)
     for idx, s in enumerate(a):
         for idx_vec, s_vec in enumerate(s):
             x[idx, idx_vec, : len(s_vec)] = s_vec
     return x
 
 
-def _pad(a, maxlen, value=0, dtype="float32"):
+def _pad(a, maxlen, value=0, dtype=None):
     if isinstance(a, np.ndarray) and a.ndim >= 2 and a.shape[1] == maxlen:
         return a
     elif isinstance(a, ak.Array):
         if a.ndim == 1:
             a = ak.unflatten(a, 1)
         a = ak.fill_none(ak.pad_none(a, maxlen, clip=True), value)
-        return ak.values_astype(a, dtype)
+        return ak.values_astype(a, dtype) if dtype is not None else a
     else:
-        x = (np.ones((len(a), maxlen)) * value).astype(dtype)
+        source_dtype = dtype
+        if source_dtype is None:
+            nonempty = next((np.asarray(s) for s in a if len(s)), None)
+            source_dtype = (
+                nonempty.dtype if nonempty is not None else np.asarray(value).dtype
+            )
+        x = np.full((len(a), maxlen), value, dtype=source_dtype)
         for idx, s in enumerate(a):
             if not len(s):
                 continue
-            trunc = s[:maxlen].astype(dtype)
+            trunc = np.asarray(s[:maxlen], dtype=source_dtype)
             x[idx, : len(trunc)] = trunc
         return x
 
 
-def _repeat_pad(a, maxlen, shuffle=False, dtype="float32"):
+def _repeat_pad(a, maxlen, shuffle=False, dtype=None):
     x = ak.to_numpy(ak.flatten(a))
     x = np.tile(x, int(np.ceil(len(a) * maxlen / len(x))))
     if shuffle:
@@ -59,7 +68,7 @@ def _repeat_pad(a, maxlen, shuffle=False, dtype="float32"):
     x = x[: len(a) * maxlen].reshape((len(a), maxlen))
     mask = _pad(ak.zeros_like(a), maxlen, value=1)
     x = _pad(a, maxlen) + mask * x
-    return ak.values_astype(x, dtype)
+    return ak.values_astype(x, dtype) if dtype is not None else x
 
 
 def _clip(a, a_min, a_max):

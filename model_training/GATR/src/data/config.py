@@ -166,7 +166,15 @@ class DataConfig(object):
             _logger.debug('load_branches:\n  %s', ','.join(self.load_branches))
 
     def __getattr__(self, name):
-        return self.options[name]
+        # Attribute-probing code such as pickle looks for optional methods
+        # including ``__getstate__``.  Python requires missing attributes to
+        # raise AttributeError; leaking the options dictionary's KeyError makes
+        # an otherwise picklable DataConfig fail under DataLoader ``spawn``.
+        options = self.__dict__.get("options", {})
+        try:
+            return options[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
 
     def dump(self, fp):
         with open(fp, 'w') as f:
@@ -215,4 +223,3 @@ class DataConfig(object):
                 }
         with open(fp, 'w') as f:
             json.dump(j, f, indent=2)
-

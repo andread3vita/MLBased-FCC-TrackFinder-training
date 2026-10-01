@@ -8,3 +8,4 @@ Pythia/
 wandb/
 *.pyc
 gun/
+tests/

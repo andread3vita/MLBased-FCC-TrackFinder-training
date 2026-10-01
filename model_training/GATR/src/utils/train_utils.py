@@ -5,6 +5,7 @@ import shutil
 import glob
 import argparse
 import functools
+import random
 import numpy as np
 import math
 import torch
@@ -16,12 +17,50 @@ from src.logger.logger import _logger, _configLogger
 from src.dataset.dataset import SimpleIterDataset
 from src.utils.import_tools import import_module
 from src.layers.batch_operations import graph_batch_func
+from src.utils.data_loading import multiprocessing_loader_options
+from src.utils.data_sharding import shard_file_dict
+
+
+def seed_data_worker(worker_id):
+    """Derive Python/NumPy/PyTorch worker RNGs from the DataLoader generator."""
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    # DataLoader has already seeded PyTorch before invoking worker_init_fn.
+    # Avoid touching the CUDA-aware torch.manual_seed() path in a worker.
+    torch.set_num_threads(1)
+
+
+def get_rank_device(args):
+    """Return the configured GPUs and the CUDA device assigned to this DDP rank."""
+    if not args.gpus:
+        raise ValueError("Please provide at least one GPU with --gpus")
+
+    gpus = [int(i) for i in args.gpus.split(",")]
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if local_rank < 0 or local_rank >= len(gpus):
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} is incompatible with configured GPUs {gpus}"
+        )
+
+    # When CUDA_VISIBLE_DEVICES is set, CUDA exposes the selected physical
+    # devices as logical cuda:0, cuda:1, ... .  Lightning/DDP commonly sets
+    # this before importing the training process, so using the physical GPU
+    # number here can target a nonexistent or unavailable device (for example
+    # cuda:2 when only logical devices 0 and 1 are visible).
+    if os.environ.get("CUDA_VISIBLE_DEVICES", "").strip() not in ("", "-1"):
+        device_index = local_rank
+    else:
+        device_index = gpus[local_rank]
+    return gpus, torch.device(f"cuda:{device_index}")
 
 def set_gpus(args):
     if args.gpus:
-        gpus = [int(i) for i in args.gpus.split(",")]
-        dev = torch.device(gpus[0])
-        print("Using GPUs:", gpus)
+        gpus, dev = get_rank_device(args)
+        print(
+            f"Using GPUs: {gpus}; LOCAL_RANK={os.environ.get('LOCAL_RANK', '0')} "
+            f"uses {dev}"
+        )
     else:
         print("No GPUs flag provided - Setting GPUs to [0]")
         gpus = [0]
@@ -51,8 +90,7 @@ def model_setup(args, data_config):
     network_options = {k: ast.literal_eval(v) for k, v in args.network_option}
 
     if args.gpus:
-        gpus = [int(i) for i in args.gpus.split(",")]  # ?
-        dev = torch.device(gpus[0])
+        gpus, dev = get_rank_device(args)
     else:
         gpus = None
         local_rank = 0
@@ -113,16 +151,12 @@ def to_filelist(args, mode="train"):
         file_dict[name] = sorted(files)
 
     if args.local_rank is not None:
+        gpus_list, _ = set_gpus(args)
+        world_size = int(os.environ.get("WORLD_SIZE", len(gpus_list)))
+        file_dict = shard_file_dict(file_dict, args.local_rank, world_size)
         if mode == "train":
-            gpus_list, _ = set_gpus(args)
-            local_world_size = len(gpus_list)  # int(os.environ['LOCAL_WORLD_SIZE'])
-            new_file_dict = {}
-            for name, files in file_dict.items():
-                new_files = files[args.local_rank :: local_world_size]
-                assert len(new_files) > 0
-                np.random.shuffle(new_files)
-                new_file_dict[name] = new_files
-            file_dict = new_file_dict
+            for files in file_dict.values():
+                np.random.shuffle(files)
 
     if args.copy_inputs:
         import tempfile
@@ -164,6 +198,25 @@ def train_load(args):
     train_file_dict, train_files = to_filelist(args, "train")
     if args.data_val:
         val_file_dict, val_files = to_filelist(args, "val")
+        # Check the complete resolved inputs, not only this rank's shards.  An
+        # overlap could otherwise be hidden when the same file lands on a
+        # different rank in the two lists.
+        train_paths = {
+            os.path.realpath(spec.split(":", 1)[-1])
+            for spec in args.data_train
+        }
+        overlapping_files = sorted(
+            spec.split(":", 1)[-1]
+            for spec in args.data_val
+            if os.path.realpath(spec.split(":", 1)[-1]) in train_paths
+        )
+        if overlapping_files:
+            examples = ", ".join(overlapping_files[:3])
+            raise ValueError(
+                "Explicit training and validation datasets must use different "
+                f"files; found {len(overlapping_files)} overlapping file(s), "
+                f"including: {examples}"
+            )
         train_range = val_range = (0, 1)
     else:
         val_file_dict, val_files = train_file_dict, train_files
@@ -200,6 +253,31 @@ def train_load(args):
         minp = int(syn_str.split("-")[0])
         maxp = int(syn_str.split("-")[1])
 
+    loader_rank = int(args.local_rank) if args.local_rank is not None else 0
+    validation_world_size = int(
+        os.environ.get(
+            "WORLD_SIZE", len([gpu for gpu in args.gpus.split(",") if gpu])
+        )
+    )
+    if loader_rank < 0 or loader_rank >= validation_world_size:
+        raise RuntimeError(
+            f"Validation rank {loader_rank} is incompatible with "
+            f"{validation_world_size} configured GPU(s)"
+        )
+    _logger.info(
+        "Validation file shard: rank %d of %d; shuffle=False",
+        loader_rank,
+        validation_world_size,
+    )
+    train_loader_seed = int(args.seed) + loader_rank
+    val_loader_seed = int(args.seed) + 10_000 + loader_rank
+    train_num_workers = min(
+        args.num_workers, int(len(train_files) * args.file_fraction)
+    )
+    val_num_workers = min(
+        args.num_workers, int(len(val_files) * args.file_fraction)
+    )
+
     train_data = SimpleIterDataset(
         train_file_dict,
         args.data_config,
@@ -210,17 +288,24 @@ def train_load(args):
         file_fraction=args.file_fraction,
         fetch_by_files=args.fetch_by_files,
         fetch_step=args.fetch_step,
+        # DataLoader multiprocessing already performs look-ahead.  Starting a
+        # second native-I/O thread in every forked worker increases memory use
+        # and has caused hard (unreportable) Parquet/DGL worker exits.  With no
+        # subprocesses, retain the dataset's lightweight file look-ahead.
+        async_load=train_num_workers == 0,
         infinity_mode=args.steps_per_epoch is not None,
         in_memory=args.in_memory,
         laplace=args.laplace,
         diffs=args.diffs,
         edges=args.class_edges,
         name="train" + ("" if args.local_rank is None else "_rank%d" % args.local_rank),
+        seed=train_loader_seed,
         dataset_cap=args.train_cap,
         n_noise=args.n_noise,
         synthetic=synthetic,
         synthetic_npart_min=minp,
         synthetic_npart_max=maxp,
+        layers_per_superlayer=args.layers_per_superlayer,
     )
     val_data = SimpleIterDataset(
         val_file_dict,
@@ -231,17 +316,33 @@ def train_load(args):
         file_fraction=args.file_fraction,
         fetch_by_files=args.fetch_by_files,
         fetch_step=args.fetch_step,
+        async_load=val_num_workers == 0,
         infinity_mode=args.steps_per_epoch_val is not None,
         in_memory=args.in_memory,
         laplace=args.laplace,
         diffs=args.diffs,
         edges=args.class_edges,
         name="val" + ("" if args.local_rank is None else "_rank%d" % args.local_rank),
+        seed=val_loader_seed,
         dataset_cap=args.val_cap,
         n_noise=args.n_noise,
         synthetic=synthetic,
         synthetic_npart_min=minp,
         synthetic_npart_max=maxp,
+        layers_per_superlayer=args.layers_per_superlayer,
+        # Validation keeps the training-time feature/selection configuration,
+        # but iteration itself must be deterministic and never resampled.
+        shuffle=False,
+        reweight=False,
+        # Validation files have already been divided between ranks.  Sharding
+        # their events again would discard data and duplicate Parquet I/O.
+        event_shard_rank=0,
+        event_num_shards=1,
+        # ``infinity_mode`` normally retains one iterator and continues where
+        # the preceding epoch stopped.  Restart validation instead: with its
+        # sorted file list and shuffle=False, cache entry zero is then always
+        # the same event while its model prediction is recomputed each epoch.
+        restart_on_iter=True,
     )
 
     if args.class_edges:
@@ -254,24 +355,47 @@ def train_load(args):
     #    train_data_arg = [next(iter(train_data_arg))]
     # if args.val_cap == 1:
     #    val_data_arg = [next(iter(val_data_arg))]
+    # Finite workers are restarted at epoch boundaries so native Parquet/DGL
+    # allocator high-water marks cannot accumulate over a multi-day run.
+    train_worker_options = multiprocessing_loader_options(
+        train_num_workers,
+        args.prefetch_factor,
+        # Spawn imports the Python/DGL stack in every worker. Keep workers alive
+        # so that cost is paid once rather than at every epoch boundary.
+        persistent_workers=True,
+    )
+    val_worker_options = multiprocessing_loader_options(
+        val_num_workers,
+        args.prefetch_factor,
+        persistent_workers=True,
+    )
+
+    train_generator = torch.Generator()
+    train_generator.manual_seed(train_loader_seed)
+    val_generator = torch.Generator()
+    val_generator.manual_seed(val_loader_seed)
+
     train_loader = DataLoader(
         train_data,
         batch_size=args.batch_size,
         drop_last=True,
         pin_memory=True,
-        num_workers=min(args.num_workers, int(len(train_files) * args.file_fraction)),
+        num_workers=train_num_workers,
         collate_fn=collator_func,
-        persistent_workers=args.num_workers > 0 and args.steps_per_epoch is not None,
+        worker_init_fn=seed_data_worker,
+        generator=train_generator,
+        **train_worker_options,
     )
     val_loader = DataLoader(
         val_data,
         batch_size=args.batch_size,
-        drop_last=True,
+        drop_last=False,
         pin_memory=True,
         collate_fn=collator_func,
-        num_workers=min(args.num_workers, int(len(val_files) * args.file_fraction)),
-        persistent_workers=args.num_workers > 0
-        and args.steps_per_epoch_val is not None,
+        num_workers=val_num_workers,
+        worker_init_fn=seed_data_worker,
+        generator=val_generator,
+        **val_worker_options,
     )
 
     data_config = train_data.config
@@ -334,7 +458,11 @@ def test_load(args):
             fetch_by_files=True,
             fetch_step=1,
             name="test_" + name,
+            seed=int(args.seed),
+            layers_per_superlayer=args.layers_per_superlayer,
         )
+        test_generator = torch.Generator()
+        test_generator.manual_seed(int(args.seed))
         test_loader = DataLoader(
             test_data,
             num_workers=num_workers,
@@ -342,13 +470,25 @@ def test_load(args):
             drop_last=False,
             pin_memory=True,
             collate_fn=graph_batch_func,
+            worker_init_fn=seed_data_worker,
+            generator=test_generator,
+            **multiprocessing_loader_options(
+                num_workers,
+                args.prefetch_factor,
+                persistent_workers=False,
+            ),
         )
         return test_loader
 
     test_loaders = {
         name: functools.partial(get_test_loader, name) for name in file_dict
     }
-    data_config = SimpleIterDataset({}, args.data_config, for_training=False).config
+    data_config = SimpleIterDataset(
+        {},
+        args.data_config,
+        for_training=False,
+        layers_per_superlayer=args.layers_per_superlayer,
+    ).config
     return test_loaders, data_config
 
 
@@ -756,8 +896,7 @@ def model_setup1(args, data_config):
     network_options = {k: ast.literal_eval(v) for k, v in args.network_option}
     network_options.update(data_config.custom_model_kwargs)
     if args.gpus:
-        gpus = [int(i) for i in args.gpus.split(",")]  # ?
-        dev = torch.device(gpus[0])
+        gpus, dev = get_rank_device(args)
     else:
         gpus = None
         local_rank = 0

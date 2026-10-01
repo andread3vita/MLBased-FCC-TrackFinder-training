@@ -1,5 +1,15 @@
 import wandb
 
+
+def _monotonic_wandb_step(step):
+    """Keep legacy metric logging from moving W&B's step backwards."""
+    try:
+        current_step = int(getattr(wandb.run, "step", 0) or 0)
+    except (TypeError, ValueError):
+        current_step = 0
+    return max(int(step), current_step)
+
+
 def log_losses_wandb_tracking(
     logwandb, num_batches, local_rank, losses, loss, val=False
 ):
@@ -18,7 +28,7 @@ def log_losses_wandb_tracking(
                 "loss" + val_ + " attractive": losses[2].item(),
                 "loss" + val_ + " repulsive": losses[3].item(),
             },
-            step=num_batches,
+            step=_monotonic_wandb_step(num_batches),
         )
 
 

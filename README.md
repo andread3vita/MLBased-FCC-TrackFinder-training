@@ -46,40 +46,8 @@ pip install plotly
 
 To train the model, go inside `model_training/GATR` and use the script [`src/train_lightning.py`](model_training/src/train_lightning.py). This script supports extensive configuration through command-line arguments, which are defined in [`src/utils/parser_args.py`](model_training/src/utils/parser_args.py).
 
-### 📌 Example Command
-
-```bash
-torchrun --nproc_per_node=4 -m src.train_lightning \
-  --data-train Zcard_graphs_{1..100}.root \
-  --data-config ../config_files/config_tracking.yaml \
-  -clust -clust_dim 3 \
-  --network-config src/models/wrapper/model_tracking_gatr.py \
-  --model-prefix training_results/ \
-  --num-workers 0 \
-  --gpus 0,1,2,3 \
-  --batch-size 4 \
-  --start-lr 1e-3 \
-  --num-epochs 100 \
-  --optimizer ranger \
-  --fetch-step 0.04 \
-  --condensation \
-  --log-wandb \
-  --wandb-displayname GATr_example \
-  --wandb-projectname <yourProject> \
-  --wandb-entity <yourEntity> \
-  --frac_cluster_loss 0 \
-  --qmin 3 \
-  --use-average-cc-pos 0.99
-```
-
-### ✅ Recommended Configuration
-
-- `--data-config`: `config_files/config_tracking_global_vector.yaml`  
-- `--network-config`: `src/models/wrapper/example_model_tracking_gatr_v_plot.py`
-
-These provide a reliable starting point for training the GATr model effectively.
 
 # How to convert the model into ONNX
 
 To run inference in C++, the `.ckpt` file may need to be converted into an `.onnx` file.  
-This can be done inside the folder `conversion_to_onnx/`.
+This can be done inside the folder `conversionModel/`.

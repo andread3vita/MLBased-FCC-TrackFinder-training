@@ -83,18 +83,40 @@ Training checkpoints every 200 steps. Auto-resumes on SLURM requeue with
 | `WARMUP_EPOCHS` | 2 | LR warmup duration |
 | `START_LR` | 3e-4 | Peak learning rate |
 
-## Evaluation
+## Evaluation & Downstream Integration
 
+### 1. Built-in End-to-End Pipeline
 ```bash
-N_GPUS=4 bash run_eval.sh checkpoints/cgatr_fcc_prod/last.ckpt
+N_GPUS=4 DATA_DIR=/path/to/eval-keepall bash run_eval.sh checkpoints/circe_production/cgatr_best.ckpt
 ```
+The eval pipeline runs in 4 stages:
+1. Sharded GPU forward pass (one shard per GPU) producing `forward_hits.parquet`
+2. Merge shards and link MC truth via `build_mc_signal.py`
+3. Greedy clustering + truth matching (standard benchmark + Hungarian 1-to-1) via `fcc_cache_parallel.py`
+4. Publication plotting via `plot_fcc_metrics.py`
 
-The eval pipeline runs in 5 stages:
-1. Sharded GPU forward pass (one shard per GPU)
-2. Merge shards, build `mc_signal.parquet`
-3. Greedy clustering + truth matching
-4. Plot unmerged metrics
-5. Oracle-merge at T=0.50/0.65/0.75 + plot
+### 2. Interfacing CIRCE with Custom Evaluation Notebooks
+CIRCE uses a **4-dimensional Euclidean condensation space** (`embed_dim = 4`), which provides the necessary degrees of freedom in conformal space to untangle dense jet cores:
+- **Output Tensor Layout**: The model output has 5 columns: `[coord_0, coord_1, coord_2, coord_3, beta_logit]`.
+- **Slicing**:
+  ```python
+  # Coordinates in R^4 Euclidean space
+  coords = output[:, :4]
+  # Condensation score in [0, 1]
+  beta = torch.sigmoid(output[:, 4])
+  ```
+  Or via the built-in helper:
+  ```python
+  coords, beta_logits = model.split_output(output)
+  beta = torch.sigmoid(beta_logits)
+  ```
+- **Clustering Distance Metric**: Euclidean distance in $\mathbb{R}^4$ is mathematically identical to $\mathbb{R}^3$:
+  $$d(x_i, x_j) = \sqrt{\sum_{k=1}^4 (x_{i,k} - x_{j,k})^2}$$
+  Both `torch.norm(X[unassigned] - X[seed], dim=-1)` and `scipy`/`numpy` handle 4D natively.
+- **Andrea's `inference_oc_tracks.py` compatibility**:
+  When calling `evaluate_efficiency_tracks(..., embedding_dim=4)` pass `embedding_dim=4` (to override the legacy default of 3).
+- **Andrea's `evaluate_tracking_efficiency_pt.py` compatibility**:
+  The script automatically queries `model.embedding_dim`, which returns `4` on CIRCE models.
 
 ## Results
 

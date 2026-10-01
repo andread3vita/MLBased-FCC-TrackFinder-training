@@ -368,6 +368,22 @@ class CGATrParquetModel(nn.Module):
             )
             self.beta = nn.Linear(self.num_blades, 1)
 
+    @property
+    def embedding_dim(self) -> int:
+        """Alias for downstream evaluation scripts expecting `model.embedding_dim`."""
+        return self.embed_dim
+
+    def split_output(self, output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split model output into condensation coordinates and beta logits.
+
+        Returns:
+            coords: Tensor of shape (N, embed_dim) in Euclidean condensation space.
+            beta_logits: Tensor of shape (N,) raw condensation logits.
+        """
+        coords = output[:, :self.embed_dim]
+        beta_logits = output[:, self.embed_dim]
+        return coords, beta_logits
+
     def forward(self, features, seq_lens):
         mv, scalars = self.embed(features)
         out_mv, out_scalars = self._backbone_outputs(mv, scalars, seq_lens)

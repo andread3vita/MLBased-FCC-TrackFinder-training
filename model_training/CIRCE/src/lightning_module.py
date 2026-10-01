@@ -126,6 +126,15 @@ class CGATrV35LightningModule(L.LightningModule):
         self._train_loss_n: int = 0
         self._train_loss_sum_t: Optional[torch.Tensor] = None
 
+    @property
+    def embedding_dim(self) -> int:
+        """Alias for downstream evaluation scripts expecting `model.embedding_dim`."""
+        return self.args.embed_dim
+
+    def split_output(self, output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split model output into condensation coordinates and beta logits."""
+        return self.model.split_output(output)
+
     def forward(self, features, seq_lens):
         return self.model(features, seq_lens)
 

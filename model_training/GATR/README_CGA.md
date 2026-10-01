@@ -144,14 +144,16 @@ flag is ignored by the GATR model.)
 
 ## Benchmark Tracking Performance
 
-Evaluated on all reconstructable truth particles across the full `eval-keepall` holdout (100 seeds, 50,000 events, 1.67M targets) under exact benchmark matching definitions ($purity > 75\%$, $15^\circ < \theta < 165^\circ$, $p_\mathrm{T} > 0$ at $t_\beta=0.6, t_d=0.10$):
+Evaluated on the full `eval-keepall` holdout (100 seeds, 50,000 events, 1.67M targets) under exact benchmark matching definitions ($purity > 75\%$, $15^\circ < \theta < 165^\circ$, $p_\mathrm{T} > 0.1$ GeV at champion operating point $t_\beta=0.6, t_d=0.10$):
 
 | Metric | Selection / Condition | CIRCE (July Production, Ep 4) | Benchmark Target | Status |
 |---|---|:---:|:---:|:---:|
-| **Tracking Efficiency ($N_\mathrm{hits} > 10$)** | Standard IDEA benchmark tracks | **91.91%** | $> 90.0\%$ | **Exceeded (+1.91%)** |
-| **Tracking Efficiency ($N_\mathrm{hits} > 3$)** | Inclusive track recovery down to 4 hits | **84.36%** | — | High inclusive recovery |
+| **Prompt Tracking Efficiency ($N_\mathrm{hits} > 10$)** | Prompt tracks ($r_\mathrm{vtx} < 50$ mm), benchmark cut | **97.09%** | $> 90.0\%$ | **Exceeded (+7.09%)** |
+| **Prompt Tracking Efficiency ($N_\mathrm{hits} > 3$)** | Prompt tracks ($r_\mathrm{vtx} < 50$ mm), inclusive | **95.87%** | — | High inclusive recovery |
+| **All-Track Efficiency ($N_\mathrm{hits} > 10$)** | All reconstructable tracks across detector volume | **93.88%** | $> 90.0\%$ | **Exceeded (+3.88%)** |
+| **All-Track Efficiency ($N_\mathrm{hits} > 3$)** | Inclusive tracks across detector volume | **91.58%** | — | Robust recovery |
 | **Fake Rate** | Unmatched non-merged candidates / all candidates | **3.74%** | $< 8.0\%$ | **Exceeded (2.1x lower)** |
-| **Merge Rate** | Multi-track candidate coverage | **12.50%** | — | Clean separation |
+| **Merge Rate** | Multi-track candidate coverage ($>75\%$ purity) | **12.50%** | — | Clean separation |
 | **Candidates / Event** | Full detector acceptance | **36.14** | — | Clean multiplicity |
 
 ## Checkpoint

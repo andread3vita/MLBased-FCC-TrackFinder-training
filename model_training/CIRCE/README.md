@@ -61,13 +61,13 @@ $$
 
 ### 2. Side-by-Side Comparison
 
-| Component | Upstream GGTF | CIRCE Champion | Physical Role & Why CIRCE is Superior |
-| :--- | :---: | :---: | :--- |
-| **Repulsive Potential $V_\text{rep}(d_{ik})$** | $\exp\left(-\frac{d_{ik}^2}{2}\right)$<br>*(Infinite-range Gaussian)* | $\max(0, 1 - d_{ik})$<br>*(Compact-support linear hinge)* | **Sharp Cluster Boundary**: Gaussian tails create diffuse clusters. Compact hinge drops strictly to zero at $d \ge 1.0$, enabling crisp separation at $t_d = 0.10$. |
-| **Charge Floor $q_\text{min}$** | $0.1$ | **$3.0$** | **Curler & Low-$p_\mathrm{T}$ Recovery**: When initial $\beta$ is small, $q_\text{min}=0.1$ produces negligible attraction ($0.1^2 = 0.01$). $q_\text{min}=3.0$ guarantees an attractive well ($3.0^2 = 9.0$) to gather curling tracks early. |
-| **$\beta$-Suppression Weight $w_\text{suppress}$** | $0.0$ *(disabled)* | **$0.1$** | **Eliminating Split Helices**: Mandatory when paired with compact hinge repulsion. Prevents multiple condensation seeds along long (50–150 hit) drift tracks. |
-| **Variance Regularizer $w_\text{var}$** | $0.0$ *(disabled)* | **$0.3$** *(1-epoch warmup)* | **Ultra-Compact Latent Spread**: Explicitly pulls hits to the track centroid $\boldsymbol{\mu}_k$, bounding latent track spread ($p_{50} = 0.060$). |
-| **Loss Weights $(w_\text{att}, w_\text{rep})$** | $(1.0, 1.0)$ | **$(1.0, 2.0)$** | **Dense Jet Separation**: Double repulsion force prioritizes untangling collimated tracks in dense jet cores. |
+| Component | Upstream GGTF | CIRCE Champion |
+| :--- | :---: | :---: |
+| **Repulsive Potential $V_\mathrm{rep}(d_{ik})$** | $\exp\left(-\frac{d_{ik}^2}{2}\right)$ *(Gaussian)* | $\max(0, 1 - d_{ik})$ *(Compact hinge)* |
+| **Charge Floor $q_\mathrm{min}$** | $0.1$ | **$3.0$** |
+| **$\beta$-Suppression Weight $w_\mathrm{suppress}$** | $0.0$ *(disabled)* | **$0.1$** |
+| **Variance Regularizer $w_\mathrm{var}$** | $0.0$ *(disabled)* | **$0.3$** *(1-epoch warmup)* |
+| **Loss Weights $(w_\mathrm{att}, w_\mathrm{rep})$** | $(1.0, 1.0)$ | **$(1.0, 2.0)$** |
 
 ### 3. Key Physical Insight: Coupling of Repulsion Geometry & $\beta$-Suppression
 A central finding from our 100-seed matched ablation (Pilot E) explains why GGTF could run without $\beta$-suppression while CIRCE benefits from $w_\text{suppress} = 0.1$:

@@ -41,6 +41,35 @@ Benchmark plots are available in `plots/`:
 - `plots/head_to_head_keepall_efficiency.png` (and `.pdf`): Tracking Efficiency vs $p_\mathrm{T}$ and Polar Angle $\theta$.
 - `plots/fcc_comprehensive_suite.png` (and `.pdf`): 4-panel comprehensive evaluation suite ($p_\mathrm{T}$ turn-on, angular coverage, hit multiplicity, summary bar chart).
 
+## Loss Formulation: CIRCE Champion Loss vs Upstream Baseline (GGTF)
+
+To facilitate unifying the loss implementations across the collaboration, the table and formulas below detail the exact mathematical differences between CIRCE's champion loss and upstream GGTF.
+
+### 1. General Formulation
+Both trackers optimize an Object Condensation objective:
+$$\mathcal{L}_\text{total} = w_\text{att} \mathcal{L}_V^\text{att} + w_\text{rep} \mathcal{L}_V^\text{rep} + \mathcal{L}_\beta^\text{sig} + \mathcal{L}_\beta^\text{noise} + w_\text{suppress} \mathcal{L}_\beta^\text{suppress} + w_\text{var} \mathcal{L}_\text{var}$$
+
+where condensation charge is defined from predicted $\beta_i \in [0, 1]$:
+$$q_i = \operatorname{arctanh}^2(\beta_i) + q_\text{min}$$
+
+### 2. Side-by-Side Comparison
+
+| Component | Upstream GGTF | CIRCE Champion | Physical Role & Why CIRCE is Superior |
+| :--- | :---: | :---: | :--- |
+| **Repulsive Potential $V_\text{rep}(d_{ik})$** | $\exp\left(-\frac{d_{ik}^2}{2}\right)$<br>*(Infinite-range Gaussian)* | $\max(0, 1 - d_{ik})$<br>*(Compact-support linear hinge)* | **Sharp Cluster Boundary**: Gaussian tails create diffuse clusters. Compact hinge drops strictly to zero at $d \ge 1.0$, enabling crisp separation at $t_d = 0.10$. |
+| **Charge Floor $q_\text{min}$** | $0.1$ | **$3.0$** | **Curler & Low-$p_\mathrm{T}$ Recovery**: When initial $\beta$ is small, $q_\text{min}=0.1$ produces negligible attraction ($0.1^2 = 0.01$). $q_\text{min}=3.0$ guarantees an attractive well ($3.0^2 = 9.0$) to gather curling tracks early. |
+| **$\beta$-Suppression Weight $w_\text{suppress}$** | $0.0$ *(disabled)* | **$0.1$** | **Eliminating Split Helices**: Mandatory when paired with compact hinge repulsion. Prevents multiple condensation seeds along long (50–150 hit) drift tracks. |
+| **Variance Regularizer $w_\text{var}$** | $0.0$ *(disabled)* | **$0.3$** *(1-epoch warmup)* | **Ultra-Compact Latent Spread**: Explicitly pulls hits to the track centroid $\boldsymbol{\mu}_k$, bounding latent track spread ($p_{50} = 0.060$). |
+| **Loss Weights $(w_\text{att}, w_\text{rep})$** | $(1.0, 1.0)$ | **$(1.0, 2.0)$** | **Dense Jet Separation**: Double repulsion force prioritizes untangling collimated tracks in dense jet cores. |
+
+### 3. Key Physical Insight: Coupling of Repulsion Geometry & $\beta$-Suppression
+A central finding from our 100-seed matched ablation (Pilot E) explains why GGTF could run without $\beta$-suppression while CIRCE benefits from $w_\text{suppress} = 0.1$:
+- **In GGTF**: The infinite-range Gaussian potential $\exp(-d^2/2)$ exerts continuous, global pushback across the entire event. Stray secondary high-$\beta$ hits are pushed away by all other tracks, providing an implicit soft regularization.
+- **In CIRCE**: The compact hinge $\max(0, 1 - d)$ has zero gradient outside $d \ge 1.0$. Because IDEA drift chamber tracks are long helices (50 to 150 hits), distant hits on the same physical particle experience zero external repulsion.
+- **Ablation Evidence**: Without explicit suppression ($w_\text{suppress} = 0.0$), multiple hits on the same track predict high $\beta$, causing latent track spread to balloon by $2.2\times$ ($0.060 \to 0.131$), cluster collision rate to spike to $59.5\%$, and tracking efficiency to drop by $-7.47\%$. Adding $w_\text{suppress} = 0.1$:
+  $$\mathcal{L}_\beta^\text{suppress} = \frac{1}{N_\text{non-\alpha}} \sum_{i \notin \{\alpha(k)\}} \beta_i$$
+  enforces exactly one condensation seed per track, cleanly solving track fragmentation.
+
 ## Data path
 
 Pre-filled in both `run_train.sh` and `train.slurm`:

@@ -75,13 +75,7 @@ $$
 A central finding from our 100-seed matched ablation (Pilot E) explains why GGTF could run without $\beta$-suppression while CIRCE benefits from $w_\text{suppress} = 0.1$:
 - **In GGTF**: The infinite-range Gaussian potential $\exp(-d^2/2)$ exerts continuous, global pushback across the entire event. Stray secondary high-$\beta$ hits are pushed away by all other tracks, providing an implicit soft regularization.
 - **In CIRCE**: The compact hinge $\max(0, 1 - d)$ has zero gradient outside $d \ge 1.0$. Because IDEA drift chamber tracks are long helices (50 to 150 hits), distant hits on the same physical particle experience zero external repulsion.
-- **Ablation Evidence**: Without explicit suppression ($w_{\text{suppress}} = 0.0$), multiple hits on the same track predict high $\beta$, causing latent track spread to balloon by $2.2\times$ ($0.060 \to 0.131$), cluster collision rate to spike to $59.5\%$, and tracking efficiency to drop by $-7.47\%$. Adding $w_{\text{suppress}} = 0.1$:
-
-$$
-\mathcal{L}_\beta^{\text{suppress}} = \frac{1}{N_{\text{non-}\alpha}} \sum_{i \notin \{\alpha(k)\}} \beta_i
-$$
-
-enforces exactly one condensation seed per track, cleanly solving track fragmentation.
+- **Ablation Evidence**: Without explicit suppression ($w_{\mathrm{suppress}} = 0.0$), multiple hits on the same track predict high $\beta$, causing latent track spread to balloon by $2.2\times$ ($0.060 \to 0.131$), cluster collision rate to spike to $59.5\%$, and tracking efficiency to drop by $-7.47\%$. Adding $w_{\mathrm{suppress}} = 0.1$ with $\mathcal{L}_\beta^{\mathrm{suppress}} = \frac{1}{N_{\mathrm{non}\text{-}\alpha}} \sum_{i \notin \{\alpha(k)\}} \beta_i$ enforces exactly one condensation seed per track, cleanly solving track fragmentation.
 
 ## Data path
 

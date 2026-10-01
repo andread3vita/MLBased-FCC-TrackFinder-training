@@ -46,11 +46,18 @@ Benchmark plots are available in `plots/`:
 To facilitate unifying the loss implementations across the collaboration, the table and formulas below detail the exact mathematical differences between CIRCE's champion loss and upstream GGTF.
 
 ### 1. General Formulation
-Both trackers optimize an Object Condensation objective:
-$$\mathcal{L}_\text{total} = w_\text{att} \mathcal{L}_V^\text{att} + w_\text{rep} \mathcal{L}_V^\text{rep} + \mathcal{L}_\beta^\text{sig} + \mathcal{L}_\beta^\text{noise} + w_\text{suppress} \mathcal{L}_\beta^\text{suppress} + w_\text{var} \mathcal{L}_\text{var}$$
+
+Both models optimize an Object Condensation objective:
+
+$$
+\mathcal{L}_{\text{total}} = w_{\text{att}} \mathcal{L}_V^{\text{att}} + w_{\text{rep}} \mathcal{L}_V^{\text{rep}} + \mathcal{L}_\beta^{\text{sig}} + \mathcal{L}_\beta^{\text{noise}} + w_{\text{suppress}} \mathcal{L}_\beta^{\text{suppress}} + w_{\text{var}} \mathcal{L}_{\text{var}}
+$$
 
 where condensation charge is defined from predicted $\beta_i \in [0, 1]$:
-$$q_i = \operatorname{arctanh}^2(\beta_i) + q_\text{min}$$
+
+$$
+q_i = \operatorname{arctanh}^2(\beta_i) + q_{\text{min}}
+$$
 
 ### 2. Side-by-Side Comparison
 
@@ -66,9 +73,13 @@ $$q_i = \operatorname{arctanh}^2(\beta_i) + q_\text{min}$$
 A central finding from our 100-seed matched ablation (Pilot E) explains why GGTF could run without $\beta$-suppression while CIRCE benefits from $w_\text{suppress} = 0.1$:
 - **In GGTF**: The infinite-range Gaussian potential $\exp(-d^2/2)$ exerts continuous, global pushback across the entire event. Stray secondary high-$\beta$ hits are pushed away by all other tracks, providing an implicit soft regularization.
 - **In CIRCE**: The compact hinge $\max(0, 1 - d)$ has zero gradient outside $d \ge 1.0$. Because IDEA drift chamber tracks are long helices (50 to 150 hits), distant hits on the same physical particle experience zero external repulsion.
-- **Ablation Evidence**: Without explicit suppression ($w_\text{suppress} = 0.0$), multiple hits on the same track predict high $\beta$, causing latent track spread to balloon by $2.2\times$ ($0.060 \to 0.131$), cluster collision rate to spike to $59.5\%$, and tracking efficiency to drop by $-7.47\%$. Adding $w_\text{suppress} = 0.1$:
-  $$\mathcal{L}_\beta^\text{suppress} = \frac{1}{N_\text{non-\alpha}} \sum_{i \notin \{\alpha(k)\}} \beta_i$$
-  enforces exactly one condensation seed per track, cleanly solving track fragmentation.
+- **Ablation Evidence**: Without explicit suppression ($w_{\text{suppress}} = 0.0$), multiple hits on the same track predict high $\beta$, causing latent track spread to balloon by $2.2\times$ ($0.060 \to 0.131$), cluster collision rate to spike to $59.5\%$, and tracking efficiency to drop by $-7.47\%$. Adding $w_{\text{suppress}} = 0.1$:
+
+$$
+\mathcal{L}_\beta^{\text{suppress}} = \frac{1}{N_{\text{non-}\alpha}} \sum_{i \notin \{\alpha(k)\}} \beta_i
+$$
+
+enforces exactly one condensation seed per track, cleanly solving track fragmentation.
 
 ## Data path
 

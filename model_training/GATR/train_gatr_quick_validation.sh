@@ -1,9 +1,12 @@
 #!/bin/bash
 
+# Standalone geometry-only launcher for producing one validation checkpoint
+# quickly from a reduced dataset.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-USE_DETECTOR_FEATURES=1
+USE_DETECTOR_FEATURES=0
 DEFAULT_LAYERS_PER_SUPERLAYER=(8 8 8 8 8 8 8 8 8 8 8 8 8 8)
 if [[ -n "${LAYERS_PER_SUPERLAYER_CSV:-}" ]]; then
     IFS=',' read -r -a LAYERS_PER_SUPERLAYER <<< "$LAYERS_PER_SUPERLAYER_CSV"
@@ -45,27 +48,34 @@ export PYTHONPATH="${GATR_V142_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 if [ "$#" -lt 1 ]; then
     echo "Usage: $0 <output_dir> [wandb_project] [wandb_entity] [gpu_ids]"
-    echo "Example: $0 results/run1 my_project ml4hep 0,1,2,3"
-    echo "Set TRAIN_GPUS to choose the GPU list when gpu_ids is omitted."
-    echo "Set DATA_TRAIN and optionally DATA_VAL to choose the Parquet input files."
-    echo "Set GRADIENT_CLIP_VAL to the global L2 gradient clipping threshold (default: 1.0; 0 disables clipping)."
-    echo "Detector scalar feature mode: $USE_DETECTOR_FEATURES."
-    echo "Set LAYERS_PER_SUPERLAYER_CSV to 14 comma-separated positive integers (default: fourteen 8s)."
-    echo "Override NUM_EPOCHS, STEPS_PER_EPOCH, or the loss/sweep variables through the environment."
-    echo "Set REJECTED_SEED_POLICY to discard, keep, or attach-after-accept (default: attach-after-accept)."
-    echo "This launcher keeps pT-binned truth-track weighting off and defaults to LR/variance warmup for stability."
-    echo "Its defaults use the September fixedDataset with attach-after-accept clustering."
+    echo "Example: $0 results/quick_validation my_project ml4hep 0"
+    echo "This standalone launcher runs one 1000-step epoch without LR or variance warmup."
+    echo "It uses four training files and four validation files by default."
+    echo "Override data with QUICK_DATA_TRAIN and QUICK_DATA_VAL."
+    echo "Set GRADIENT_CLIP_VAL to the global L2 gradient clipping threshold (default: 5.0; 0 disables clipping)."
     exit 1
 fi
 
 OUTPUT_DIR="$1"
 WANDB_PROJECT="${2:-IDEA_v3_o1_tracking_andrea}"
 WANDB_ENTITY="${3:-ml4hep}"
-GPU_IDS="${4:-${TRAIN_GPUS:-0,1,2,3}}"
+GPU_IDS="${4:-${TRAIN_GPUS:-0}}"
 
-DEFAULT_DATA_TRAIN='/eos/experiment/fcc/ee/simulation/key4hep_2026_09_10/91GeV/IDEA_o1_v4/fixedDataset/Zuds/graph/Graphs_*_train.parquet'
-DATA_TRAIN="${DATA_TRAIN:-$DEFAULT_DATA_TRAIN}"
-DATA_VAL="${DATA_VAL-/eos/experiment/fcc/ee/simulation/key4hep_2026_09_10/91GeV/IDEA_o1_v4/fixedDataset/Zuds_validation/graph/Graphs_*_test.parquet}"
+DATASET_ROOT='/eos/experiment/fcc/ee/simulation/key4hep_2026_09_10/91GeV/IDEA_o1_v4/fixedDataset'
+DEFAULT_DATA_TRAIN="${DATASET_ROOT}/Zuds/graph/Graphs_[1-4]_train.parquet"
+DEFAULT_DATA_VAL="${DATASET_ROOT}/Zuds_validation/graph/Graphs_100[1-4]_test.parquet"
+DATA_TRAIN="${QUICK_DATA_TRAIN:-$DEFAULT_DATA_TRAIN}"
+DATA_VAL="${QUICK_DATA_VAL:-$DEFAULT_DATA_VAL}"
+
+for INPUT_NAME in DATA_TRAIN DATA_VAL; do
+    INPUT_PATTERN="${!INPUT_NAME}"
+    if ! compgen -G "$INPUT_PATTERN" >/dev/null; then
+        echo "Quick-run $INPUT_NAME did not match any files: $INPUT_PATTERN" >&2
+        echo "Override it with QUICK_$INPUT_NAME." >&2
+        exit 2
+    fi
+done
+
 EMBED_DIM="${EMBED_DIM:-5}"
 GATR_BLOCKS="${GATR_BLOCKS:-10}"
 HIDDEN_MV_CHANNELS="${HIDDEN_MV_CHANNELS:-16}"
@@ -75,20 +85,22 @@ PREFETCH_FACTOR="${PREFETCH_FACTOR:-1}"
 FETCH_FILES="${FETCH_FILES:-2}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-1}"
-CHECKPOINT_EVERY_N_STEPS="${CHECKPOINT_EVERY_N_STEPS:-12000}"
-NUM_EPOCHS="${NUM_EPOCHS:-20}"
-STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-30000}"
-LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-125}"
-VALIDATE_BEFORE_TRAINING="${VALIDATE_BEFORE_TRAINING:-0}"
+# Keep the weights-only checkpoint interval beyond this run. The desired
+# artifact is the full checkpoint written after the validation sweep.
+CHECKPOINT_EVERY_N_STEPS=2000
+NUM_EPOCHS=1
+STEPS_PER_EPOCH=1000
+LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-50}"
+VALIDATE_BEFORE_TRAINING=0
 TRAIN_SEED="${TRAIN_SEED:-42}"
 
 START_LR="${START_LR:-4e-4}"
 GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-5.0}"
-LR_SCHEDULER="${LR_SCHEDULER:-flat+decay}"
+LR_SCHEDULER=none
 PLATEAU_FACTOR="${PLATEAU_FACTOR:-0.5}"
 PLATEAU_PATIENCE="${PLATEAU_PATIENCE:-1}"
 PLATEAU_THRESHOLD="${PLATEAU_THRESHOLD:-1e-3}"
-WARMUP_EPOCHS="${WARMUP_EPOCHS:-2}"
+WARMUP_EPOCHS=0
 MIN_LR="${MIN_LR:-1e-6}"
 EMA_DECAY="${EMA_DECAY:-0.999}"
 ATTENTION_PHI_SECTORS="${ATTENTION_PHI_SECTORS:-1}"
@@ -98,24 +110,20 @@ L_REPULSIVE_WEIGHT="${L_REPULSIVE_WEIGHT:-1.0}"
 BETA_SUPPRESS_WEIGHT="${BETA_SUPPRESS_WEIGHT:-0.1}"
 BETA_SECOND_WEIGHT="${BETA_SECOND_WEIGHT:-0.2}"
 VAR_WEIGHT="${VAR_WEIGHT:-0.2}"
-VAR_WARMUP_EPOCHS="${VAR_WARMUP_EPOCHS:-3}"
+VAR_WARMUP_EPOCHS=0
 HARD_NEGATIVE_WEIGHT="${HARD_NEGATIVE_WEIGHT:-1.0}"
 HARD_NEGATIVE_MAX_WEIGHT="${HARD_NEGATIVE_MAX_WEIGHT:-100}"
-PT_TRACK_WEIGHTING="0"
+PT_TRACK_WEIGHTING=0
 PT_TRACK_WEIGHT_BIN_EDGES="${PT_TRACK_WEIGHT_BIN_EDGES:-0.4,0.9,5.0}"
 PT_TRACK_WEIGHT_BIN_WEIGHTS="${PT_TRACK_WEIGHT_BIN_WEIGHTS:-1.5,1.2,0.75,2.0}"
 HELIX_LOSS_WEIGHT="${HELIX_LOSS_WEIGHT:-0.5}"
 
-SWEEP_MAX_EVENTS="${SWEEP_MAX_EVENTS:-1000}"
+SWEEP_MAX_EVENTS="${SWEEP_MAX_EVENTS:-200}"
 SWEEP_TBETA_GRID="${SWEEP_TBETA_GRID:-0.2,0.35,0.5,0.6,0.7,0.75,0.8,0.85,0.9,0.95}"
 SWEEP_TD_GRID="${SWEEP_TD_GRID:-0.1,0.15,0.2,0.25,0.3,0.4,0.5,0.55,0.6}"
 SWEEP_MIN_HITS_GRID="${SWEEP_MIN_HITS_GRID:-3}"
 REJECTED_SEED_POLICY="${REJECTED_SEED_POLICY:-attach-after-accept}"
 
-if [[ "$VALIDATE_BEFORE_TRAINING" != "0" && "$VALIDATE_BEFORE_TRAINING" != "1" ]]; then
-    echo "Invalid VALIDATE_BEFORE_TRAINING '$VALIDATE_BEFORE_TRAINING'; use 0 or 1." >&2
-    exit 2
-fi
 if [[ "$PT_TRACK_WEIGHTING" != "0" && "$PT_TRACK_WEIGHTING" != "1" ]]; then
     echo "Invalid PT_TRACK_WEIGHTING '$PT_TRACK_WEIGHTING'; use 0 or 1." >&2
     exit 2
@@ -164,44 +172,12 @@ for GPU_ID in "${GPU_ARRAY[@]}"; do
     SEEN_GPU_IDS="${SEEN_GPU_IDS}${GPU_ID},"
 done
 
-expand_data_spec() {
-    local spec="$1"
-    if [[ "$spec" =~ ^(.*)\{([0-9]+)\.\.([0-9]+)\}(.*)$ ]]; then
-        local prefix="${BASH_REMATCH[1]}"
-        local first="${BASH_REMATCH[2]}"
-        local last="${BASH_REMATCH[3]}"
-        local suffix="${BASH_REMATCH[4]}"
-        if (( first > last )); then
-            echo "Invalid descending data range in '$spec'." >&2
-            exit 2
-        fi
-        local index
-        for (( index=first; index<=last; index++ )); do
-            DATA_ARGUMENTS+=("${prefix}${index}${suffix}")
-        done
-    else
-        DATA_ARGUMENTS+=("$spec")
-    fi
-}
-
-DATA_ARGUMENTS=(--data-train)
-expand_data_spec "$DATA_TRAIN"
-if [ -n "$DATA_VAL" ]; then
-    DATA_ARGUMENTS+=(--data-val)
-    expand_data_spec "$DATA_VAL"
-    TRAIN_VAL_SPLIT="1.0"
-else
-    TRAIN_VAL_SPLIT="0.8"
-fi
-
+DATA_ARGUMENTS=(--data-train "$DATA_TRAIN" --data-val "$DATA_VAL")
 TRAINING_OPTIONS=(
     --num-epochs "$NUM_EPOCHS"
-    --train-val-split "$TRAIN_VAL_SPLIT"
+    --train-val-split 1.0
     --steps-per-epoch "$STEPS_PER_EPOCH"
 )
-if [[ "$VALIDATE_BEFORE_TRAINING" == "1" ]]; then
-    TRAINING_OPTIONS+=(--validate-before-training)
-fi
 TRACK_WEIGHTING_OPTIONS=(
     --pt-track-weight-bin-edges "$PT_TRACK_WEIGHT_BIN_EDGES"
     --pt-track-weight-bin-weights "$PT_TRACK_WEIGHT_BIN_WEIGHTS"
@@ -215,16 +191,16 @@ TRAINING_NAME="$(basename "${OUTPUT_DIR%/}")"
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
-echo "Starting unweighted GATr training with LR and embedding-variance warmup"
+echo "Starting quick geometry-only GATr training"
 echo "Output: $OUTPUT_DIR"
 echo "GPU(s): $GPU_IDS; embedding dimension: $EMBED_DIM; GATr blocks: $GATR_BLOCKS"
 echo "Training data: $DATA_TRAIN"
-echo "Validation data: ${DATA_VAL:-internal 80/20 split}"
+echo "Validation data: $DATA_VAL"
 echo "Model input: $MODEL_INPUT_DESCRIPTION"
 echo "Schedule: $LR_SCHEDULER, start_lr=$START_LR, epochs=$NUM_EPOCHS, steps/epoch=$STEPS_PER_EPOCH"
 echo "Global L2 gradient clipping threshold: $GRADIENT_CLIP_VAL (0 disables clipping)"
 echo "Warmup: LR=$WARMUP_EPOCHS epochs; embedding variance=$VAR_WARMUP_EPOCHS epochs"
-echo "Embedding variance loss: var_weight=$VAR_WEIGHT"
+echo "Validation: batches=$LIMIT_VAL_BATCHES, sweep events=$SWEEP_MAX_EVENTS"
 echo "Rejected seed policy: $REJECTED_SEED_POLICY"
 echo "pT track weighting: disabled"
 

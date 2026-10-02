@@ -48,6 +48,7 @@ if [ "$#" -lt 1 ]; then
     echo "Example: $0 results/run1 my_project ml4hep 0,1,2,3"
     echo "Set TRAIN_GPUS to choose the GPU list when gpu_ids is omitted."
     echo "Set DATA_TRAIN and optionally DATA_VAL to choose the Parquet input files."
+    echo "Set GRADIENT_CLIP_VAL to the global L2 gradient clipping threshold (default: 1.0; 0 disables clipping)."
     echo "Detector scalar feature mode: $USE_DETECTOR_FEATURES."
     echo "Set LAYERS_PER_SUPERLAYER_CSV to 14 comma-separated positive integers (default: fourteen 8s)."
     echo "Override NUM_EPOCHS, STEPS_PER_EPOCH, or the loss/sweep variables through the environment."
@@ -82,6 +83,7 @@ VALIDATE_BEFORE_TRAINING="${VALIDATE_BEFORE_TRAINING:-0}"
 TRAIN_SEED="${TRAIN_SEED:-42}"
 
 START_LR="${START_LR:-4e-4}"
+GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-5.0}"
 LR_SCHEDULER="${LR_SCHEDULER:-flat+decay}"
 PLATEAU_FACTOR="${PLATEAU_FACTOR:-0.5}"
 PLATEAU_PATIENCE="${PLATEAU_PATIENCE:-1}"
@@ -220,6 +222,7 @@ echo "Training data: $DATA_TRAIN"
 echo "Validation data: ${DATA_VAL:-internal 80/20 split}"
 echo "Model input: $MODEL_INPUT_DESCRIPTION"
 echo "Schedule: $LR_SCHEDULER, start_lr=$START_LR, epochs=$NUM_EPOCHS, steps/epoch=$STEPS_PER_EPOCH"
+echo "Global L2 gradient clipping threshold: $GRADIENT_CLIP_VAL (0 disables clipping)"
 echo "Warmup: LR=$WARMUP_EPOCHS epochs; embedding variance=$VAR_WARMUP_EPOCHS epochs"
 echo "Embedding variance loss: var_weight=$VAR_WEIGHT"
 echo "Rejected seed policy: $REJECTED_SEED_POLICY"
@@ -246,6 +249,7 @@ python -m src.train_lightning \
     --checkpoint-every-n-train-steps "$CHECKPOINT_EVERY_N_STEPS" \
     --limit-val-batches "$LIMIT_VAL_BATCHES" \
     --start-lr "$START_LR" \
+    --gradient-clip-val "$GRADIENT_CLIP_VAL" \
     "${TRAINING_OPTIONS[@]}" \
     --optimizer adamW \
     --weight-decay 1e-3 \

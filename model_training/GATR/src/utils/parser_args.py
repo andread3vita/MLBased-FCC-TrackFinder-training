@@ -279,6 +279,15 @@ parser.add_argument(
     help="used to resume interrupted training, load model and optimizer state saved in the `epoch-%d_state.pt` and `epoch-%d_optimizer.pt` files",
 )
 parser.add_argument("--start-lr", type=float, default=5e-3, help="start learning rate")
+parser.add_argument(
+    "--gradient-clip-val",
+    type=float,
+    default=1.0,
+    help=(
+        "maximum global L2 gradient norm applied before each optimizer step; "
+        "use 0 to disable gradient clipping"
+    ),
+)
 parser.add_argument("--batch-size", type=int, default=128, help="batch size")
 parser.add_argument(
     "--accumulate-grad-batches",

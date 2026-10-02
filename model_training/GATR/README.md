@@ -27,6 +27,7 @@ python -m src.train_lightning \
     --checkpoint-every-n-train-steps 12000 \
     --limit-val-batches 125 \
     --start-lr 4e-4 \
+    --gradient-clip-val 1.0 \
     --num-epochs 20 \
     --train-val-split 1.0 \
     --steps-per-epoch 30000 \
@@ -66,3 +67,22 @@ python -m src.train_lightning \
     --rejected-seed-policy attach-after-accept \
     --sweep-match-metric double_majority
 ```
+
+## Gradient clipping
+
+Training uses global L2 gradient-norm clipping with a default threshold of
+`1.0`. Set the threshold directly when running `src.train_lightning`:
+
+```bash
+python -m src.train_lightning --gradient-clip-val 5.0 ...
+```
+
+For `train_gatr.sh` and `train_gatr_detectorfeatures.sh`, set the
+`GRADIENT_CLIP_VAL` environment variable:
+
+```bash
+GRADIENT_CLIP_VAL=5.0 ./train_gatr_detectorfeatures.sh "$OUTPUT_DIR"
+```
+
+The value must be finite and non-negative. Set it to `0` to disable gradient
+clipping.

@@ -264,6 +264,8 @@ def main():
         parser.error("--batch-size must be a positive integer")
     if args.accumulate_grad_batches < 1:
         parser.error("--accumulate-grad-batches must be a positive integer")
+    if not math.isfinite(args.gradient_clip_val) or args.gradient_clip_val < 0.0:
+        parser.error("--gradient-clip-val must be a finite non-negative number")
     if args.checkpoint_every_n_train_steps < 1:
         parser.error("--checkpoint-every-n-train-steps must be a positive integer")
     if args.num_workers < 0:
@@ -414,7 +416,7 @@ def main():
             # Pre-training validation is explicitly opt-in below.
             num_sanity_val_steps=0,
             precision="bf16-mixed",
-            gradient_clip_val=1.0,
+            gradient_clip_val=args.gradient_clip_val,
         )
 
         args.local_rank = trainer.global_rank

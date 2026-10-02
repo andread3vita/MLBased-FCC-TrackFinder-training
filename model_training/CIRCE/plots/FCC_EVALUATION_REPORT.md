@@ -1,5 +1,4 @@
-# CIRCE Performance on IDEA Drift Chamber KeepAll: Raw Unmerged vs. Fragment Merged
-50 000 events, 100 seeds, tb = 0.60, td = 0.10
+# CIRCE Performance on IDEA Drift Chamber KeepAll 50 000 events, 100 seeds, tb = 0.60, td = 0.10
 
 Evaluated on all reconstructable tracks across the full 100-seed `eval-keepall` holdout ($15^\circ < \theta < 165^\circ$, $p_\mathrm{T} > 0.1$ GeV at champion operating point $t_\beta=0.60, t_d=0.10$):
 

@@ -12,6 +12,9 @@ class MLPConfig:
     s_channels: Optional[List[int]] = None
     activation: str = "gelu"
     dropout_prob: Optional[float] = None
+    # The projective arm enables the join and moves the pseudoscalar to index 15.
+    use_join: bool = False
+    pseudoscalar_idx: int = 31
 
     def __post_init__(self):
         if isinstance(self.dropout_prob, str) and self.dropout_prob.lower() in ["null", "none"]:

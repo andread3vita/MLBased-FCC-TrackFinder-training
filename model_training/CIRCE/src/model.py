@@ -6,9 +6,9 @@ All ablation flags removed; these improvements are now permanent:
   M3: isotropic position normalization (pos/1000.0)
   M4: faithful OC loss (Kieseler 2002.03605 hinge repulsive + arctanh^2)
 
-M5 (invariant-only readout) was tested and discarded — ablation showed
-higher loss (~0.95-1.06) vs equivariant readout (~0.78-0.84). The
-multivector output is used directly.
+New symmetry-preserving runs return clustering coordinates and beta through
+GATr's scalar output representation. The historical unconstrained blade-mixing
+readout remains only for loading old checkpoints.
 """
 
 import os
@@ -26,13 +26,20 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch_scatter import scatter_max, scatter_add, scatter_mean
 
+from src.cgatr.layers.linear import EquiLinear
 from src.cgatr.nets.cgatr import CGATr
 from src.cgatr.layers.attention.config import SelfAttentionConfig
 from src.cgatr.layers.mlp.config import MLPConfig
 from src.cgatr.interface.point import embed_point
 from src.cgatr.interface.scalar import embed_scalar
 from src.cgatr.interface.circle import embed_circle_ipns
-from src.cgatr.primitives.linear import _compute_se3_equi_linear_basis
+from src.cgatr.interface.line import embed_line
+from src.cgatr.interface.sphere import embed_sphere
+from src.cgatr.interface.plane import embed_plane
+from src.cgatr.primitives.linear import (
+    _compute_e3_equi_linear_basis,
+    _compute_se3_equi_linear_basis,
+)
 from src.cgatr.primitives.attention import _build_dist_basis, block_diagonal_bool_mask
 from src.cgatr.primitives.invariants import compute_inner_product_mask
 from src.cgatr.primitives.dual import _DualCache
@@ -53,35 +60,279 @@ class CGATrParquetModel(nn.Module):
         # M3: isotropic norm — single scale, preserves E(3) rotation equivariance.
         self.pos_scale = 1000.0
 
-        gp_sparse = torch.load("cga_utils/cga_geometric_product.pt", weights_only=False)
+        # Hit time enters as a scalar channel rather than through embed_scalar:
+        # the grade-0 blade already carries hit_type, and summing the two there
+        # would make them indistinguishable.
+        self.use_time = bool(getattr(args, "use_time", False))
+        self.algebra = getattr(args, "algebra", "conformal")
+        if self.algebra not in ("conformal", "projective"):
+            raise ValueError(f"unknown algebra {self.algebra!r}")
+        self.projective = self.algebra == "projective"
+        self.pga_encoding = getattr(args, "pga_hit_encoding", "line")
+        if self.pga_encoding not in ("line", "ggtf", "ggtf_wire", "point_line"):
+            raise ValueError(f"unknown pga_hit_encoding {self.pga_encoding!r}")
+        # Only GGTF's encoding needs the left-to-right drift vector, so only it
+        # asks the dataset for the extra feature columns.
+        self.needs_drift_dir = (self.projective
+                                and self.pga_encoding in ("ggtf", "ggtf_wire"))
+        self.physical_drift_geometry = bool(
+            getattr(args, "physical_drift_geometry", False))
+        self.separate_hit_metadata = bool(
+            getattr(args, "separate_hit_metadata", False))
+        # A clean hit-type-location ablation: unlike
+        # --separate_hit_metadata, this does not add a redundant drift-radius
+        # scalar beside the geometric sphere/circle radius.
+        self.separate_hit_type = bool(
+            self.separate_hit_metadata
+            or getattr(args, "separate_hit_type", False)
+        )
+        self.layernorm_epsilon_mode = getattr(
+            args, "layernorm_epsilon_mode", "clamp"
+        )
+        if self.layernorm_epsilon_mode not in ("clamp", "add"):
+            raise ValueError(
+                "unknown layernorm_epsilon_mode "
+                f"{self.layernorm_epsilon_mode!r}"
+            )
+        self.equi_init = getattr(args, "equi_init", "default")
+        if self.equi_init not in ("default", "identity_algebra"):
+            raise ValueError(f"unknown equi_init {self.equi_init!r}")
+        self.equivariance_group = getattr(args, "equivariance_group", "se3").lower()
+        if self.equivariance_group not in ("e3", "se3"):
+            raise ValueError(
+                f"unknown equivariance_group {self.equivariance_group!r}")
+        self.invariant_output_head = bool(
+            getattr(args, "invariant_output_head", False)
+        )
+
+        # Two-channel drift embedding. Today a drift hit is a grade-2 circle
+        # while a vertex hit is a grade-1 point, so the conformal inner product
+        # between them is not the point-to-sphere distance that motivates the
+        # algebra in the first place -- it is a circle-point product of mixed
+        # grade. Giving each drift hit a sphere channel alongside its circle puts
+        # the two hit types back on a shared grade, so the distance the network
+        # can read between a vertex hit and a drift hit is the clean one, while
+        # the circle channel still carries the full wire constraint.
+        # The sphere and plane embeddings offset the centre along e+ + e-, which
+        # is 2o, the origin, where the definition calls for inf = e- - e+. It is
+        # the same o-versus-inf confusion the equivariant linear basis had before
+        # --no_legacy_equivariance, in a second and independent place. Off by
+        # default because every conformal checkpoint so far trained on those
+        # inputs; see src/cgatr/interface/sphere.py for what it costs.
+        self.fix_cga_null = getattr(args, "fix_cga_null", False)
+
+        # The wire direction was built with the azimuth in the wrong slots,
+        # (sin s cos a, sin s sin a, cos s), which tilts the wire radially. A
+        # stereo wire tilts azimuthally: the detector convention that produced
+        # left/right in the parquet is (sin s sin a, -sin s cos a, cos s). The
+        # wrong vector is a median 10.8 degrees off, up to 20.2, and is not
+        # perpendicular to the drift direction the data carries. Off by default
+        # because every conformal checkpoint so far trained on the tilted plane.
+        self.fix_wire_dir = getattr(args, "fix_wire_dir", False)
+
+        self.two_channel_dc = getattr(args, "two_channel_dc", False)
+        if self.two_channel_dc and self.projective:
+            raise ValueError(
+                "--two_channel_dc is a conformal construction: it needs the "
+                "grade-1 sphere, which the projective algebra has no room for")
+        self.cga_encoding = getattr(args, "cga_hit_encoding", "circle")
+        if self.cga_encoding not in (
+            "circle", "sphere_circle", "sphere_plane", "point_line"
+        ):
+            raise ValueError(f"unknown cga_hit_encoding {self.cga_encoding!r}")
+        if self.two_channel_dc:
+            if self.cga_encoding != "circle":
+                raise ValueError(
+                    "--two_channel_dc is the legacy spelling of "
+                    "--cga_hit_encoding sphere_circle; do not pass both")
+            self.cga_encoding = "sphere_circle"
+        if self.projective and self.cga_encoding != "circle":
+            raise ValueError("--cga_hit_encoding applies only to conformal models")
+        if self.cga_encoding == "point_line":
+            if not self.fix_wire_dir:
+                raise ValueError(
+                    "CGA point_line requires --fix_wire_dir"
+                )
+            if not self.separate_hit_metadata:
+                raise ValueError(
+                    "CGA point_line requires --separate_hit_metadata so drift "
+                    "radius and hit type are not discarded"
+                )
+        prefix = "pga" if self.projective else "cga"
+
+        gp_sparse = torch.load(f"cga_utils/{prefix}_geometric_product.pt", weights_only=False)
         self.register_buffer("basis_gp", gp_sparse.to_dense().to(dtype=torch.float32))
 
-        op_sparse = torch.load("cga_utils/cga_outer_product.pt", weights_only=False)
+        op_sparse = torch.load(f"cga_utils/{prefix}_outer_product.pt", weights_only=False)
         self.register_buffer("basis_outer", op_sparse.to_dense().to(dtype=torch.float32))
 
-        metadata = torch.load("cga_utils/cga_metadata.pt", weights_only=False)
+        metadata = torch.load(f"cga_utils/{prefix}_metadata.pt", weights_only=False)
         _DualCache.init_from_metadata(metadata, device=torch.device("cpu"))
+        self.num_blades = int(metadata["num_blades"])
+        self._blade_names = list(metadata["blade_names"])
+        # A plain attribute, not a buffer: it is only used by the equivariance
+        # test, and adding a buffer would put a new key in the state dict and
+        # break loading of every existing checkpoint.
+        self._reversal = metadata["reversal_signs"].clone()
 
-        # Canonical SE(3)-equivariant CGA linear basis (de Haan et al. 2311.04744
-        # Sec. 3.3), computed as the null space of the Lie-algebra equivariance
-        # constraint. Replaces the old 9-element basis (which carried 3
-        # non-equivariant Hodge cross-grade maps). Self-verifies at construction.
-        pin_basis = _compute_se3_equi_linear_basis(
-            self.basis_gp, device=torch.device("cpu"), dtype=torch.float32
+        # Reproduces the pre-2026-07-31 conformal architecture, whose backbone is
+        # rotation- but not translation-equivariant. Kept only so the ablation
+        # can measure what correcting it buys; see
+        # paper_adjustment_candidates/equivariance_claim.md.
+        self.legacy_equi = bool(getattr(args, "legacy_equivariance", False))
+        if self.legacy_equi and self.equivariance_group != "se3":
+            raise ValueError(
+                "--legacy_equivariance reproduces the old 40-map SE(3) "
+                "backbone and cannot be combined with --equivariance_group e3")
+
+        # Equivariant linear basis from de Haan et al. 2311.04744 Sec. 3.3.
+        # The paper's full E(3) construction has 20 CGA maps; removing the
+        # mirror constraint gives 40 SE(3) maps and allows chirality in the
+        # fixed solenoidal field. Both are computed from the same verified
+        # Lie-algebra null space.
+        #
+        # Translations are generated against the degenerate e0 in the projective
+        # algebra and against the point at infinity inf = e- - e+ in the
+        # conformal one. inf is fixed by the point embedding P = o + p +
+        # |p|^2 inf/2 in interface/point.py. The other null direction, o =
+        # (e+ + e-)/2, generates transversions instead, and yields an equally
+        # large basis sharing only 12 of its 40 maps -- which is what the legacy
+        # path used.
+        translation_vec = None
+        if not self.projective:
+            translation_vec = torch.zeros(int(metadata["num_blades"]))
+            translation_vec[4] = 1.0 if self.legacy_equi else -1.0  # e+
+            translation_vec[5] = 1.0                                # e-
+        spatial_idx = (2, 3, 4) if self.projective else (1, 2, 3)
+        translation_idx = 1 if self.projective else None
+        basis_kwargs = dict(
+            gp=self.basis_gp,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            spatial_idx=spatial_idx,
+            translation_idx=translation_idx,
+            translation_vec=translation_vec,
+            label="PGA" if self.projective else "CGA",
         )
-        basis_q, basis_k = _build_dist_basis(device=torch.device("cpu"), dtype=torch.float32)
-        basis_ip_weights = compute_inner_product_mask(self.basis_gp, device=torch.device("cpu"))
+        if self.equivariance_group == "e3":
+            pin_basis = _compute_e3_equi_linear_basis(
+                grade_involution=metadata["grade_involution_signs"],
+                mirror_vector_idx=spatial_idx[0],
+                expected_count=9 if self.projective else 20,
+                **basis_kwargs,
+            )
+        else:
+            pin_basis = _compute_se3_equi_linear_basis(**basis_kwargs)
+        basis_ip_weights = compute_inner_product_mask(
+            self.basis_gp, device=torch.device("cpu"),
+            reversal=metadata["reversal_signs"] if self.projective else None,
+        )
+        # Attention scores are the invariant inner product <x~ y>_0 = sum_i
+        # w_i x_i y_i, so the blades with zero weight are dropped and the rest
+        # are weighted. In the projective algebra the weights are all +1 and the
+        # zeros are exactly the e0 blades, which recovers GATr's "plain dot
+        # product on 8 of the 16 dimensions". In the conformal algebra sixteen
+        # weights are -1, so the same unweighted shortcut is not invariant.
+        ip_idx = torch.nonzero(basis_ip_weights, as_tuple=True)[0].tolist()
+        ip_weights = basis_ip_weights[ip_idx].tolist()
+
+        if self.projective:
+            self.register_buffer("point_matrix", metadata["point_matrix"])
+            self.register_buffer("line_matrix", metadata["line_matrix"])
+            # GATr's translation embedding, T(t) = 1 - e0 (t . e) / 2
+            # (gatr/interface/translation.py). Built by blade name so it does
+            # not depend on our ordering, which swaps e12 and e03 relative to
+            # the reference.
+            blade = {str(n): i for i, n in enumerate(metadata["blade_names"])}
+            trans_matrix = torch.zeros(int(metadata["num_blades"]), 4)
+            trans_matrix[blade["1"], 3] = 1.0
+            for axis, name in enumerate(("e01", "e02", "e03")):
+                trans_matrix[blade[name], axis] = -0.5
+            self.register_buffer("translation_matrix", trans_matrix)
+            basis_q = basis_k = None
+            # Distance-aware attention is not optional here. The projective
+            # inner product between two points is provably constant in their
+            # coordinates (de Haan et al. Prop. 3), so without these features
+            # attention is blind to position and the arm degenerates into the
+            # P-GATr variant their paper reports as the weak one. With them,
+            # plus the join, this is iP-GATr -- the architecture GGTF uses.
+            names = [str(n) for n in self._blade_names]
+            # GATr drops the trivector from the inner product once the distance
+            # features are switched on -- the reference implementation attends
+            # over `_INNER_PRODUCT_WO_TRI_IDX`, seven blades rather than eight,
+            # because the trivector is what the distance features are built
+            # from and would otherwise enter the logit twice.
+            tri_blade = names.index("e123")
+            ip_wo_tri = [(i, w) for i, w in zip(ip_idx, ip_weights)
+                         if i != tri_blade]
+            attention = SelfAttentionConfig(
+                grade1_idx=[1, 2, 3, 4],
+                ip_idx=[i for i, _ in ip_wo_tri],
+                ip_weights=[w for _, w in ip_wo_tri],
+                num_blades=self.num_blades,
+                # Homogeneous weight first, then the components GATr writes as
+                # q_{\1}, q_{\2}, q_{\3}.
+                pga_dist_idx=[names.index(b)
+                              for b in ("e123", "e023", "e013", "e012")],
+            )
+            mlp = MLPConfig(use_join=True, pseudoscalar_idx=self.num_blades - 1)
+            # The projective algebra cannot hold a circle, so the drift radius
+            # has to go somewhere. Under 'line' it becomes a scalar channel;
+            # under 'ggtf' it stays geometric, as the length of the translation
+            # between the two tangency points, and the scalar channel is then
+            # only needed if hit time is switched on -- which is also why GGTF
+            # itself runs with in_s_channels=None.
+            include_drift_scalar = (
+                self.separate_hit_metadata
+                or self.pga_encoding in ("line", "point_line")
+            )
+            in_s_channels = (
+                int(include_drift_scalar)
+                + int(self.separate_hit_type)
+                + int(self.use_time)
+            ) or None
+        elif self.legacy_equi:
+            basis_q, basis_k = _build_dist_basis(
+                device=torch.device("cpu"), dtype=torch.float32
+            )
+            attention = SelfAttentionConfig()
+            mlp = MLPConfig()
+            in_s_channels = (
+                int(self.separate_hit_metadata)
+                + int(self.separate_hit_type)
+                + int(self.use_time)
+            ) or None
+        else:
+            # C-GATr proper: no hand-crafted distance features. In a
+            # non-degenerate algebra the invariant inner product between null
+            # vectors already is the Euclidean distance, which is de Haan et
+            # al.'s stated reason (Sec. 4.3) for preferring this algebra.
+            basis_q = basis_k = None
+            attention = SelfAttentionConfig(ip_idx=ip_idx, ip_weights=ip_weights)
+            mlp = MLPConfig()
+            in_s_channels = (
+                int(self.separate_hit_metadata)
+                + int(self.separate_hit_type)
+                + int(self.use_time)
+            ) or None
 
         self.cgatr = CGATr(
-            in_mv_channels=1,
+            in_mv_channels=2 if (
+                self.cga_encoding in (
+                    "sphere_circle", "sphere_plane", "point_line"
+                )
+                or self.pga_encoding in ("ggtf_wire", "point_line")
+            ) else 1,
             out_mv_channels=1,
             hidden_mv_channels=args.hidden_mv_channels,
-            in_s_channels=None,
-            out_s_channels=None,
+            in_s_channels=in_s_channels,
+            out_s_channels=(
+                args.embed_dim + 1 if self.invariant_output_head else None
+            ),
             hidden_s_channels=args.hidden_s_channels,
             num_blocks=args.num_blocks,
-            attention=SelfAttentionConfig(),
-            mlp=MLPConfig(),
+            attention=attention,
+            mlp=mlp,
             basis_gp=self.basis_gp,
             basis_ip_weights=basis_ip_weights,
             basis_outer=self.basis_outer,
@@ -89,13 +340,66 @@ class CGATrParquetModel(nn.Module):
             basis_q=basis_q,
             basis_k=basis_k,
             checkpoint_blocks=getattr(args, "grad_checkpoint", False),
+            norm_epsilon_mode=self.layernorm_epsilon_mode,
         )
 
+        if self.equi_init == "identity_algebra":
+            # Applied after construction so only the layers that took the generic
+            # scheme are touched; the bilinears' almost_unit_scalar layers are
+            # tuned for their own job and are left as they are.
+            n = 0
+            for mod in self.cgatr.modules():
+                if isinstance(mod, EquiLinear) and mod._init_kind == "default":
+                    mod.reset_parameters("identity_algebra")
+                    n += 1
+            print(f"[cgatr] identity-on-algebra initialization applied to "
+                  f"{n} equivariant linear layers", flush=True)
+
         self.embed_dim = args.embed_dim
-        self.clustering = nn.Linear(32, self.embed_dim, bias=False)
-        self.beta = nn.Linear(32, 1)
+        if self.invariant_output_head:
+            self.clustering = None
+            self.beta = None
+        else:
+            # Backward-compatible path for existing checkpoints. These heads
+            # mix blades without an equivariance constraint and must not be used
+            # for new symmetry-preserving runs.
+            self.clustering = nn.Linear(
+                self.num_blades, self.embed_dim, bias=False
+            )
+            self.beta = nn.Linear(self.num_blades, 1)
+
+    @property
+    def embedding_dim(self) -> int:
+        """Alias for downstream evaluation scripts expecting `model.embedding_dim`."""
+        return self.embed_dim
+
+    def split_output(self, output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split model output into condensation coordinates and beta logits.
+
+        Returns:
+            coords: Tensor of shape (N, embed_dim) in Euclidean condensation space.
+            beta_logits: Tensor of shape (N,) raw condensation logits.
+        """
+        coords = output[:, :self.embed_dim]
+        beta_logits = output[:, self.embed_dim]
+        return coords, beta_logits
 
     def forward(self, features, seq_lens):
+        mv, scalars = self.embed(features)
+        out_mv, out_scalars = self._backbone_outputs(mv, scalars, seq_lens)
+        if self.invariant_output_head:
+            if out_scalars is None:
+                raise RuntimeError(
+                    "invariant output head requested but GATr returned no scalars"
+                )
+            return out_scalars
+        out = out_mv[:, 0, :]
+        return torch.cat([self.clustering(out), self.beta(out)], dim=1)
+
+    def embed(self, features):
+        """Hits to multivectors and scalar channels. Split out of `forward` so
+        the equivariance test can check the embedding and the stack separately.
+        """
         pos = features[:, :3]
         hit_type = features[:, 3:4]
         # M3: isotropic norm
@@ -104,26 +408,184 @@ class CGATrParquetModel(nn.Module):
         is_vtx = (hit_type.squeeze(-1) == 0)
         is_dc = (hit_type.squeeze(-1) == 1)
 
-        mv = torch.zeros(features.shape[0], 32, device=features.device, dtype=features.dtype)
+        mv = torch.zeros(features.shape[0], self.num_blades,
+                         device=features.device, dtype=features.dtype)
 
-        if is_vtx.any():
-            mv[is_vtx] = embed_point(pos_normed[is_vtx]).to(mv.dtype)
-
+        # Wire geometry is common to both algebras; only what it becomes differs.
+        drift_normed = drift_geometry = wire_normed = wire_dir = None
         if is_dc.any():
             dc = features[is_dc]
             # M3: isotropic norm for wire positions
             wire_normed = dc[:, 4:7] / self.pos_scale
-            # M2: fixed positive scale preserves monotonic drift-to-radius mapping
+            # The legacy representation deliberately amplifies a few-mm drift
+            # radius relative to metre-scale positions. Physical mode instead
+            # uses one length unit for every geometric coordinate; the
+            # separately normalized scalar below keeps the small radius visible.
             drift_normed = dc[:, 7] / 5.0
+            drift_geometry = (
+                dc[:, 7] / self.pos_scale
+                if self.physical_drift_geometry
+                else drift_normed
+            )
             cos_s = torch.cos(dc[:, 9])
             sin_s = torch.sin(dc[:, 9])
             cos_a = torch.cos(dc[:, 8])
             sin_a = torch.sin(dc[:, 8])
-            wire_dir = torch.stack([sin_s * cos_a, sin_s * sin_a, cos_s], dim=-1)
+            if self.fix_wire_dir:
+                wire_dir = torch.stack(
+                    [sin_s * sin_a, -sin_s * cos_a, cos_s], dim=-1)
+            else:
+                wire_dir = torch.stack(
+                    [sin_s * cos_a, sin_s * sin_a, cos_s], dim=-1)
             wire_dir = wire_dir / (torch.norm(wire_dir, dim=-1, keepdim=True) + 1e-8)
-            mv[is_dc] = embed_circle_ipns(wire_normed, wire_dir, drift_normed, self.basis_outer).to(mv.dtype)
 
-        mv = mv + embed_scalar(hit_type)
+        if self.projective and self.pga_encoding in ("ggtf", "ggtf_wire"):
+            # GGTF's encoding: every hit is a point plus a translation. A vertex
+            # hit translates by nothing; a drift hit sits at one tangency point
+            # and translates to the other, so the drift radius survives as half
+            # the length of that translation rather than as a scalar.
+            #
+            # The drift direction comes straight from the data: our parquet
+            # carries the same left and right tangency points GGTF reads off the
+            # DD4hep cell frame, and right - left is exactly 2 * drift_distance
+            # long with its midpoint exactly on the wire. Earlier this arm
+            # reconstructed the axis as wire_dir x r_hat, which is off by a
+            # median 48 degrees and wrong by more than 10 degrees for 94% of
+            # hits; that would have handicapped the projective baseline in
+            # precisely the place we claim it loses, which is the one direction
+            # the comparison must not err in.
+            #
+            # The offset uses drift_normed, which is the drift on its own /5
+            # scale rather than the /pos_scale the positions use, so the two
+            # tangency points come out far further apart than the physical few
+            # millimetres. That is deliberate. The conformal arm inflates the
+            # same quantity by the same factor -- its drift sphere has radius
+            # drift_normed too -- and matching the inflation keeps the drift
+            # signal the same size in both arms, so the comparison isolates the
+            # algebra rather than the feature scaling. It also errs in the
+            # projective arm's favour, which is the direction we want when the
+            # claim is that this arm loses.
+            point = pos_normed
+            vec = torch.zeros_like(pos_normed)
+            if is_dc.any():
+                off = 11 if self.use_time else 10
+                if features.shape[1] < off + 3:
+                    raise ValueError(
+                        "pga_hit_encoding='ggtf' needs the drift-direction "
+                        "columns; construct the dataset with with_drift_dir=True")
+                u = features[is_dc, off:off + 3]
+                u = u / (torch.norm(u, dim=-1, keepdim=True) + 1e-8)
+                offset = drift_geometry.unsqueeze(-1) * u
+                point = point.clone()
+                point[is_dc] = wire_normed - offset
+                vec[is_dc] = 2.0 * offset
+            homog = torch.cat([point, torch.ones_like(point[:, :1])], dim=-1)
+            trans = torch.cat([vec, torch.ones_like(vec[:, :1])], dim=-1)
+            mv = ((homog @ self.point_matrix.T)
+                  + (trans @ self.translation_matrix.T)).to(mv.dtype)
+            if self.pga_encoding == "ggtf_wire":
+                # The control for M39. GGTF's pair fixes the wire position and
+                # the radius but leaves the wire direction underdetermined, so
+                # hand it over explicitly in a second channel. PGA still cannot
+                # hold the circle as one object; it can hold both facts at once
+                # across two. If conformal beats this, the claim is not that
+                # the projective arm was starved of information.
+                second = torch.zeros_like(mv)
+                if is_dc.any():
+                    moment = torch.cross(wire_normed, wire_dir, dim=-1)
+                    plucker = torch.cat([wire_dir, moment], dim=-1)
+                    second[is_dc] = (plucker @ self.line_matrix.T).to(mv.dtype)
+                mv = torch.stack([mv, second], dim=1)
+        elif self.projective and self.pga_encoding == "point_line":
+            # Information-matched, gauge-free PGA control. Channel 0 carries
+            # the measured point on the wire (or the VTX point); channel 1
+            # carries the full Pluecker wire. Drift radius is a scalar below.
+            mv = torch.zeros(features.shape[0], 2, self.num_blades,
+                             device=features.device, dtype=features.dtype)
+            if is_vtx.any():
+                p = pos_normed[is_vtx]
+                homog = torch.cat([p, torch.ones_like(p[:, :1])], dim=-1)
+                mv[is_vtx, 0] = (homog @ self.point_matrix.T).to(mv.dtype)
+            if is_dc.any():
+                homog = torch.cat(
+                    [wire_normed, torch.ones_like(wire_normed[:, :1])], dim=-1)
+                mv[is_dc, 0] = (homog @ self.point_matrix.T).to(mv.dtype)
+                moment = torch.cross(wire_normed, wire_dir, dim=-1)
+                plucker = torch.cat([wire_dir, moment], dim=-1)
+                mv[is_dc, 1] = (plucker @ self.line_matrix.T).to(mv.dtype)
+        elif self.projective:
+            # Points are trivectors and the wire is a line bivector in Plucker
+            # form. The drift radius has no geometric home here and is handed to
+            # the scalar channel below — the limitation under test.
+            if is_vtx.any():
+                p = pos_normed[is_vtx]
+                homog = torch.cat([p, torch.ones_like(p[:, :1])], dim=-1)
+                mv[is_vtx] = (homog @ self.point_matrix.T).to(mv.dtype)
+            if is_dc.any():
+                moment = torch.cross(wire_normed, wire_dir, dim=-1)
+                plucker = torch.cat([wire_dir, moment], dim=-1)
+                mv[is_dc] = (plucker @ self.line_matrix.T).to(mv.dtype)
+        elif self.cga_encoding == "point_line":
+            # Paper-faithful, deployable drift observation. Channel 0 is always
+            # a CGA point: the VTX position or the digitized point on the wire.
+            # Channel 1 is the complete conformal wire line for DC hits and zero
+            # for VTX hits. The measured drift radius and hit type are auxiliary
+            # scalars below. This specifies the tube-like measurement without
+            # pretending that the noisy longitudinal coordinate defines an
+            # exact circle plane.
+            mv = torch.zeros(
+                features.shape[0], 2, self.num_blades,
+                device=features.device, dtype=features.dtype,
+            )
+            if is_vtx.any():
+                mv[is_vtx, 0] = embed_point(
+                    pos_normed[is_vtx]
+                ).to(mv.dtype)
+            if is_dc.any():
+                mv[is_dc, 0] = embed_point(wire_normed).to(mv.dtype)
+                mv[is_dc, 1] = embed_line(
+                    wire_normed, wire_dir, self.basis_outer
+                ).to(mv.dtype)
+        elif self.cga_encoding in ("sphere_circle", "sphere_plane"):
+            # Channel 0 is grade-1 for both hit types -- a null point for a
+            # vertex hit, a drift sphere for a wire hit -- so their inner product
+            # is the point-to-sphere distance. Channel 1 is the grade-2 circle
+            # for a wire hit and zero for a vertex hit, which has no second
+            # constraint to carry.
+            mv = torch.zeros(features.shape[0], 2, self.num_blades,
+                             device=features.device, dtype=features.dtype)
+            if is_vtx.any():
+                mv[is_vtx, 0] = embed_point(pos_normed[is_vtx]).to(mv.dtype)
+            if is_dc.any():
+                mv[is_dc, 0] = embed_sphere(
+                    wire_normed, drift_geometry, fix_null=self.fix_cga_null
+                ).to(mv.dtype)
+                if self.cga_encoding == "sphere_circle":
+                    mv[is_dc, 1] = embed_circle_ipns(
+                        wire_normed, wire_dir, drift_geometry, self.basis_outer,
+                        fix_null=self.fix_cga_null
+                    ).to(mv.dtype)
+                else:
+                    mv[is_dc, 1] = embed_plane(
+                        wire_dir, wire_normed, fix_null=self.fix_cga_null
+                    ).to(mv.dtype)
+        else:
+            if is_vtx.any():
+                mv[is_vtx] = embed_point(pos_normed[is_vtx]).to(mv.dtype)
+            if is_dc.any():
+                mv[is_dc] = embed_circle_ipns(
+                    wire_normed, wire_dir, drift_geometry, self.basis_outer,
+                    fix_null=self.fix_cga_null
+                ).to(mv.dtype)
+
+        # Same as adding embed_scalar(hit_type); written by index so it does not
+        # assume 32 blades. In two-channel mode it goes on the shared grade-1
+        # channel, where the single-channel arm also puts it.
+        if not self.separate_hit_type:
+            if mv.dim() == 3:
+                mv[:, 0, 0] = mv[:, 0, 0] + hit_type.squeeze(-1)
+            else:
+                mv[:, 0] = mv[:, 0] + hit_type.squeeze(-1)
 
         if self.args.normalize_mv_inputs:
             # Euclidean per-hit normalization. This is ROTATION-equivariant (a
@@ -134,10 +596,33 @@ class CGATrParquetModel(nn.Module):
             # and translation is not a physical symmetry here. The equivariant CGA
             # grade-wise norm cannot be used on the inputs because VTX hits are
             # null vectors (<P,P> = 0), so their CGA norm is identically zero.
+            # Per channel, so a vertex hit's empty circle channel stays exactly
+            # zero rather than being blown up to unit norm.
             mv_norm = torch.norm(mv, dim=-1, keepdim=True).clamp(min=1e-6)
             mv = mv / mv_norm
 
-        mv = mv.unsqueeze(1)  # (N, 1, 32) — single channel
+        scalar_parts = []
+        if (self.separate_hit_metadata
+                or (self.projective
+                    and self.pga_encoding in ("line", "point_line"))):
+            drift = torch.zeros(features.shape[0], 1,
+                                device=features.device, dtype=features.dtype)
+            if is_dc.any():
+                drift[is_dc, 0] = drift_normed
+            scalar_parts.append(drift)
+        if self.separate_hit_type:
+            scalar_parts.append(hit_type)
+        if self.use_time:
+            scalar_parts.append(features[:, 10:11])
+        scalars = torch.cat(scalar_parts, dim=-1) if scalar_parts else None
+
+        return mv, scalars
+
+    def _backbone_outputs(self, mv, scalars, seq_lens):
+        """Run the equivariant stack and retain both output representations."""
+        if mv.dim() == 2:
+            mv = mv.unsqueeze(1)  # (N, 1, blades) — single channel
+        # else the embedding already produced (N, channels, blades)
 
         # Pass per-event hit counts rather than a dense (1,1,M,M) bool mask.
         # The attention primitive runs block-diagonal attention as independent
@@ -145,15 +630,26 @@ class CGATrParquetModel(nn.Module):
         # VRAM cost under the MATH backend that the large MV feature dim forces).
         # A dense bool mask is still accepted by the primitive for back-compat;
         # `block_diagonal_bool_mask` remains available for that path.
-        out_mv, _ = self.cgatr(mv, scalars=None, attention_mask=list(seq_lens))
-        out = out_mv[:, 0, :]
+        #
+        # The packed seq_lens form dispatches to xformers, which is CUDA-only;
+        # off GPU fall back to the equivalent dense mask so the model stays
+        # runnable on CPU for smoke tests and debugging.
+        if mv.is_cuda:
+            attn = list(seq_lens)
+        else:
+            attn = block_diagonal_bool_mask(seq_lens, device=mv.device)
 
-        return torch.cat([self.clustering(out), self.beta(out)], dim=1)
+        return self.cgatr(mv, scalars=scalars, attention_mask=attn)
+
+    def backbone(self, mv, scalars, seq_lens):
+        """The equivariant stack. Takes and returns one multivector per hit."""
+        out_mv, _ = self._backbone_outputs(mv, scalars, seq_lens)
+        return out_mv[:, 0, :]
 
 
 # ---------------------------------------------------------------------------
 # Object condensation loss — torch_scatter port of hgcalimplementation
-# (no DGL dependency)
+# with selectable repulsive potential (no DGL dependency)
 # ---------------------------------------------------------------------------
 def object_condensation_loss(
     coords, beta, mc_index, batch,
@@ -163,11 +659,19 @@ def object_condensation_loss(
     beta_suppress_weight=0.0,
     var_weight=0.0,
     return_components=False,
+    detach_components=True,
+    oc_mode="paper_hinge",
+    track_separation_weight=None,
 ):
-    """Object condensation loss (hgcalimplementation-style) using torch_scatter.
+    """Hybrid object-condensation loss using torch_scatter.
 
-    M4 baked in: faithful OC (Kieseler 2002.03605 hinge repulsive + arctanh^2
-    with /1.0). All ablation flags removed.
+    Both modes use the logarithmic attractive potential and per-object
+    normalization from the HGCAL/GGTF implementation. ``paper_hinge`` combines
+    that attraction with Kieseler's compact-support hinge repulsion and the
+    original arctanh-squared charge. It is the empirically selected tracking
+    objective, but it is not the literal Kieseler loss (whose attraction is
+    quadratic). ``ggtf`` instead uses GGTF's Gaussian repulsion and softened
+    charge, optionally with inverse nearest-track-separation weights.
 
     Matches the original calc_LV_Lbeta semantics:
     - Attraction: signal hits pulled toward their own condensation point
@@ -181,8 +685,6 @@ def object_condensation_loss(
     - If return_components=True, returns (total, dict of components).
     """
     device = coords.device
-    # M4: faithful OC (Kieseler 2002.03605) — hardcoded, no env flag.
-    _faithful = True
     beta = torch.nan_to_num(beta, nan=0.0)
 
     is_noise = mc_index == noise_index
@@ -220,15 +722,28 @@ def object_condensation_loss(
     if n_objects < 2:
         return torch.tensor(0.0, device=device, requires_grad=True)
 
-    # q for ALL hits (repulsion uses noise hits too, matching original)
-    # M4: /1.0 (faithful, no /1.01)
-    q_all = (beta.clip(0.0, 1 - 1e-4).arctanh() / 1.0) ** 2 + qmin
+    if oc_mode not in ("paper_hinge", "ggtf"):
+        raise ValueError(f"Unknown object-condensation mode: {oc_mode}")
+
+    # q for ALL hits (repulsion uses noise hits too, matching original).
+    # GGTF's HGCAL-derived implementation divides by 1.01; the paper mode does not.
+    q_scale = 1.01 if oc_mode == "ggtf" else 1.0
+    q_all = (beta.clip(0.0, 1 - 1e-4).arctanh() / q_scale) ** 2 + qmin
     q_sig = q_all[is_sig]
 
     # Alpha points (condensation points)
     q_alpha, index_alpha = scatter_max(q_sig, object_index)
     x_alpha = sig_coords[index_alpha]
     beta_alpha = sig_beta[index_alpha]
+    object_repulsion_weight = None
+    if track_separation_weight is not None:
+        if track_separation_weight.shape != beta.shape:
+            raise ValueError(
+                "track_separation_weight must have one value per input hit"
+            )
+        object_repulsion_weight = scatter_mean(
+            track_separation_weight[is_sig].float(), object_index
+        )
 
     # --- Attractive potential (signal hits only, per-hit) ---
     e1 = torch.exp(torch.tensor(1.0, device=device))
@@ -252,7 +767,7 @@ def object_condensation_loss(
     all_object_index[is_sig] = object_index
 
     rep_sum = torch.tensor(0.0, device=device)
-    rep_n_objects = 0
+    rep_normalization = torch.tensor(0.0, device=device)
     obj_offset = 0
 
     for i, evt_val in enumerate(unique_events):
@@ -270,8 +785,12 @@ def object_condensation_loss(
         evt_q_alpha = q_alpha[obj_offset:obj_offset + n_evt_obj]
 
         d_sq = ((evt_coords.unsqueeze(1) - evt_x_alpha.unsqueeze(0)) ** 2).sum(-1)
-        # M4: hinge repulsion (faithful Kieseler 2002.03605)
-        exp_rep = torch.relu(1.0 - torch.sqrt(d_sq.clamp(min=1e-12)))
+        if oc_mode == "ggtf":
+            # GGTF/HGCAL tracking path: Gaussian in squared latent distance.
+            exp_rep = torch.exp(-d_sq / 2.0)
+        else:
+            # Kieseler 2002.03605: compact-support linear hinge.
+            exp_rep = torch.relu(1.0 - torch.sqrt(d_sq.clamp(min=1e-12)))
 
         local_obj = evt_obj.clone()
         has_obj = local_obj >= 0
@@ -288,11 +807,18 @@ def object_condensation_loss(
         n_rep_terms = M_inv.sum(dim=0).clamp(min=1.0)
         V_rep_per_obj = V_rep_per_obj / n_rep_terms
 
-        rep_sum = rep_sum + V_rep_per_obj.sum()
-        rep_n_objects += n_evt_obj
+        if object_repulsion_weight is None:
+            rep_sum = rep_sum + V_rep_per_obj.sum()
+            rep_normalization = rep_normalization + n_evt_obj
+        else:
+            evt_weight = object_repulsion_weight[
+                obj_offset:obj_offset + n_evt_obj
+            ]
+            rep_sum = rep_sum + (V_rep_per_obj * evt_weight).sum()
+            rep_normalization = rep_normalization + evt_weight.sum()
         obj_offset += n_evt_obj
 
-    L_V_rep = rep_sum / max(rep_n_objects, 1)
+    L_V_rep = rep_sum / rep_normalization.clamp(min=1.0)
     L_V = attr_weight * L_V_att + repul_weight * L_V_rep
 
     # --- L_beta signal ---
@@ -321,13 +847,18 @@ def object_condensation_loss(
 
     total = L_V + L_beta_sig + L_beta_noise + L_beta_suppress + var_weight * L_var
     if return_components:
+        def component(value):
+            if not torch.is_tensor(value):
+                value = torch.tensor(float(value), device=device)
+            return value.detach() if detach_components else value
+
         components = {
-            "L_V_att": L_V_att.detach(),
-            "L_V_rep": L_V_rep.detach(),
-            "L_beta_sig": L_beta_sig.detach() if torch.is_tensor(L_beta_sig) else torch.tensor(float(L_beta_sig), device=device),
-            "L_beta_noise": L_beta_noise.detach() if torch.is_tensor(L_beta_noise) else torch.tensor(float(L_beta_noise), device=device),
-            "L_beta_suppress": L_beta_suppress.detach() if torch.is_tensor(L_beta_suppress) else torch.tensor(float(L_beta_suppress), device=device),
-            "L_var": L_var.detach(),
+            "L_V_att": component(L_V_att),
+            "L_V_rep": component(L_V_rep),
+            "L_beta_sig": component(L_beta_sig),
+            "L_beta_noise": component(L_beta_noise),
+            "L_beta_suppress": component(L_beta_suppress),
+            "L_var": component(L_var),
             "var_weight": torch.tensor(float(var_weight), device=device),
         }
         return total, components
@@ -369,7 +900,7 @@ def _compute_var_weight(epoch, args):
     return float(args.var_weight) * frac
 
 
-def _compute_batch_metrics_greedy(coords, beta_logits, mc_index, is_secondary, seq_lens, tbeta=0.5, td=0.5, cosine_norm=False):
+def _compute_batch_metrics_greedy(coords, beta_logits, mc_index, is_secondary, seq_lens, tbeta=0.5, td=0.5, cosine_norm=False, noise_index=0):
     from collections import Counter
 
     coords = coords.detach().cpu().numpy()
@@ -385,12 +916,12 @@ def _compute_batch_metrics_greedy(coords, beta_logits, mc_index, is_secondary, s
         sl = slice(offset, offset + n_hits)
         offset += n_hits
 
-        sec_mask = is_secondary[sl] | (mc_index[sl] == 0)
+        sec_mask = is_secondary[sl] | (mc_index[sl] == noise_index)
         if sec_mask.any():
             noise_total_counts += sec_mask.sum()
             noise_low_beta_counts += (beta[sl][sec_mask] < 0.1).sum()
 
-        mask = (~is_secondary[sl]) & (mc_index[sl] != 0)
+        mask = (~is_secondary[sl]) & (mc_index[sl] != noise_index)
         c = coords[sl][mask]
         if cosine_norm:
             norms = np.linalg.norm(c, axis=1, keepdims=True)

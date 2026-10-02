@@ -5,14 +5,14 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 CKPT=${1:?Usage: bash run_eval.sh /path/to/checkpoint.ckpt}
-DATA_DIR=${DATA_DIR:-/path/to/eos/v1_zqq_uds}
-EVAL_SEEDS=${EVAL_SEEDS:-1001-1196}
+DATA_DIR=${DATA_DIR:-/space/marko.cechovic/cgatr-data/eval-keepall}
+EVAL_SEEDS=${EVAL_SEEDS:-1-100}
 N_GPUS=${N_GPUS:-4}
 EMB_DIM=${EMB_DIM:-4}
 NUM_BLOCKS=${NUM_BLOCKS:-10}
 CPU_THREADS=${CPU_THREADS:-8}
-TB=${TB:-0.1}
-TD=${TD:-0.2}
+TB=${TB:-0.60}
+TD=${TD:-0.10}
 TAG=${TAG:-$(basename "$CKPT" .ckpt)}
 BASE=${BASE:-eval_results/$TAG}
 
@@ -48,6 +48,16 @@ for g in $(seq 0 $((N_GPUS-1))); do
         --checkpoint "$CKPT" \
         --eval_seeds "$SHARD_SEEDS" \
         --max_hits 0 \
+        --algebra conformal \
+        --cga_hit_encoding sphere_circle \
+        --physical_drift_geometry \
+        --fix_cga_null \
+        --fix_wire_dir \
+        --no_legacy_equivariance \
+        --equivariance_group e3 \
+        --invariant_output_head \
+        --equi_init identity_algebra \
+        --no-normalize_mv_inputs \
         --embed_dim $EMB_DIM \
         --num_blocks $NUM_BLOCKS \
         --gpu 0 \

@@ -127,14 +127,34 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--warmup_epochs", type=int, default=2)
     p.add_argument("--warmup_steps", type=int, default=None)
-    p.add_argument("--lr_schedule", default="cosine", choices=["cosine", "plateau"],
+    p.add_argument("--lr_schedule", default="cosine",
+                   choices=["cosine", "plateau", "step"],
                    help="cosine: warmup + half-cosine to min_lr over --num_epochs. "
                         "plateau: warmup + ReduceLROnPlateau on val_loss (adapts to "
-                        "convergence; robust when run length is uncertain).")
+                        "convergence; robust when run length is uncertain). "
+                        "step: GGTF's schedule, multiply by --lr_step_factor every "
+                        "--lr_step_epochs epochs down to --min_lr, no warmup.")
+    p.add_argument("--lr_step_epochs", type=int, default=4,
+                   help="Epochs between LR drops (step schedule).")
+    p.add_argument("--lr_step_factor", type=float, default=0.1,
+                   help="LR multiplier at each drop (step schedule).")
+    p.add_argument("--optimizer", default="adamw", choices=["adamw", "adam"],
+                   help="adam is for the GGTF parity runs, which use plain Adam; "
+                        "decoupled weight decay is not a neutral difference when "
+                        "the point is to match their recipe.")
     p.add_argument("--plateau_patience", type=int, default=4,
                    help="Epochs without val_loss improvement before LR drop (plateau).")
     p.add_argument("--plateau_factor", type=float, default=0.5,
                    help="LR multiplier on plateau (plateau schedule).")
+    p.add_argument(
+        "--terminal_anneal_epochs",
+        type=int,
+        default=0,
+        help="For the plateau schedule, cap the LR with a half-cosine decay "
+             "from start_lr to min_lr over the final N epochs. Zero disables "
+             "it. This guarantees a refinement phase even while val_loss is "
+             "still improving too quickly for ReduceLROnPlateau to fire.",
+    )
 
     p.add_argument("--num_blocks", type=int, default=10)
     p.add_argument("--hidden_mv_channels", type=int, default=16)
@@ -144,7 +164,159 @@ def parse_args():
     p.add_argument("--beta_mlp", action="store_true", default=False)
     p.add_argument("--cosine_norm", action="store_true", default=False)
     p.add_argument("--normalize_mv_inputs",
-                   action=argparse.BooleanOptionalAction, default=True)
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Legacy per-token Euclidean L2 normalization. It "
+                        "preserves rotations but breaks conformal translation "
+                        "equivariance; paper-faithful C-GATr runs must pass "
+                        "--no-normalize_mv_inputs.")
+    p.add_argument(
+        "--layernorm_epsilon_mode",
+        choices=["clamp", "add"],
+        default="clamp",
+        help="Equivariant LayerNorm denominator: 'clamp' reproduces released "
+             "GATr max(norm^2, epsilon); 'add' follows the literal C-GATr "
+             "paper equation norm^2 + epsilon.",
+    )
+    p.add_argument("--use_time", action="store_true", default=False,
+                   help="Feed normalized hit time as a scalar input channel.")
+    p.add_argument("--algebra", choices=["conformal", "projective"],
+                   default="conformal",
+                   help="Geometric algebra: conformal Cl(4,1) (drift hits are "
+                        "circles) or projective Cl(3,0,1) (the GGTF algebra, "
+                        "where the drift radius becomes a scalar).")
+    p.add_argument("--pga_hit_encoding",
+                   choices=["line", "ggtf", "ggtf_wire", "point_line"],
+                   default="line",
+                   help="How a drift hit enters the projective algebra, which "
+                        "cannot hold a circle. 'line': the wire as a Plucker "
+                        "bivector, drift radius as a scalar channel. 'ggtf': the "
+                        "two tangency points as GGTF does it, embed_point(left) + "
+                        "embed_translation(right - left), so the radius stays "
+                        "geometric but the wire direction is dropped. "
+                        "'ggtf_wire': that pair plus the Plucker wire in a "
+                        "second channel, so the projective arm is handed every "
+                        "fact the data holds and the comparison cannot be "
+                        "dismissed as starving it. 'point_line': a measured "
+                        "point on the wire plus the Plucker wire in two channels; "
+                        "use with --separate_hit_metadata to carry radius "
+                        "without an arbitrary left/right gauge. Projective only.")
+    p.add_argument("--cga_hit_encoding",
+                   choices=[
+                       "circle", "sphere_circle", "sphere_plane", "point_line"
+                   ],
+                   default="circle",
+                   help="Conformal DC representation. 'circle' is the legacy "
+                        "single IPNS circle; 'sphere_circle' adds a shared "
+                        "grade-1 sphere channel; 'sphere_plane' exposes the two "
+                        "grade-1 constraints whose wedge is the circle. "
+                        "'point_line' carries the digitized wire point and full "
+                        "CGA wire line in two channels, with drift radius and hit "
+                        "type in separate scalars; this is the deployable "
+                        "tube-like observation used by the corrected run.")
+    p.add_argument("--physical_drift_geometry", action="store_true", default=False,
+                   help="Scale drift radius by the same 1000 mm length as "
+                        "positions. Legacy runs use /5 to make radius order one, "
+                        "which inflates the claimed circle by exactly 200x.")
+    p.add_argument("--separate_hit_metadata", action="store_true", default=False,
+                   help="Carry normalized drift radius and hit type as scalar "
+                        "channels. This keeps physical radius visible and avoids "
+                        "mixing metadata into geometric multivectors.")
+    p.add_argument(
+        "--separate_hit_type",
+        action="store_true",
+        default=False,
+        help="Carry only hit type as an invariant scalar instead of adding it "
+             "to the geometric token's grade-0 blade. Unlike "
+             "--separate_hit_metadata, this does not also add drift radius.",
+    )
+    p.add_argument("--legacy_equivariance", action="store_true", default=False,
+                   help="Reproduce the pre-2026-07-31 conformal backbone, which "
+                        "is rotation- but not translation-equivariant: linear "
+                        "basis generated against the origin instead of the point "
+                        "at infinity, unweighted attention dot product, and the "
+                        "hand-crafted distance features. Conformal arm only.")
+    p.add_argument(
+        "--equivariance_group",
+        choices=["e3", "se3"],
+        default="se3",
+        help="Symmetry imposed by equivariant linear layers. 'e3' is de Haan "
+             "et al.'s published reflection-equivariant basis (20 CGA maps, "
+             "9 PGA maps). 'se3' drops reflections, allowing chirality "
+             "(40 CGA maps; default and used by corrected existing runs).",
+    )
+    p.add_argument(
+        "--invariant_output_head",
+        action="store_true",
+        default=False,
+        help="Return clustering coordinates and beta through GATr's scalar "
+             "output channels. This preserves the backbone's geometric "
+             "symmetry; the legacy unconstrained Linear(blades, outputs) "
+             "readout is retained only for old checkpoints.",
+    )
+
+    p.add_argument("--drop_loopers", action="store_true", default=False,
+                   help="Train on GGTF's target set: delete every particle "
+                        "whose hits span more than 1600/1600/2800 mm or that "
+                        "has fewer than 5 hits, hits included, before the "
+                        "network sees them (their remove_loopers). Truth-based, "
+                        "so it cannot be applied at inference; it exists to make "
+                        "the comparison to their numbers possible. Note it "
+                        "removes two thirds of pT > 1 GeV tracks and keeps three "
+                        "fifths of genuine multi-turn curlers, so it is a "
+                        "track-length cut rather than a curler cut -- see "
+                        "paper_adjustment_candidates/curler_question.md.")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Initialization and shuffling seed. The data split is "
+                        "set by --train_seeds/--val_seeds and is unaffected, so "
+                        "varying this measures run-to-run scatter at fixed data. "
+                        "42 was the hardcoded value every run so far used, so it "
+                        "is the default and seed 1 of any multi-seed comparison.")
+    p.add_argument("--fix_cga_null", action="store_true", default=False,
+                   help="Conformal only. Offset the drift sphere and wire plane "
+                        "along the point at infinity, inf = e- - e+, as their "
+                        "definitions require, rather than along e+ + e- = 2o, "
+                        "the origin. Without it the drift radius enters weighted "
+                        "by the hit's squared distance from the origin, the "
+                        "point-on-sphere test is not the sphere, and the drift "
+                        "embedding is not translation-covariant at all. Off by "
+                        "default so runs stay comparable to the existing "
+                        "checkpoints, which all trained with the error.")
+    p.add_argument("--fix_wire_dir", action="store_true", default=False,
+                   help="Build the wire direction as the detector does, "
+                        "(sin s sin a, -sin s cos a, cos s), so a stereo wire "
+                        "tilts azimuthally. The old slot ordering tilted it "
+                        "radially: a median 10.8 degrees off, up to 20.2, and "
+                        "not perpendicular to the drift direction the parquet "
+                        "carries. Affects every arm that reads the wire "
+                        "direction, which is conformal and "
+                        "--pga_hit_encoding line, but not 'ggtf', which takes "
+                        "the drift axis straight from left/right. Off by "
+                        "default so runs stay comparable to the existing "
+                        "checkpoints, which all trained with the error.")
+    p.add_argument("--two_channel_dc", action="store_true", default=False,
+                   help="Conformal only. Give every drift hit a grade-1 sphere "
+                        "channel alongside its grade-2 circle, so drift and "
+                        "vertex hits share a grade and the conformal inner "
+                        "product between them is the point-to-sphere distance "
+                        "that motivates the algebra. Doubles the input "
+                        "multivector channels and so costs a little capacity in "
+                        "the first layer only.")
+    p.add_argument("--equi_init", default="default",
+                   choices=["default", "identity_algebra"],
+                   help="Initialization of the equivariant linear layers. "
+                        "'default' is Kaiming-like over all basis maps; "
+                        "'identity_algebra' starts every channel pair as a "
+                        "multiple of the identity map, so the multivector "
+                        "structure is untouched at init. de Haan et al. App. C "
+                        "report the latter is best for C-GATr and the former "
+                        "best for the projective variants, so running "
+                        "Kaiming-like everywhere understates the conformal arm. "
+                        "Matched to 'default' layer by layer on random input, so "
+                        "the two are not confounded by a per-layer gain.")
+    p.add_argument("--merge_daughters", action="store_true", default=False,
+                   help="Reassign a daughter's hits to its parent when the "
+                        "parent also left hits (their fix_splitted_tracks). "
+                        "Runs before --drop_loopers, as in their pipeline.")
 
     p.add_argument("--qmin", type=float, default=0.1)
     p.add_argument("--attr_weight", type=float, default=1.0)
@@ -154,6 +326,15 @@ def parse_args():
     p.add_argument("--beta_suppress_weight", type=float, default=0.1)
     p.add_argument("--var_weight", type=float, default=0.3)
     p.add_argument("--var_warmup_epochs", type=int, default=2)
+    p.add_argument(
+        "--oc_mode", choices=["paper_hinge", "ggtf"], default="paper_hinge",
+        help="Repulsive branch of the hybrid OC formula. Both modes use the "
+             "HGCAL/GGTF logarithmic attraction. 'paper_hinge' uses Kieseler's "
+             "hinge repulsion and unsoftened charge; it is not the literal "
+             "quadratic-attraction paper loss. 'ggtf' uses GGTF's /1.01 charge "
+             "stabilization, Gaussian repulsion, and inverse nearest-track "
+             "truth-(eta,phi) repulsion weighting.",
+    )
 
     p.add_argument("--tbeta", type=float, default=0.1)
     p.add_argument("--td", type=float, default=0.2)
@@ -180,6 +361,48 @@ def parse_args():
         help="Shortcut: 1 epoch, 20 train batches, 5 val batches.",
     )
     p.add_argument(
+        "--legacy_variable_epoch_batches", action="store_true",
+        help="Let the epoch length wobble with the reshuffle, as every run before "
+             "2026-08-05 did. Only for reproducing those runs: it costs a validation "
+             "on any epoch that packs shorter than the first one (see FINDINGS.md M13).",
+    )
+    p.add_argument(
+        "--fix_particle_zero", action="store_true",
+        help="Stop treating mc_index 0 as noise. It is not noise: the dataset has no "
+             "unassociated hits at all, and index 0 is a real generator-status-1 "
+             "particle, charged in a fifth of events, leaving full tracks of a median "
+             "122 hits at a median 0.84 GeV. The default trains against them -- beta "
+             "suppressed, hits repelled from every object -- and drops 0.67%% of "
+             "targets. This moves the noise sentinel to -1, which no hit carries, so "
+             "they become targets and the noise class is empty. Off by default only to "
+             "keep the in-flight ladder internally comparable (FINDINGS.md M20).",
+    )
+    p.add_argument(
+        "--min_target_hits", type=int, default=0,
+        help="Relabel any particle with fewer than this many hits in its event as noise, "
+             "for the loss and for the validation metric alike. This is GGTF's "
+             "create_garbage_label(minNumHits=3), which they apply during graph "
+             "construction so their loss never sees a sub-3-hit target; we had it only in "
+             "the scorer, and so trained against 146.6 primaries an event where they train "
+             "against 33.2. Use 3 for parity with them. The hits are kept and only their "
+             "label changes -- removing them would be the looper filter, which is a "
+             "different thing (FINDINGS.md M23, M33). 0 disables, which is the pre-parity "
+             "behaviour of every run before 2026-08-08.",
+    )
+    p.add_argument(
+        "--secondaries_as_noise", action="store_true", default=False,
+        help="Relabel hits whose particle has gen_status == 0 as noise, matching "
+             "GGTF's create_garbage_label, which converts every "
+             "isProducedBySecondary hit to noise and drops all-secondary "
+             "particles. Our produced_by_secondary column is identically zero "
+             "because this production stores secondaries as their own "
+             "MCParticles with generatorStatus 0 rather than omitting them, so "
+             "the flag has to be derived from gen_status (FINDINGS.md M83). "
+             "Turning this on removes 42.5%% of targets and 31.9%% of target "
+             "hits from the objective (M81), making the task GGTF's rather than "
+             "ours. Off by default; the epoch-24 baseline trained without it.",
+    )
+    p.add_argument(
         "--max_time", default=None,
         help="Pass-through to L.Trainer(max_time=...). 'HH:MM:SS'.",
     )
@@ -199,8 +422,15 @@ def parse_args():
     p.add_argument(
         "--compile", action="store_true", default=False,
         help="torch.compile the model in-place (dynamic shapes). The xformers "
-             "attention is excluded from the graph; the rest fuses. ~1.5x faster, "
-             "numerically identical. State-dict keys are unchanged.",
+             "attention is excluded from the graph; the rest fuses. State-dict "
+             "keys are unchanged; speed and numerics must be gated per target.",
+    )
+    p.add_argument(
+        "--compile_mode",
+        choices=("default", "max-autotune-no-cudagraphs"),
+        default="default",
+        help="torch.compile mode. CUDAGraph modes are excluded because packed "
+             "event shapes are dynamic.",
     )
     p.add_argument(
         "--cpu_threads", type=int, default=4,
@@ -219,12 +449,29 @@ def make_loaders(args):
 
     print(f"Loading training data: seeds {tr_a}-{tr_b - 1}"
           f"  max_hits_per_event={max_hits}", flush=True)
+    ggtf_targets = dict(drop_loopers=args.drop_loopers,
+                        merge_daughters=args.merge_daughters,
+                        with_drift_dir=(
+                            args.algebra == "projective"
+                            and args.pga_hit_encoding in ("ggtf", "ggtf_wire")))
+    if any(ggtf_targets.values()):
+        print(f"GGTF regime / inputs: {ggtf_targets}", flush=True)
     train_ds = IDEAParquetDataset(args.data_dir, seed_range=(tr_a, tr_b),
-                                  max_hits_per_event=max_hits)
+                                  max_hits_per_event=max_hits,
+                                  with_time=args.use_time,
+                                  ggtf_loss=args.oc_mode == "ggtf",
+                                  min_target_hits=args.min_target_hits,
+                                  secondaries_as_noise=args.secondaries_as_noise,
+                                  **ggtf_targets)
     print(f"Loading validation data: seeds {va_a}-{va_b - 1}"
           f"  max_hits_per_event={max_hits}", flush=True)
     val_ds = IDEAParquetDataset(args.data_dir, seed_range=(va_a, va_b),
-                                max_hits_per_event=max_hits)
+                                max_hits_per_event=max_hits,
+                                with_time=args.use_time,
+                                ggtf_loss=args.oc_mode == "ggtf",
+                                min_target_hits=args.min_target_hits,
+                                secondaries_as_noise=args.secondaries_as_noise,
+                                **ggtf_targets)
 
     _pin = os.environ.get("CGATR_PIN_MEMORY", "1") not in ("0", "false", "False")
     base_kwargs = dict(
@@ -247,10 +494,19 @@ def make_loaders(args):
         train_sampler = TokenBudgetBatchSampler(
             train_ds, max_tokens=args.max_tokens,
             shuffle=True, drop_last=True,
+            stable_epoch_length=not args.legacy_variable_epoch_batches,
         )
+        # The sampler sorts by event size before packing. With shuffle=False,
+        # Lightning's --limit_val_batches takes only the smallest events: for
+        # the production gate, 1,564/5,000 events with median 2,202 rather than
+        # 3,725 hits. Enable the sampler's deterministic bucket shuffle so a
+        # limited validation pass spans the event-size distribution. The val
+        # sampler is never advanced by _BatchSamplerEpochCallback, so this
+        # subset remains fixed across epochs and across matched runs.
         val_sampler = TokenBudgetBatchSampler(
             val_ds, max_tokens=args.max_tokens,
-            shuffle=False, drop_last=False,
+            shuffle=True, drop_last=False,
+            stable_epoch_length=False,
         )
         train_loader = DataLoader(
             train_ds, batch_sampler=train_sampler, **base_kwargs,
@@ -320,18 +576,38 @@ class _EpochCSVCallback(Callback):
         self._train_wall = 0.0
         self._val_wall = 0.0
         self._initialised = False
+        # Lightning does not validate every epoch here, and when it does not,
+        # `trainer.callback_metrics` still holds the previous epoch's values -- so the row
+        # written below was silently a copy of the one above it. Every completed 8-epoch
+        # run has exactly that: epochs 4 and 7 duplicate 3 and 6, wall-clock included, in
+        # all six arms, deterministically. The mechanism is that Lightning derives its
+        # end-of-epoch validation trigger from the *first* epoch's batch count, while the
+        # token-budget sampler reshuffles each epoch and some epochs come out a batch
+        # short, so the trigger is never reached. See FINDINGS.md.
+        #
+        # Tracked explicitly rather than inferred from equal values, so the record says
+        # "not measured" instead of inventing a measurement.
+        self._validated_this_epoch = False
 
     def _init_file(self):
+        # Append, and write the header only into a file that does not yet have one. Opening
+        # "w" here truncated the record every time a run resumed from a checkpoint: v2_b_time
+        # came back from the crash at epoch 5 and lost epochs 1-4, which then read as a
+        # 4-of-8 run to the launcher's completion guard and stopped the whole queue on a
+        # healthy result. The rows are the experiment record, and a resume must extend it.
         os.makedirs(os.path.dirname(self.csv_path) or ".", exist_ok=True)
-        with open(self.csv_path, "w") as f:
-            f.write(
-                "run,epoch,mean_train_loss,val_loss,val_match_loose,"
-                "val_match_strict50,wall_s_train,wall_s_val,lr,world_size,timestamp\n"
-            )
+        fresh = not os.path.exists(self.csv_path) or os.path.getsize(self.csv_path) == 0
+        if fresh:
+            with open(self.csv_path, "w") as f:
+                f.write(
+                    "run,epoch,mean_train_loss,val_loss,val_match_loose,"
+                    "val_match_strict50,wall_s_train,wall_s_val,lr,world_size,timestamp\n"
+                )
         self._initialised = True
 
     def on_train_epoch_start(self, trainer, pl_module):
         self._train_t0 = time.perf_counter()
+        self._validated_this_epoch = False
 
     def on_validation_epoch_start(self, trainer, pl_module):
         if trainer.sanity_checking:
@@ -344,6 +620,7 @@ class _EpochCSVCallback(Callback):
         if trainer.sanity_checking:
             return
         self._val_wall = time.perf_counter() - self._val_t0
+        self._validated_this_epoch = True
 
     def on_train_epoch_end(self, trainer, pl_module):
         if not trainer.is_global_zero:
@@ -351,10 +628,24 @@ class _EpochCSVCallback(Callback):
         if not self._initialised:
             self._init_file()
         m = trainer.callback_metrics
-        train_loss = float(m.get("train_loss", float("nan")))
-        val_loss = float(m.get("val_loss", float("nan")))
-        loose = float(m.get("val/match_rate", float("nan")))
-        strict50 = float(m.get("val/match_rate_strict50", float("nan")))
+        nan = float("nan")
+        if self._validated_this_epoch:
+            train_loss = float(m.get("train_loss", nan))
+            val_loss = float(m.get("val_loss", nan))
+            loose = float(m.get("val/match_rate", nan))
+            strict50 = float(m.get("val/match_rate_strict50", nan))
+            val_wall = self._val_wall
+        else:
+            # No validation this epoch, so nothing in callback_metrics is this epoch's.
+            # `train_loss` included: its all-reduce lives in the module's
+            # on_validation_epoch_end, so it too is last epoch's value. The training
+            # statistics themselves are fine -- the accumulators are reset in
+            # on_train_epoch_start regardless, so no epoch's mean is contaminated by
+            # another; it is only that this epoch's mean is never computed. Recorded as
+            # missing rather than duplicated, so readers must tolerate blank columns.
+            train_loss = val_loss = loose = strict50 = nan
+            val_wall = nan
+            self._train_wall = time.perf_counter() - self._train_t0
         lr = trainer.optimizers[0].param_groups[0]["lr"]
         ts = time.strftime("%Y-%m-%dT%H:%M:%S")
         with open(self.csv_path, "a") as f:
@@ -362,14 +653,15 @@ class _EpochCSVCallback(Callback):
                 f"{self.run_tag},{pl_module.current_epoch + 1},"
                 f"{train_loss:.6f},{val_loss:.6f},"
                 f"{loose:.6f},{strict50:.6f},"
-                f"{self._train_wall:.3f},{self._val_wall:.3f},"
+                f"{self._train_wall:.3f},{val_wall:.3f},"
                 f"{lr:.6e},{self.world_size},{ts}\n"
             )
         print(
             f"[csv] epoch {pl_module.current_epoch + 1}: "
             f"train={train_loss:.4f} val={val_loss:.4f} "
             f"loose={loose:.4f} strict50={strict50:.4f} "
-            f"train_s={self._train_wall:.1f} val_s={self._val_wall:.1f}",
+            f"train_s={self._train_wall:.1f} val_s={val_wall:.1f}"
+            + ("" if self._validated_this_epoch else "   [no validation this epoch]"),
             flush=True,
         )
 
@@ -378,16 +670,19 @@ def main():
     args = parse_args()
 
     torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
+    # TF32 MUST stay off: its 10-bit mantissa breaks the geometric-product
+    # precision the Pin(4,1)-equivariance relies on. No-op on V100 (Volta has
+    # no TF32), but critical on A100/H100 where TF32 is otherwise used.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
     if args.cpu_threads > 0:
         torch.set_num_threads(args.cpu_threads)
         os.environ.setdefault("OMP_NUM_THREADS", str(args.cpu_threads))
         os.environ.setdefault("POLARS_MAX_THREADS", str(args.cpu_threads))
         os.environ.setdefault("MKL_NUM_THREADS", str(args.cpu_threads))
 
-    L.seed_everything(42, workers=True)
+    L.seed_everything(args.seed, workers=True)
 
     if args.dry_run:
         _apply_dry_run(args)
@@ -402,9 +697,12 @@ def main():
         # In-place compile: preserves module identity + state_dict keys, so
         # checkpoints stay compatible. The xformers attention graph-breaks
         # (decorated with torch._dynamo.disable); everything else fuses.
-        module.model.compile(dynamic=True)
-        print("[cgatr_fcc] torch.compile enabled (dynamic=True, attention excluded)",
-              flush=True)
+        module.model.compile(dynamic=True, mode=args.compile_mode)
+        print(
+            "[cgatr_fcc] torch.compile enabled "
+            f"(dynamic=True, mode={args.compile_mode}, attention excluded)",
+            flush=True,
+        )
 
     os.makedirs(args.output_dir, exist_ok=True)
 

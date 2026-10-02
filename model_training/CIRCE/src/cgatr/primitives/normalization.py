@@ -4,9 +4,16 @@ import torch
 
 from src.cgatr.primitives.invariants import inner_product
 
-# Contiguous blade-index ranges per grade for CGA Cl(4,1) (grades 0..5;
-# dims 1,5,10,10,5,1). From cga_metadata.pt grade_ranges.
-_GRADE_RANGES = ((0, 1), (1, 6), (6, 16), (16, 26), (26, 31), (31, 32))
+# Contiguous blade-index ranges per grade, keyed by blade count. The grade
+# partition is a property of the algebra, so the blade count identifies it
+# unambiguously for the two algebras in play and saves threading it through
+# every layer.
+#   32 -> CGA Cl(4,1),    grades 0..5, dims 1,5,10,10,5,1
+#   16 -> PGA Cl(3,0,1),  grades 0..4, dims 1,4,6,4,1
+_GRADE_RANGES_BY_BLADES = {
+    32: ((0, 1), (1, 6), (6, 16), (16, 26), (26, 31), (31, 32)),
+    16: ((0, 1), (1, 5), (5, 11), (11, 15), (15, 16)),
+}
 
 
 def equi_layer_norm(
@@ -16,6 +23,7 @@ def equi_layer_norm(
     gain: float = 1.0,
     epsilon: float = 0.01,
     gradewise: bool = False,
+    epsilon_mode: str = "clamp",
 ) -> torch.Tensor:
     """Equivariant LayerNorm using CGA inner product.
 
@@ -35,6 +43,9 @@ def equi_layer_norm(
         multivectors from +/- grade cancellation that otherwise let coefficients
         grow by 1/sqrt(epsilon) each layer. If False (default), uses the
         whole-multivector abs(<x,x>) (the paper intermediate, less stable).
+    epsilon_mode : {"clamp", "add"}
+        ``clamp`` reproduces the released GATr code, ``max(norm², epsilon)``.
+        ``add`` follows the literal C-GATr equation, ``norm² + epsilon``.
 
     Returns
     -------
@@ -43,7 +54,7 @@ def equi_layer_norm(
     if gradewise:
         wsq = ip_weights.to(x.dtype) * x * x  # (..., channels, 32)
         squared_norms = None
-        for a, b in _GRADE_RANGES:
+        for a, b in _GRADE_RANGES_BY_BLADES[x.shape[-1]]:
             g = wsq[..., a:b].sum(dim=-1, keepdim=True).abs()  # (..., channels, 1)
             squared_norms = g if squared_norms is None else squared_norms + g
     else:
@@ -51,6 +62,11 @@ def equi_layer_norm(
         # Take absolute value since CGA inner product can be negative
         squared_norms = torch.abs(squared_norms)
     squared_norms = torch.mean(squared_norms, dim=channel_dim, keepdim=True)
-    squared_norms = torch.clamp(squared_norms, epsilon)
+    if epsilon_mode == "clamp":
+        squared_norms = torch.clamp(squared_norms, min=epsilon)
+    elif epsilon_mode == "add":
+        squared_norms = squared_norms + epsilon
+    else:
+        raise ValueError(f"unknown LayerNorm epsilon mode: {epsilon_mode!r}")
     outputs = gain * x / torch.sqrt(squared_norms)
     return outputs

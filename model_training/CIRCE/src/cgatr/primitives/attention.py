@@ -20,16 +20,22 @@ from einops import rearrange
 from torch import Tensor, nn
 from torch.nn.functional import scaled_dot_product_attention
 
-from src.gatr_v111.utils.tensors import to_nd
+
+def to_nd(tensor: Tensor, d: int) -> Tensor:
+    """Prepend singleton dimensions until `tensor` has dimension `d`."""
+    while len(tensor.shape) < d:
+        tensor = tensor.unsqueeze(0)
+    return tensor
 
 # Optional xformers memory-efficient attention. Used for the packed-batch
 # training path: it is block-sparse and O(M) in memory (never materialises the
-# M x M score matrix), and it handles this model's large per-head feature dim
-# (~640). SDPA — which falls back to the O(M^2) MATH backend for that head dim —
+# M x M score matrix), and it handles this model's large per-head feature dim.
+# SDPA — which falls back to the O(M^2) MATH backend for that head dim —
 # is kept as the fallback and for single-event eval / ONNX export.
 try:
     import xformers.ops as _xops
     from xformers.ops.fmha import BlockDiagonalMask as _BlockDiagonalMask
+
     _HAS_XFORMERS = True
 except Exception:  # pragma: no cover - xformers optional
     _HAS_XFORMERS = False
@@ -57,10 +63,8 @@ def block_diagonal_bool_mask(seq_lens, device, M=None):
     if M is None:
         M = int(sum(seq_lens))
     lens = torch.as_tensor(seq_lens, device=device, dtype=torch.long)
-    event_id = torch.repeat_interleave(
-        torch.arange(lens.numel(), device=device), lens
-    )
-    mask = (event_id[:, None] == event_id[None, :])  # (M, M) bool
+    event_id = torch.repeat_interleave(torch.arange(lens.numel(), device=device), lens)
+    mask = event_id[:, None] == event_id[None, :]  # (M, M) bool
     return mask[None, None]  # (1, 1, M, M) broadcasts over batch and heads
 
 
@@ -99,7 +103,55 @@ def _build_dist_basis(device, dtype) -> Tuple[Tensor, Tensor]:
     return basis_q, basis_k
 
 
-def _build_dist_vec(tri: Tensor, basis: Tensor, normalizer: Callable[[Tensor], Tensor], device=None) -> Tensor:
+def pga_distance_features(
+    tri: Tensor, normalizer: Callable[[Tensor], Tensor], query: bool
+) -> Tensor:
+    """GATr's distance-aware query/key features for the projective algebra.
+
+    Brehmer et al. arXiv:2305.18415 App. B. The trivector is first rescaled by
+    w(q0), where q0 is its homogeneous weight and w(x) = x / (x^2 + eps); the
+    features are then quadratic in the rescaled components qv,
+
+        phi(q) = (q0^2, |qv|^2,  q0 qv)
+        psi(k) = (-|kv|^2, -k0^2, 2 k0 kv)
+
+    so that phi(q).psi(k) = -||k0 qv - q0 kv||^2 = -||xq - xk||^2, the negative
+    squared Euclidean distance between the points the trivectors represent.
+    This is needed because the projective inner product is provably constant in
+    point coordinates (de Haan et al. Prop. 3), so without it attention cannot
+    see positions at all. The conformal algebra needs no such construction.
+
+    The rescaling must happen before the quadratic, not after: the homogeneous
+    weight is gauge, and only w(q0)^2 q0^2 -> 1 divides it back out. Applying
+    w once instead leaves the logit proportional to q0 k0, which is the
+    distance times an arbitrary learnable factor rather than the distance.
+    `src/eval/verify_distance_features.py` pins this against the reference.
+
+    Parameters
+    ----------
+    tri : Tensor (..., channels, 4)
+        Trivector components, homogeneous weight first.
+    query : bool
+        Selects phi (True) or psi (False).
+
+    Returns
+    -------
+    features : Tensor (..., channels, 5)
+    """
+    tri = tri * normalizer(tri[..., :1])
+    w0 = tri[..., :1]
+    wv = tri[..., 1:]
+    sq_v = wv.pow(2).sum(-1, keepdim=True)
+    if query:
+        parts = [w0.pow(2), sq_v, w0 * wv]
+    else:
+        parts = [-sq_v, -w0.pow(2), 2.0 * w0 * wv]
+    return torch.cat(parts, dim=-1)
+
+
+def _build_dist_vec(
+    tri: Tensor, basis: Tensor, normalizer: Callable[[Tensor], Tensor], device=None
+) -> Tensor:
     """Build distance feature vector.
 
     Parameters
@@ -146,14 +198,41 @@ class geometric_attention(nn.Module):
     dispatch in `forward` for details.
     """
 
-    def __init__(self, basis_q, basis_k,
-                 num_mv_channels_qk=None, num_s_channels_qk=None,
-                 num_mv_channels_v=None, num_s_channels_v=None):
+    def __init__(
+        self,
+        basis_q,
+        basis_k,
+        num_mv_channels_qk=None,
+        num_s_channels_qk=None,
+        num_mv_channels_v=None,
+        num_s_channels_v=None,
+        grade1_idx=None,
+        ip_idx=None,
+        num_blades=32,
+        ip_weights=None,
+        pga_dist_idx=None,
+    ):
         super().__init__()
+        # basis_q/basis_k None disables the legacy conformal distance features.
         self.register_buffer("basis_q", basis_q)
         self.register_buffer("basis_k", basis_k)
-        self._GRADE1_IDX = _GRADE1_IDX
-        self._INNER_PRODUCT_WO_EXTREMES_IDX = _INNER_PRODUCT_WO_EXTREMES_IDX
+        self.use_dist = basis_q is not None
+        self.num_blades = num_blades
+        self._GRADE1_IDX = grade1_idx if grade1_idx is not None else _GRADE1_IDX
+        self._INNER_PRODUCT_WO_EXTREMES_IDX = (
+            ip_idx if ip_idx is not None else _INNER_PRODUCT_WO_EXTREMES_IDX
+        )
+        # Metric weights turn the dot product into the invariant inner product.
+        # Folded into the query side only, which keeps the whole score a single
+        # Euclidean dot product and so keeps the fast attention kernels usable.
+        self.register_buffer(
+            "ip_weights",
+            None if ip_weights is None
+            else torch.as_tensor(ip_weights, dtype=torch.float32),
+        )
+        # Projective distance-aware attention (GATr App. B).
+        self._PGA_DIST_IDX = pga_dist_idx
+        self.use_pga_dist = pga_dist_idx is not None
         self.num_mv_channels_qk = num_mv_channels_qk
         self.num_s_channels_qk = num_s_channels_qk
         self.num_mv_channels_v = num_mv_channels_v
@@ -210,69 +289,121 @@ class geometric_attention(nn.Module):
         # so the channel arithmetic below is pure Python and doesn't
         # trip the tracer.  Fall back to `.shape[-]` for legacy callers.
         num_mv_channels_v = (
-            self.num_mv_channels_v if self.num_mv_channels_v is not None
+            self.num_mv_channels_v
+            if self.num_mv_channels_v is not None
             else v_mv.shape[-2]
         )
         num_s_channels_v = (
-            self.num_s_channels_v if self.num_s_channels_v is not None
+            self.num_s_channels_v
+            if self.num_s_channels_v is not None
             else v_s.shape[-1]
         )
         num_mv_channels_qk = (
-            self.num_mv_channels_qk if self.num_mv_channels_qk is not None
+            self.num_mv_channels_qk
+            if self.num_mv_channels_qk is not None
             else q_mv.shape[-2]
         )
         num_s_channels_qk = (
-            self.num_s_channels_qk if self.num_s_channels_qk is not None
+            self.num_s_channels_qk
+            if self.num_s_channels_qk is not None
             else q_s.shape[-1]
         )
 
         device = q_mv.device
         dtype = q_mv.dtype
 
-        # Extract grade-1 components for distance computation
-        q_g1 = q_mv[..., _GRADE1_IDX]  # (..., channels, 5)
-        k_g1 = k_mv[..., _GRADE1_IDX]
+        if self.use_dist:
+            # Extract grade-1 components for distance computation
+            q_g1 = q_mv[..., self._GRADE1_IDX]  # (..., channels, 5)
+            k_g1 = k_mv[..., self._GRADE1_IDX]
 
-        q_dist = _build_dist_vec(q_g1, self.basis_q, normalizer, device=device)
-        k_dist = _build_dist_vec(k_g1, self.basis_k, normalizer, device=device)
+            q_dist = _build_dist_vec(q_g1, self.basis_q, normalizer, device=device)
+            k_dist = _build_dist_vec(k_g1, self.basis_k, normalizer, device=device)
 
-        if weights is not None:
-            q_dist = q_dist * weights[..., None].to(q_dist.dtype)
+            if weights is not None:
+                q_dist = q_dist * weights[..., None].to(q_dist.dtype)
+        elif self.use_pga_dist:
+            q_dist = pga_distance_features(
+                q_mv[..., self._PGA_DIST_IDX], normalizer, query=True)
+            k_dist = pga_distance_features(
+                k_mv[..., self._PGA_DIST_IDX], normalizer, query=False)
+            if weights is not None:
+                q_dist = q_dist * weights[..., None].to(q_dist.dtype)
+        else:
+            q_dist = k_dist = None
+        use_dist = self.use_dist or self.use_pga_dist
 
-        # Extract grade 1-4 components for inner product attention (30 components)
-        q_mv_ip = q_mv[..., _INNER_PRODUCT_WO_EXTREMES_IDX]
-        k_mv_ip = k_mv[..., _INNER_PRODUCT_WO_EXTREMES_IDX]
+        q_mv_ip = q_mv[..., self._INNER_PRODUCT_WO_EXTREMES_IDX]
+        k_mv_ip = k_mv[..., self._INNER_PRODUCT_WO_EXTREMES_IDX]
+        if self.ip_weights is not None:
+            q_mv_ip = q_mv_ip * self.ip_weights.to(q_mv_ip.dtype)
 
         # Compute channel dimensions
-        num_ip_components = len(_INNER_PRODUCT_WO_EXTREMES_IDX)  # 30
-        num_dist_features = 6  # from _build_dist_basis
-        num_channels_qk = num_mv_channels_qk * (num_ip_components + num_dist_features) + num_s_channels_qk
-        num_channels_v = num_mv_channels_v * 32 + num_s_channels_v
+        num_ip_components = len(self._INNER_PRODUCT_WO_EXTREMES_IDX)
+        num_dist_features = (
+            self.basis_q.shape[-1] if self.use_dist
+            else (5 if self.use_pga_dist else 0)
+        )
+        num_channels_qk = (
+            num_mv_channels_qk * (num_ip_components + num_dist_features)
+            + num_s_channels_qk
+        )
+        num_channels_v = num_mv_channels_v * self.num_blades + num_s_channels_v
         num_channels = max(num_channels_qk, num_channels_v)
         num_channels = 8 * -(-num_channels // 8)  # Ceil to multiple of 8
 
         # Build queries
         a = rearrange(q_mv_ip, "... c x -> ... (c x)")
-        b = rearrange(q_dist, "... c d -> ... (c d)")
-        q = torch.cat([
-            a, b, q_s,
-            torch.zeros(*q_s.shape[:3], num_channels - num_channels_qk, device=device, dtype=dtype),
-        ], -1)
+        b = (rearrange(q_dist, "... c d -> ... (c d)") if use_dist
+             else a[..., :0])
+        q = torch.cat(
+            [
+                a,
+                b,
+                q_s,
+                torch.zeros(
+                    *q_s.shape[:3],
+                    num_channels - num_channels_qk,
+                    device=device,
+                    dtype=dtype,
+                ),
+            ],
+            -1,
+        )
 
         # Build keys
         a_k = rearrange(k_mv_ip, "... c x -> ... (c x)")
-        b_k = rearrange(k_dist, "... c d -> ... (c d)")
-        k = torch.cat([
-            a_k, b_k, k_s,
-            torch.zeros(*k_s.shape[:3], num_channels - num_channels_qk, device=device, dtype=dtype),
-        ], -1)
+        b_k = (rearrange(k_dist, "... c d -> ... (c d)") if use_dist
+               else a_k[..., :0])
+        k = torch.cat(
+            [
+                a_k,
+                b_k,
+                k_s,
+                torch.zeros(
+                    *k_s.shape[:3],
+                    num_channels - num_channels_qk,
+                    device=device,
+                    dtype=dtype,
+                ),
+            ],
+            -1,
+        )
 
         # Build values
-        v = torch.cat([
-            rearrange(v_mv, "... c x -> ... (c x)"),
-            v_s,
-            torch.zeros(*v_s.shape[:3], num_channels - num_channels_v, device=device, dtype=dtype),
-        ], -1)
+        v = torch.cat(
+            [
+                rearrange(v_mv, "... c x -> ... (c x)"),
+                v_s,
+                torch.zeros(
+                    *v_s.shape[:3],
+                    num_channels - num_channels_v,
+                    device=device,
+                    dtype=dtype,
+                ),
+            ],
+            -1,
+        )
 
         # Scale keys to correct for zero padding
         k = k * math.sqrt(num_channels / num_channels_qk)
@@ -313,14 +444,24 @@ class geometric_attention(nn.Module):
                 # xformers wants (B, M, H, K). q is (.., H, M, C); k/v are
                 # (.., 1, M, C) under multi-query -> broadcast to H heads.
                 qx = q.reshape(Hq, M, C).permute(1, 0, 2).unsqueeze(0).contiguous()
-                kx = (k.reshape(k.shape[-3], M, C).permute(1, 0, 2)
-                      .unsqueeze(0).expand(1, M, Hq, C))
-                vx = (v.reshape(v.shape[-3], M, v.shape[-1]).permute(1, 0, 2)
-                      .unsqueeze(0).expand(1, M, Hq, v.shape[-1]))
+                kx = (
+                    k.reshape(k.shape[-3], M, C)
+                    .permute(1, 0, 2)
+                    .unsqueeze(0)
+                    .expand(1, M, Hq, C)
+                )
+                vx = (
+                    v.reshape(v.shape[-3], M, v.shape[-1])
+                    .permute(1, 0, 2)
+                    .unsqueeze(0)
+                    .expand(1, M, Hq, v.shape[-1])
+                )
                 bias = _BlockDiagonalMask.from_seqlens(seq_lens)
                 ox = _xops.memory_efficient_attention(qx, kx, vx, attn_bias=bias)
                 # (1, M, H, Cv) -> (.., H, M, Cv)
-                v_out = ox.squeeze(0).permute(1, 0, 2).reshape(*q.shape[:-1], v.shape[-1])
+                v_out = (
+                    ox.squeeze(0).permute(1, 0, 2).reshape(*q.shape[:-1], v.shape[-1])
+                )
             elif len(seq_lens) <= 1:
                 v_out = scaled_dot_product_attention(q, k, v)
             else:
@@ -332,13 +473,21 @@ class geometric_attention(nn.Module):
                 for n in seq_lens:
                     sl = slice(off, off + n)
                     off += n
-                    outs.append(scaled_dot_product_attention(
-                        q[..., sl, :], k[..., sl, :], v[..., sl, :]))
+                    outs.append(
+                        scaled_dot_product_attention(
+                            q[..., sl, :], k[..., sl, :], v[..., sl, :]
+                        )
+                    )
                 v_out = torch.cat(outs, dim=-2)
 
         # Split output
-        v_out_mv = rearrange(v_out[..., :num_mv_channels_v * 32], "... (c x) -> ... c x", x=32)
-        v_out_s = v_out[..., num_mv_channels_v * 32:num_mv_channels_v * 32 + num_s_channels_v]
+        nb = self.num_blades
+        v_out_mv = rearrange(
+            v_out[..., : num_mv_channels_v * nb], "... (c x) -> ... c x", x=nb
+        )
+        v_out_s = v_out[
+            ..., num_mv_channels_v * nb : num_mv_channels_v * nb + num_s_channels_v
+        ]
 
         v_out_mv = v_out_mv.view(*bh_shape, *v_out_mv.shape[-3:])
         v_out_s = v_out_s.view(*bh_shape, *v_out_s.shape[-2:])

@@ -1,11 +1,13 @@
 """QKV computation for CGA self-attention with 32-dim multivectors."""
 
+import os
+
 import torch
 from einops import rearrange
 from torch import nn
 
 from src.cgatr.layers.attention.config import SelfAttentionConfig
-from src.cgatr.layers.linear import EquiLinear
+from src.cgatr.layers.linear import EquiLinear, fused_equi_linear_same_input
 
 
 class MultiQueryQKVModule(nn.Module):
@@ -45,6 +47,8 @@ class MultiQueryQKVModule(nn.Module):
         )
 
         self.config = config
+        fused = os.environ.get("CGATR_FUSED_PROJECTIONS", "").strip().lower()
+        self._use_fused = fused in ("1", "true", "yes")
 
     def forward(self, inputs, scalars, additional_qk_features_mv=None, additional_qk_features_s=None):
         """Forward pass.
@@ -63,9 +67,22 @@ class MultiQueryQKVModule(nn.Module):
         else:
             qk_scalars = scalars
 
-        q_mv, q_s = self.q_linear(qk_inputs, qk_scalars)
-        k_mv, k_s = self.k_linear(qk_inputs, qk_scalars)
-        v_mv, v_s = self.v_linear(inputs, scalars)
+        if (
+            self._use_fused
+            and additional_qk_features_mv is None
+            and additional_qk_features_s is None
+        ):
+            (q_mv, q_s), (k_mv, k_s), (v_mv, v_s) = (
+                fused_equi_linear_same_input(
+                    (self.q_linear, self.k_linear, self.v_linear),
+                    inputs,
+                    scalars,
+                )
+            )
+        else:
+            q_mv, q_s = self.q_linear(qk_inputs, qk_scalars)
+            k_mv, k_s = self.k_linear(qk_inputs, qk_scalars)
+            v_mv, v_s = self.v_linear(inputs, scalars)
 
         # Rearrange Q to (..., heads, items, channels, 32)
         q_mv = rearrange(

@@ -46,6 +46,8 @@ class GeoMLP(nn.Module):
                     out_mv_channels=config.mv_channels[1],
                     in_s_channels=s_channels[0],
                     out_s_channels=s_channels[1],
+                    use_join=config.use_join,
+                    pseudoscalar_idx=config.pseudoscalar_idx,
                 )
             )
             if config.dropout_prob is not None:

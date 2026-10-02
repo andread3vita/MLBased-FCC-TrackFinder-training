@@ -45,6 +45,22 @@ class SelfAttentionConfig:
     checkpoint: bool = True
     increase_hidden_channels: int = 2
     dropout_prob: Optional[float] = None
+    # Blade layout. Defaults describe Cl(4,1); the projective arm overrides them.
+    grade1_idx: Optional[list] = None
+    ip_idx: Optional[list] = None
+    num_blades: int = 32
+    # Metric weights for the attention inner product, aligned with `ip_idx`. The
+    # geometric-algebra inner product is <x~ y>_0 = sum_i w_i x_i y_i, so an
+    # unweighted dot product is only invariant when every w_i is +1. That holds
+    # for the projective blades without e0 -- the shortcut GATr takes -- but not
+    # in the conformal algebra, whose metric carries sixteen minus signs. None
+    # reproduces the unweighted behaviour.
+    ip_weights: Optional[list] = None
+    # Trivector blade indices (homogeneous weight first) for GATr's
+    # distance-aware attention features. Projective algebra only: the conformal
+    # inner product already measures distance, the projective one provably
+    # cannot. See de Haan et al. Prop. 3.
+    pga_dist_idx: Optional[list] = None
 
     def __post_init__(self):
         if isinstance(self.dropout_prob, str) and self.dropout_prob.lower() in ["null", "none"]:

@@ -95,13 +95,25 @@ def dual(x: torch.Tensor) -> torch.Tensor:
 
 
 class equivariant_join(nn.Module):
-    """Equivariant join: dual(outer_product(dual(x), dual(y))) * reference_pseudoscalar."""
+    """Equivariant join: dual(outer_product(dual(x), dual(y))).
 
-    def __init__(self, outer) -> None:
+    The reference pseudoscalar is optional. It exists only to fix the sign under
+    reflections, since the pseudoscalar flips under parity; the join is already
+    SE(3)-equivariant without it. We default to omitting it for two reasons: this
+    model deliberately drops parity equivariance anyway (a solenoidal B-field
+    makes tracking chiral, see the linear-basis construction), and the reference
+    we can actually form here — a mean over inputs that are points and lines —
+    has an identically-zero pseudoscalar component, which would silently zero the
+    whole branch.
+    """
+
+    def __init__(self, outer, pseudoscalar_idx: int = 31) -> None:
         super().__init__()
         self.register_buffer("outer", outer)
+        self.pseudoscalar_idx = pseudoscalar_idx
 
-    def forward(self, x, y, reference):
-        # reference[..., [31]] is the pseudoscalar component (grade 5, index 31)
-        ref_ps = reference[..., [31]]
-        return ref_ps * dual(outer_product(self.outer, dual(x), dual(y)))
+    def forward(self, x, y, reference=None):
+        joined = dual(outer_product(self.outer, dual(x), dual(y)))
+        if reference is None:
+            return joined
+        return reference[..., [self.pseudoscalar_idx]] * joined

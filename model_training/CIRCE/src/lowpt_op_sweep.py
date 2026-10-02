@@ -102,10 +102,15 @@ def cache_from_dataframe(df: pl.DataFrame, embed_dim: int) -> list[dict]:
     per-event entries with numpy arrays.
     """
     coord_cols = [f"coord_{d}" for d in range(embed_dim)]
+    # Detector positions are optional: only geometric post-processing needs them,
+    # and caches written before that was added do not carry them.
+    pos_cols = [c for c in ("pos_x", "pos_y", "pos_z") if c in df.columns]
+    has_pos = len(pos_cols) == 3
     cache: list[dict] = []
     by_event = df.group_by(["seed", "event_id"], maintain_order=True).agg(
         [pl.col(c) for c in coord_cols]
         + [pl.col("beta"), pl.col("mc_index"), pl.col("n_hits_total")]
+        + [pl.col(c) for c in pos_cols]
     )
     for row in by_event.iter_rows(named=True):
         coords = np.stack([np.asarray(row[c], dtype=np.float32) for c in coord_cols], axis=1)
@@ -113,14 +118,18 @@ def cache_from_dataframe(df: pl.DataFrame, embed_dim: int) -> list[dict]:
         mc = np.asarray(row["mc_index"], dtype=np.int64)
         nht = np.asarray(row["n_hits_total"], dtype=np.int64)
         n_hits_total_map = {int(m): int(n) for m, n in zip(mc, nht)}
-        cache.append({
+        entry = {
             "event_id": int(row["event_id"]),
             "seed": int(row["seed"]),
             "sig_coords": coords,
             "sig_beta": beta,
             "sig_mc": mc,
             "n_hits_total_map": n_hits_total_map,
-        })
+        }
+        if has_pos:
+            entry["sig_pos"] = np.stack(
+                [np.asarray(row[c], dtype=np.float32) for c in pos_cols], axis=1)
+        cache.append(entry)
     return cache
 
 

@@ -29,6 +29,7 @@ def embed_circle_ipns(
     wire_dir: torch.Tensor,
     drift_radius: torch.Tensor,
     op_table: torch.Tensor,
+    fix_null: bool = False,
 ) -> torch.Tensor:
     """Embed a drift chamber circle as IPNS grade-2 bivector: C = S ∧ π.
 
@@ -42,17 +43,20 @@ def embed_circle_ipns(
         Drift distance / radius.
     op_table : torch.Tensor (32, 32, 32)
         Outer product Cayley table.
+    fix_null : bool
+        Offset the sphere and plane along the point at infinity, as their
+        definitions require, rather than along the origin. Only then does the
+        circle mean what it claims and transform covariantly under translation.
+        See `src/cgatr/interface/sphere.py`. False reproduces the behaviour every
+        conformal checkpoint was trained with.
 
     Returns
     -------
     circle : torch.Tensor (..., 32)
         IPNS circle (grade-2 bivector).
     """
-    # Drift sphere: S = P(wire_center) - (ρ²/2)·e∞
-    S = embed_sphere(wire_pos, drift_radius)  # grade-1
-
-    # Constraint plane: π = wire_dir + (wire_dir·wire_pos)·e∞
-    pi = embed_plane(wire_dir, wire_pos)  # grade-1
+    S = embed_sphere(wire_pos, drift_radius, fix_null=fix_null)  # grade-1
+    pi = embed_plane(wire_dir, wire_pos, fix_null=fix_null)  # grade-1
 
     # Circle = S ∧ π (single outer product → grade-2 bivector)
     S_ex = S.unsqueeze(-2)   # (..., 1, 32)
@@ -67,6 +71,7 @@ def embed_dc_two_channel(
     wire_dir: torch.Tensor,
     drift_radius: torch.Tensor,
     op_table: torch.Tensor,
+    fix_null: bool = False,
 ) -> torch.Tensor:
     """Two-channel DC embedding: sphere (grade-1) + circle (grade-2).
 
@@ -82,8 +87,9 @@ def embed_dc_two_channel(
     mv : torch.Tensor (..., 2, 32)
         Two-channel multivector.
     """
-    sphere = embed_sphere(wire_pos, drift_radius)  # (..., 32) grade-1
-    circle = embed_circle_ipns(wire_pos, wire_dir, drift_radius, op_table)  # (..., 32) grade-2
+    sphere = embed_sphere(wire_pos, drift_radius, fix_null=fix_null)  # grade-1
+    circle = embed_circle_ipns(wire_pos, wire_dir, drift_radius, op_table,
+                               fix_null=fix_null)  # grade-2
 
     return torch.stack([sphere, circle], dim=-2)  # (..., 2, 32)
 
@@ -119,6 +125,8 @@ def embed_circle_from_features(
     stereo: torch.Tensor,
     op_table: torch.Tensor,
     two_channel: bool = True,
+    fix_null: bool = False,
+    fix_wire_dir: bool = False,
 ) -> torch.Tensor:
     """Embed DC hits from raw features.
 
@@ -144,14 +152,25 @@ def embed_circle_from_features(
     cos_a = torch.cos(azimuthal)
     sin_a = torch.sin(azimuthal)
 
-    wire_dir = torch.stack([
-        sin_s * cos_a,
-        sin_s * sin_a,
-        cos_s,
-    ], dim=-1)
+    # A stereo wire tilts azimuthally, not radially; see CGATrParquetModel for
+    # what the wrong slot ordering costs.
+    if fix_wire_dir:
+        wire_dir = torch.stack([
+            sin_s * sin_a,
+            -sin_s * cos_a,
+            cos_s,
+        ], dim=-1)
+    else:
+        wire_dir = torch.stack([
+            sin_s * cos_a,
+            sin_s * sin_a,
+            cos_s,
+        ], dim=-1)
     wire_dir = wire_dir / (torch.norm(wire_dir, dim=-1, keepdim=True) + 1e-8)
 
     if two_channel:
-        return embed_dc_two_channel(wire_pos, wire_dir, drift_distance, op_table)
+        return embed_dc_two_channel(wire_pos, wire_dir, drift_distance, op_table,
+                                    fix_null=fix_null)
     else:
-        return embed_circle_ipns(wire_pos, wire_dir, drift_distance, op_table)
+        return embed_circle_ipns(wire_pos, wire_dir, drift_distance, op_table,
+                                 fix_null=fix_null)

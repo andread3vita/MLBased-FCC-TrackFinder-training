@@ -50,9 +50,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import lightning as L
 import torch
 from lightning.pytorch.callbacks import (
-    Callback, LearningRateMonitor, ModelCheckpoint,
+    Callback, ModelCheckpoint,
 )
-from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 from lightning.pytorch.strategies import DDPStrategy
 import multiprocessing as mp
@@ -64,6 +63,8 @@ from src.lightning_module import CGATrV35LightningModule
 from src.dataset.parquet_dataset import (
     IDEAParquetDataset, TokenBudgetBatchSampler, collate_idea_events,
 )
+from shared_training.circe_parquet_dataset import SharedIDEAParquetDataset
+from shared_training.wandb_logger import build_experiment_logger
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +96,12 @@ def _apply_dry_run(args) -> None:
 
 def parse_args():
     p = argparse.ArgumentParser(description="C-GATr FCC training (M1-M5 baked in)")
-    p.add_argument("--data_dir", required=True)
+    p.add_argument("--data_dir", default=None,
+                   help="Legacy split CIRCE dataset directory.")
+    p.add_argument("--train_files", nargs="+", default=None,
+                   help="Canonical shared event-wise Parquet files or globs.")
+    p.add_argument("--val_files", nargs="+", default=None,
+                   help="Canonical shared validation Parquet files or globs.")
     p.add_argument("--train_seeds", default="1-1000")
     p.add_argument("--val_seeds", default="1001-1196")
     p.add_argument(
@@ -163,12 +169,19 @@ def parse_args():
                    help="Clustering-coord dimensionality.")
     p.add_argument("--beta_mlp", action="store_true", default=False)
     p.add_argument("--cosine_norm", action="store_true", default=False)
-    p.add_argument("--normalize_mv_inputs",
-                   action=argparse.BooleanOptionalAction, default=True,
+    _boolean_optional = getattr(argparse, "BooleanOptionalAction", None)
+    if _boolean_optional is not None:
+        p.add_argument("--normalize_mv_inputs",
+                   action=_boolean_optional, default=True,
                    help="Legacy per-token Euclidean L2 normalization. It "
                         "preserves rotations but breaks conformal translation "
                         "equivariance; paper-faithful C-GATr runs must pass "
                         "--no-normalize_mv_inputs.")
+    else:
+        p.add_argument("--normalize_mv_inputs", dest="normalize_mv_inputs",
+                       action="store_true", default=True)
+        p.add_argument("--no-normalize_mv_inputs", dest="normalize_mv_inputs",
+                       action="store_false")
     p.add_argument(
         "--layernorm_epsilon_mode",
         choices=["clamp", "add"],
@@ -338,11 +351,26 @@ def parse_args():
 
     p.add_argument("--tbeta", type=float, default=0.1)
     p.add_argument("--td", type=float, default=0.2)
+    p.add_argument("--sweep_tbeta_grid", default="0.35,0.45,0.5,0.6,0.7,0.8")
+    p.add_argument("--sweep_td_grid", default="0.15,0.2,0.3,0.4,0.5,0.6")
+    p.add_argument("--sweep_min_hits_grid", default="3,4")
+    p.add_argument("--sweep_match_metric",
+                   choices=("idea", "double_majority", "hungarian"),
+                   default="double_majority")
+    p.add_argument("--sweep_truth_min_hits", type=int, default=3)
+    p.add_argument("--validation_sweep_max_events", type=int, default=500)
+    p.add_argument("--rejected_seed_policy",
+                   choices=("discard", "keep", "attach-after-accept"),
+                   default="discard")
     p.add_argument("--ema_decay", type=float, default=0.999)
 
     p.add_argument("--output_dir", default="checkpoints/cgatr_fcc_prod")
     p.add_argument("--epoch_csv_path", default=None)
     p.add_argument("--run_tag", default="cgatr_fcc_prod")
+    p.add_argument("--log_wandb", action="store_true", default=False)
+    p.add_argument("--wandb_projectname", default=None)
+    p.add_argument("--wandb_entity", default=None)
+    p.add_argument("--wandb_displayname", default=None)
     p.add_argument("--resume_ckpt", default="none",
                    help="'last' / explicit path / 'none' to disable.")
     p.add_argument("--init_weights", default="none",
@@ -442,13 +470,23 @@ def parse_args():
 
 def make_loaders(args):
     """Build (train, val) DataLoaders."""
+    shared_files = args.train_files is not None or args.val_files is not None
+    if shared_files:
+        if args.data_dir is not None or not args.train_files or not args.val_files:
+            raise ValueError(
+                "Use either --data_dir or both --train_files and --val_files."
+            )
+    elif args.data_dir is None:
+        raise ValueError("Provide --data_dir or both shared file lists")
+
     tr_a, tr_b = _parse_seed_range(args.train_seeds)
     va_a, va_b = _parse_seed_range(args.val_seeds)
 
     max_hits = args.max_hits if args.max_hits > 0 else None
 
-    print(f"Loading training data: seeds {tr_a}-{tr_b - 1}"
-          f"  max_hits_per_event={max_hits}", flush=True)
+    print(("Loading shared training files" if shared_files else
+           f"Loading training data: seeds {tr_a}-{tr_b - 1}")
+          + f"  max_hits_per_event={max_hits}", flush=True)
     ggtf_targets = dict(drop_loopers=args.drop_loopers,
                         merge_daughters=args.merge_daughters,
                         with_drift_dir=(
@@ -456,22 +494,36 @@ def make_loaders(args):
                             and args.pga_hit_encoding in ("ggtf", "ggtf_wire")))
     if any(ggtf_targets.values()):
         print(f"GGTF regime / inputs: {ggtf_targets}", flush=True)
-    train_ds = IDEAParquetDataset(args.data_dir, seed_range=(tr_a, tr_b),
-                                  max_hits_per_event=max_hits,
-                                  with_time=args.use_time,
-                                  ggtf_loss=args.oc_mode == "ggtf",
-                                  min_target_hits=args.min_target_hits,
-                                  secondaries_as_noise=args.secondaries_as_noise,
-                                  **ggtf_targets)
-    print(f"Loading validation data: seeds {va_a}-{va_b - 1}"
-          f"  max_hits_per_event={max_hits}", flush=True)
-    val_ds = IDEAParquetDataset(args.data_dir, seed_range=(va_a, va_b),
-                                max_hits_per_event=max_hits,
-                                with_time=args.use_time,
-                                ggtf_loss=args.oc_mode == "ggtf",
-                                min_target_hits=args.min_target_hits,
-                                secondaries_as_noise=args.secondaries_as_noise,
-                                **ggtf_targets)
+    if shared_files:
+        if args.drop_loopers or args.merge_daughters or args.oc_mode != "paper_hinge":
+            raise ValueError(
+                "The shared comparison path uses paper_hinge without "
+                "truth-dependent hit deletion or daughter merging."
+            )
+        common = dict(
+            max_hits_per_event=max_hits,
+            with_time=args.use_time,
+            with_drift_dir=ggtf_targets["with_drift_dir"],
+        )
+        train_ds = SharedIDEAParquetDataset(args.train_files, **common)
+        val_ds = SharedIDEAParquetDataset(args.val_files, **common)
+    else:
+        train_ds = IDEAParquetDataset(args.data_dir, seed_range=(tr_a, tr_b),
+                                      max_hits_per_event=max_hits,
+                                      with_time=args.use_time,
+                                      ggtf_loss=args.oc_mode == "ggtf",
+                                      min_target_hits=args.min_target_hits,
+                                      secondaries_as_noise=args.secondaries_as_noise,
+                                      **ggtf_targets)
+        print(f"Loading validation data: seeds {va_a}-{va_b - 1}"
+              f"  max_hits_per_event={max_hits}", flush=True)
+        val_ds = IDEAParquetDataset(args.data_dir, seed_range=(va_a, va_b),
+                                    max_hits_per_event=max_hits,
+                                    with_time=args.use_time,
+                                    ggtf_loss=args.oc_mode == "ggtf",
+                                    min_target_hits=args.min_target_hits,
+                                    secondaries_as_noise=args.secondaries_as_noise,
+                                    **ggtf_targets)
 
     _pin = os.environ.get("CGATR_PIN_MEMORY", "1") not in ("0", "false", "False")
     base_kwargs = dict(
@@ -729,7 +781,6 @@ def main():
             save_top_k=1,
             save_weights_only=False,
         ),
-        LearningRateMonitor(logging_interval="epoch"),
         _BatchSamplerEpochCallback(),
         _HeartbeatCallback(every_n_steps=50),
         _EpochCSVCallback(csv_path, args.run_tag, world_size=args.num_devices),
@@ -780,10 +831,18 @@ def main():
         gradient_clip_val=args.gradient_clip_val,
         callbacks=callbacks,
         plugins=plugins or None,
-        logger=CSVLogger(args.output_dir, name=""),
+        logger=build_experiment_logger(
+            enabled=args.log_wandb,
+            output_dir=args.output_dir,
+            project=args.wandb_projectname,
+            entity=args.wandb_entity,
+            run_name=args.wandb_displayname or args.run_tag,
+            csv_name="",
+        ),
         log_every_n_steps=50,
         enable_progress_bar=False,
         enable_model_summary=True,
+        num_sanity_val_steps=0,
         deterministic=False,
         use_distributed_sampler=use_distributed_sampler,
         limit_train_batches=_normalize_limit_batches(args.limit_train_batches),

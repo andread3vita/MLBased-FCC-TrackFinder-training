@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
-"""Convert an IDEA digitized EDM4hep file directly to GATR Parquet.
+"""Convert digitized IDEA EDM4hep to the shared CIRCE/GATr Parquet schema.
 
 The extraction follows ``CIRCE/src/dataset/edm4hep_to_parquet.py``: PODIO
 collections are read directly, drift geometry is derived from the digitized
 hit, and MC relations come from the simulated hit.  Unlike the CIRCE utility,
-the result remains one row per event with jagged columns because that is the
-schema consumed by the GATR Parquet loader.
+the result remains one row per event with jagged columns. It stores both the
+raw drift-circle parameters used by CIRCE and the left/right ambiguity points
+used by GATr; model-specific representations are built only in their loaders.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ HIT_FIELDS = (
     "rightPosition_x", "rightPosition_y", "rightPosition_z",
     "produced_by_secondary", "overlay", "cluster_count",
     "superLayer", "layer", "phi", "stereo",
+    "drift_distance", "wire_azimuthal_angle", "wire_stereo_angle",
 )
 
 PARTICLE_FIELDS = (
@@ -196,6 +198,9 @@ def extract_drift_hits(event, metadata, values, hit_mc_indices):
         values["layer"].append(decoder.get(cell_id, "layer"))
         values["phi"].append(decoder.get(cell_id, "nphi"))
         values["stereo"].append(decoder.get(cell_id, "stereosign"))
+        values["drift_distance"].append(drift_distance)
+        values["wire_azimuthal_angle"].append(azimuthal)
+        values["wire_stereo_angle"].append(wire_stereo)
 
 
 def extract_planar_hits(event, values, hit_mc_indices):
@@ -235,6 +240,9 @@ def extract_planar_hits(event, values, hit_mc_indices):
             values["layer"].append(0)
             values["phi"].append(0)
             values["stereo"].append(0)
+            values["drift_distance"].append(0)
+            values["wire_azimuthal_angle"].append(0)
+            values["wire_stereo_angle"].append(0)
 
 
 def extract_particles(event, values, hit_mc_indices):
@@ -316,6 +324,9 @@ def make_arrow_table(columns, file_number):
         events = ak.with_field(events, ak.values_astype(events[name], np.float32), name)
     events = ak.with_field(
         events, np.full(len(events), file_number, dtype=np.int32), "file_number"
+    )
+    events = ak.with_field(
+        events, np.full(len(events), 1, dtype=np.int32), "shared_schema_version"
     )
     return ak.to_arrow_table(events, extensionarray=True)
 

@@ -30,10 +30,10 @@ geoservice.OutputLevel = INFO
 # see https://indico.cern.ch/event/1244371/contributions/5350233
 innerVertexResolution_x = 0.003  # [mm], assume 3 µm resolution for ARCADIA sensor
 innerVertexResolution_y = 0.003  # [mm], assume 3 µm resolution for ARCADIA sensor
-innerVertexResolution_t = 1000  # [ns]
+innerVertexResolution_t = 25  # [ns]
 outerVertexResolution_x = 0.050 / math.sqrt(12)  # [mm], assume ATLASPix3 sensor with 50 µm pitch
 outerVertexResolution_y = 0.150 / math.sqrt(12)  # [mm], assume ATLASPix3 sensor with 150 µm pitch
-outerVertexResolution_t = 1000  # [ns]
+outerVertexResolution_t = 25  # [ns]
 
 # silicon wrapper hits parameters
 siWrapperResolution_x = 0.050 / math.sqrt(12)  # [mm]

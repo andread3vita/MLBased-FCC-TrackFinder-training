@@ -1,4 +1,15 @@
-# IDEA no-background Parquet production
+# IDEA shared CIRCE/GATr no-background Parquet production
+
+The produced `Graphs_*.parquet` file is the canonical input for both models.
+It stores measured planar positions, drift-wire position/radius/angles,
+left/right drift ambiguity points, truth associations and particle metadata.
+CIRCE constructs full circles in its loader; GATr constructs its existing
+midpoint plus left/right-vector representation in its loader. Do not generate
+separate model-specific files for a matched comparison.
+
+The schema is tagged with scalar column `shared_schema_version=1`. Training
+and validation file lists must be disjoint and are passed unchanged to both
+arms of `model_training/train_circe_gatr_shared.sh`.
 
 This is an independent copy of `noBackground` that writes the final graph
 dataset directly as Parquet. The EDM4hep simulation and digitization products

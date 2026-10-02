@@ -1,7 +1,7 @@
 """C-GATr FCC LightningModule (`cgatr_fcc`).
 
-Imports CGATrParquetModel, object_condensation_loss, and helpers directly
-from src.model (no importlib tricks needed — no hyphen in the filename).
+The model definition stays local to CIRCE. The loss, warmup helpers, tracking
+metrics, plots, and logging contracts are imported from ``shared_training``.
 
   * M1-M5 are baked into src.model; no env flags needed.
   * Same EMA(0.999) over the full state_dict (BatchNorm buffers included).
@@ -16,17 +16,32 @@ from __future__ import annotations
 import math
 import os
 import sys
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import lightning as L
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 
-from src.model import (
-    CGATrParquetModel, object_condensation_loss,
-    _compute_batch_metrics_greedy, _seq_lens_to_batch, _compute_var_weight,
+from src.model import CGATrParquetModel
+from shared_training.circe_loss import (
+    object_condensation_loss, sequence_lengths_to_batch, variance_weight,
+)
+from shared_training.logging_contract import (
+    log_sweep_metrics, log_training_metrics, log_validation_loss,
+)
+from shared_training.tracking_metrics import (
+    TRACKING_COUNT_KEYS, TRACKING_DISPLACEMENT_BINS, TRACKING_PT_BINS,
+    matching_comparison_binned_counts, matching_comparison_plot_series,
+    parse_grid, run_operating_point_sweep,
+    save_sweep_results, save_tracking_efficiency_displacement_plot,
+    save_tracking_efficiency_pt_plot, tracking_metrics_from_counts,
+)
+from shared_training.wandb_logger import (
+    log_wandb_media, operating_point_media, tracking_efficiency_media,
 )
 
 
@@ -122,6 +137,7 @@ class CGATrV35LightningModule(L.LightningModule):
         self._val_loss_sum: float = 0.0
         self._val_loss_n: int = 0
         self._val_metrics: List[Dict[str, float]] = []
+        self._val_tracking_events = []
         self._train_loss_sum: float = 0.0
         self._train_loss_n: int = 0
         self._train_loss_sum_t: Optional[torch.Tensor] = None
@@ -165,7 +181,7 @@ class CGATrV35LightningModule(L.LightningModule):
         mc_index = batch["mc_index"]
         is_secondary = batch["is_secondary"]
         seq_lens = batch["seq_lens"]
-        batch_ids = _seq_lens_to_batch(seq_lens, features.device)
+        batch_ids = sequence_lengths_to_batch(seq_lens, features.device)
 
         output = self.model(features, seq_lens)
 
@@ -227,6 +243,7 @@ class CGATrV35LightningModule(L.LightningModule):
             "output": output,
             "noise_index": noise_index,
             "track_separation_weight": batch.get("track_separation_weight"),
+            "particle_info": batch.get("particle_info"),
         }
 
     # ---- training step ------------------------------------------------------
@@ -266,7 +283,11 @@ class CGATrV35LightningModule(L.LightningModule):
 
         s = self._shared_step(batch)
         n_events = len(s["seq_lens"])
-        vw = _compute_var_weight(self.current_epoch + 1, self.args)  # 1-indexed
+        vw = variance_weight(
+            self.current_epoch + 1,
+            self.args.var_weight,
+            self.args.var_warmup_epochs,
+        )
 
         if (s["mc_index_loss"] != s["noise_index"]).sum() < 4:
             return (s["coords"].sum() + s["beta_val"].sum()) * 0.0
@@ -291,7 +312,8 @@ class CGATrV35LightningModule(L.LightningModule):
 
         if torch.isnan(loss).any() or torch.isinf(loss).any():
             self.log("train/nan_skip", 1.0, on_step=True, on_epoch=False,
-                     prog_bar=False, sync_dist=False, batch_size=n_events)
+                     prog_bar=False, sync_dist=False, logger=False,
+                     batch_size=n_events)
             return (s["coords"].sum() + s["beta_val"].sum()) * 0.0
 
         loss_d = loss.detach()
@@ -301,19 +323,15 @@ class CGATrV35LightningModule(L.LightningModule):
             self._train_loss_sum_t += loss_d.double()
         self._train_loss_n += 1
 
-        log_kwargs = dict(on_step=True, on_epoch=False,
-                          sync_dist=False, batch_size=n_events)
-        self.log("train/loss", loss_d, prog_bar=True, **log_kwargs)
-        self.log("train/L_att", comp["L_V_att"].detach(), **log_kwargs)
-        self.log("train/L_rep", comp["L_V_rep"].detach(), **log_kwargs)
-        self.log("train/L_beta_sig", comp["L_beta_sig"].detach(), **log_kwargs)
-        self.log("train/L_beta_noise", comp["L_beta_noise"].detach(), **log_kwargs)
-        self.log("train/L_beta_suppress",
-                 comp["L_beta_suppress"].detach(), **log_kwargs)
-        self.log("train/L_var", comp["L_var"].detach(), **log_kwargs)
-        self.log("train/var_weight", float(vw), **log_kwargs)
-        self.log("lr", self.trainer.optimizers[0].param_groups[0]["lr"],
-                 **log_kwargs)
+        log_training_metrics(
+            self,
+            loss_d,
+            comp,
+            self.args.attr_weight,
+            self.args.repul_weight,
+            vw,
+            n_events,
+        )
         return loss
 
     # gradient clipping is handled by Trainer(gradient_clip_val=1.0)
@@ -328,6 +346,7 @@ class CGATrV35LightningModule(L.LightningModule):
         self._val_loss_sum = 0.0
         self._val_loss_n = 0
         self._val_metrics = []
+        self._val_tracking_events = []
 
     def validation_step(self, batch, batch_idx):
         if batch is None:
@@ -353,52 +372,214 @@ class CGATrV35LightningModule(L.LightningModule):
                 self._val_loss_sum += float(loss.item())
                 self._val_loss_n += 1
 
-        ed = self.args.embed_dim
-        # `mc_index_loss`, not the raw column, so the metric scores the same target set the
-        # loss was trained on. With no relabelling flags the two are identical on this dataset
-        # (no secondaries, no unassociated hits), so this changes nothing retroactively -- it
-        # is what makes `--min_target_hits` visible to strict50 rather than only to the loss.
-        m = _compute_batch_metrics_greedy(
-            s["output"][:, :ed], s["output"][:, ed:ed + 1],
-            s["mc_index_loss"], s["is_secondary"], s["seq_lens"],
-            tbeta=self.args.tbeta, td=self.args.td,
-            cosine_norm=self.args.cosine_norm,
-            noise_index=s["noise_index"],
-        )
-        self._val_metrics.append(m)
+        # Cache exactly the representation accepted by GATr's current metric
+        # code. Truth IDs are positive and event-local; zero denotes noise.
+        coords = s["coords"].detach().float().cpu().numpy()
+        beta = s["beta_val"].detach().float().cpu().numpy()
+        truth = s["mc_index_loss"].detach().cpu().numpy()
+        offset = 0
+        cached_particle_info = s["particle_info"] or [
+            {} for _ in s["seq_lens"]
+        ]
+        for event_slot, length in enumerate(s["seq_lens"]):
+            end = offset + int(length)
+            raw = truth[offset:end]
+            event_truth = np.zeros(raw.shape, dtype=np.int64)
+            signal = raw != s["noise_index"]
+            event_particle_info = {}
+            if np.any(signal):
+                raw_ids, inverse = np.unique(raw[signal], return_inverse=True)
+                event_truth[signal] = inverse + 1
+                source_info = cached_particle_info[event_slot]
+                event_particle_info = {
+                    local_id: source_info[int(raw_id)]
+                    for local_id, raw_id in enumerate(raw_ids, start=1)
+                    if int(raw_id) in source_info
+                }
+            self._val_tracking_events.append({
+                "coords": coords[offset:end],
+                "beta": beta[offset:end],
+                "truth": event_truth,
+                "particle_info": event_particle_info,
+            })
+            offset = end
 
     def on_validation_epoch_end(self):
         avg_loss = self._val_loss_sum / max(self._val_loss_n, 1)
-        if self._val_metrics:
-            def _mean(key: str) -> float:
-                return float(np.mean([m[key] for m in self._val_metrics]))
-            avg_purity = _mean("purity")
-            avg_eff = _mean("efficiency")
-            avg_match_loose = _mean("match_rate")
-            avg_match_strict50 = _mean("match_rate_strict50")
-            avg_noise = _mean("noise_suppression")
+        tbetas = parse_grid(self.args.sweep_tbeta_grid, float)
+        tds = parse_grid(self.args.sweep_td_grid, float)
+        min_hits = parse_grid(self.args.sweep_min_hits_grid, int)
+        max_events = int(self.args.validation_sweep_max_events)
+        world_size = max(int(self.trainer.world_size), 1)
+        rank = int(self.trainer.global_rank)
+        base, remainder = divmod(max_events, world_size)
+        local_events = self._val_tracking_events[:base + int(rank < remainder)]
+        local_rows = run_operating_point_sweep(
+            local_events, tbetas, tds, min_hits,
+            metric=self.args.sweep_match_metric,
+            truth_min_hits=int(self.args.sweep_truth_min_hits),
+            rejected_seed_policy=self.args.rejected_seed_policy,
+        )
+        device = next(self.model.parameters()).device
+        count_tensor = torch.tensor(
+            [[row[key] for key in TRACKING_COUNT_KEYS] for row in local_rows],
+            dtype=torch.int64, device=device,
+        )
+        event_count = torch.tensor(len(local_events), dtype=torch.int64, device=device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(event_count, op=dist.ReduceOp.SUM)
+        output_dir = Path(self.args.output_dir) / "validation_sweeps" / (
+            f"epoch_{self.current_epoch:04d}"
+        )
+        working_points = None
+        if self.trainer.is_global_zero and int(event_count.item()) > 0:
+            rows = []
+            for template, counts in zip(local_rows, count_tensor.cpu().tolist()):
+                rows.append(tracking_metrics_from_counts(
+                    template["tbeta"], template["td"], template["min_hits"],
+                    dict(zip(TRACKING_COUNT_KEYS, counts)),
+                ))
+            working_points = save_sweep_results(
+                rows, str(output_dir),
+                metadata={
+                    "implementation": "current_GATR_tracking_metrics",
+                    "events": int(event_count.item()),
+                    "matching": self.args.sweep_match_metric,
+                    "rejected_seed_policy": self.args.rejected_seed_policy,
+                },
+                fixed_min_hits=int(self.args.sweep_truth_min_hits),
+            )
+        if dist.is_available() and dist.is_initialized():
+            holder = [working_points]
+            dist.broadcast_object_list(holder, src=0)
+            working_points = holder[0]
+        if working_points:
+            pareto = working_points["pareto_f1"]
+            avg_eff = float(pareto["efficiency"])
+            avg_fake = float(pareto["fake_rate"])
         else:
-            avg_purity = avg_eff = avg_match_loose = 0.0
-            avg_match_strict50 = avg_noise = 0.0
+            avg_eff = avg_fake = 0.0
 
-        log_kwargs = dict(on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("val/loss", avg_loss, prog_bar=True, **log_kwargs)
-        self.log("val_loss", avg_loss, **log_kwargs)
-        self.log("val/purity", avg_purity, **log_kwargs)
-        self.log("val/efficiency", avg_eff, **log_kwargs)
-        self.log("val/match_rate", avg_match_loose, **log_kwargs)
-        self.log("val/match_rate_strict50", avg_match_strict50, **log_kwargs)
-        self.log("val/noise_supp", avg_noise, **log_kwargs)
+        log_validation_loss(self, avg_loss, batch_size=1)
+        self.log(
+            "val_loss", avg_loss, on_epoch=True, sync_dist=True,
+            logger=False, batch_size=1,
+        )
+        if working_points:
+            log_sweep_metrics(self, working_points)
+            comparison_order, comparison_rows, missing = (
+                matching_comparison_binned_counts(
+                    self._val_tracking_events,
+                    working_points,
+                    {
+                        "pt": TRACKING_PT_BINS,
+                        "displacement": TRACKING_DISPLACEMENT_BINS,
+                    },
+                    truth_min_hits=int(self.args.sweep_truth_min_hits),
+                    min_theta=10.0,
+                    max_theta=170.0,
+                    gen_status=(0, 1),
+                    rejected_seed_policy=self.args.rejected_seed_policy,
+                )
+            )
+            pt_count_tensor = torch.tensor(
+                np.stack([
+                    np.stack(pair, axis=0)
+                    for pair in comparison_rows["pt"]
+                ], axis=0),
+                dtype=torch.int64,
+                device=device,
+            )
+            displacement_count_tensor = torch.tensor(
+                np.stack([
+                    np.stack(pair, axis=0)
+                    for pair in comparison_rows["displacement"]
+                ], axis=0),
+                dtype=torch.int64,
+                device=device,
+            )
+            missing_tensor = torch.tensor(
+                [missing["pt"], missing["displacement"]],
+                dtype=torch.int64,
+                device=device,
+            )
+            binned_event_count = torch.tensor(
+                len(self._val_tracking_events), dtype=torch.int64, device=device
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(pt_count_tensor, op=dist.ReduceOp.SUM)
+                dist.all_reduce(displacement_count_tensor, op=dist.ReduceOp.SUM)
+                dist.all_reduce(missing_tensor, op=dist.ReduceOp.SUM)
+                dist.all_reduce(binned_event_count, op=dist.ReduceOp.SUM)
+
+            pt_image_paths = {}
+            displacement_image_paths = {}
+            if self.trainer.is_global_zero:
+                pt_counts = pt_count_tensor.cpu().numpy()
+                displacement_counts = displacement_count_tensor.cpu().numpy()
+                for point_name in ("max_efficiency", "pareto_f1"):
+                    pt_image_paths[point_name] = save_tracking_efficiency_pt_plot(
+                        matching_comparison_plot_series(
+                            comparison_order, pt_counts, point_name
+                        ),
+                        str(output_dir),
+                        filename_stem=(
+                            f"tracking_efficiency_vs_pt_{point_name}"
+                        ),
+                        bins=TRACKING_PT_BINS,
+                        min_x=0.1,
+                        max_x=60.0,
+                        min_theta=10.0,
+                        max_theta=170.0,
+                        gen_status=(0, 1),
+                    )
+                    displacement_image_paths[point_name] = (
+                        save_tracking_efficiency_displacement_plot(
+                            matching_comparison_plot_series(
+                                comparison_order,
+                                displacement_counts,
+                                point_name,
+                            ),
+                            str(output_dir),
+                            filename_stem=(
+                                "tracking_efficiency_vs_displacement_"
+                                f"{point_name}"
+                            ),
+                            bins=TRACKING_DISPLACEMENT_BINS,
+                            min_x=0.0,
+                            max_x=2000.0,
+                            min_theta=10.0,
+                            max_theta=170.0,
+                            gen_status=(0, 1),
+                        )
+                    )
+                print(
+                    "Saved double-majority and Hungarian tracking efficiency "
+                    "versus pT and uniformly binned displacement from "
+                    f"{int(binned_event_count.item())} validation events; "
+                    "missing pT/displacement metadata for "
+                    f"{int(missing_tensor[0].item())}/"
+                    f"{int(missing_tensor[1].item())} eligible truth tracks.",
+                    flush=True,
+                )
+            if self.trainer.is_global_zero and hasattr(self.logger, "log_image"):
+                media = operating_point_media(output_dir)
+                media.update(tracking_efficiency_media(
+                    pt_image_paths, displacement_image_paths
+                ))
+                log_wandb_media(
+                    self.logger,
+                    media,
+                )
 
         if self.trainer.is_global_zero:
             tag = ("[sanity]" if self.trainer.sanity_checking
                    else f"Epoch {self.current_epoch + 1}")
             print(
                 f"  {tag} | Val Loss: {avg_loss:.4f} | "
-                f"Purity: {avg_purity:.3f} | Efficiency: {avg_eff:.3f} | "
-                f"Match: loose={avg_match_loose:.3f} "
-                f"strict50={avg_match_strict50:.3f} | "
-                f"Noise Supp: {avg_noise:.3f} ({self._val_loss_n} batches)",
+                f"GATr metric: efficiency={avg_eff:.3f}, fake={avg_fake:.3f} | "
+                f"({self._val_loss_n} batches)",
                 flush=True,
             )
 
@@ -423,7 +604,7 @@ class CGATrV35LightningModule(L.LightningModule):
                 torch.distributed.all_reduce(loss_n)
             mean = (loss_sum / loss_n.clamp(min=1.0)).item()
             self.log("train_loss", mean, on_epoch=True, sync_dist=False,
-                     batch_size=1)
+                     logger=False, batch_size=1)
             self.trainer.callback_metrics["train_loss"] = torch.as_tensor(mean)
             self._train_loss_sum = 0.0
             self._train_loss_n = 0

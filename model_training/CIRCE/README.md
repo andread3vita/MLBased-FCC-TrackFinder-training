@@ -31,16 +31,17 @@ Evaluated on the full 100-seed `eval-keepall` holdout (1,672,188 targets) under 
 
 | Metric | Selection / Condition | CIRCE Results |
 |---|---|:---:|
-| **Tracking Efficiency ($N_\mathrm{hits} > 10$)** | Standard IDEA benchmark tracks | **97.28%** |
-| **Tracking Efficiency ($N_\mathrm{hits} > 3$)** | Inclusive track recovery down to 4 hits | **96.12%** |
-| **Tracking Efficiency (1-to-1 Hungarian)** | Double Majority (purity $\ge 50\%$, hit eff $\ge 50\%$) | **94.65%** |
+| **Tracking Efficiency ($N_\mathrm{hits} > 10$, Majority Match)** | Standard IDEA benchmark tracks, Purity $> 75\%$ | **97.28%** |
+| **Tracking Efficiency ($N_\mathrm{hits} > 10$, 1-to-1 Hungarian)** | Double Majority (Purity $\ge 50\%$, Hit Eff $\ge 50\%$) | **97.75%** |
+| **Tracking Efficiency ($N_\mathrm{hits} > 3$, Majority Match)** | Inclusive track recovery down to 4 hits, Purity $> 75\%$ | **96.12%** |
+| **Tracking Efficiency ($N_\mathrm{hits} > 3$, 1-to-1 Hungarian)** | Inclusive recovery, Double Majority 1-to-1 | **96.73%** |
 | **Fake Rate (Non-Merged)** | Unmatched non-merged candidates / all candidates | **3.74%** |
 | **Fake Rate (1-to-1 Hungarian)** | Unassigned candidates in 1-to-1 match | **10.69%** |
-| **Merge Rate** | Multi-track candidate coverage ($>75\%$ purity) | **12.50%** |
+| **Merge Rate (Multi-Track)** | Multi-track candidate coverage ($>75\%$ purity) | **12.50%** |
 | **Candidates / Event** | Full detector acceptance | **36.14** |
 
 Benchmark plots are available in `plots/`:
-- `plots/head_to_head_keepall_efficiency.png` (and `.pdf`): Tracking Efficiency vs $p_\mathrm{T}$ and Polar Angle $\theta$.
+- `plots/head_to_head_keepall_efficiency.png` (and `.pdf`): Tracking Efficiency vs $p_\mathrm{T}$ and Polar Angle $\theta$ (all 4 efficiency lines displayed).
 - `plots/fcc_comprehensive_suite.png` (and `.pdf`): 4-panel comprehensive evaluation suite ($p_\mathrm{T}$ turn-on, angular coverage, hit multiplicity, summary bar chart).
 
 ## Loss Formulation: CIRCE Champion Loss vs Upstream Baseline (GGTF)

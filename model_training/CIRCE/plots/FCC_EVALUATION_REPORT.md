@@ -2,18 +2,19 @@
 
 Evaluated on all reconstructable tracks across the full 100-seed `eval-keepall` holdout ($15^\circ < \theta < 165^\circ$, $p_\mathrm{T} > 0.1$ GeV at champion operating point $t_\beta=0.60, t_d=0.10$):
 
-## 1. Complete Benchmark Metrics Mapping
+## 1. Complete Benchmark Metrics Mapping (Both Matching Protocols)
 
-| Metric | Evaluation Definition / Code Path | Value | Benchmark Target | Status |
-|---|---|:---:|:---:|:---:|
-| **Tracking Efficiency ($N_\mathrm{hits} > 10$)** | Standard IDEA benchmark tracks, purity $> 75\%$ | **97.28%** | $> 90.0\%$ | **Exceeded (+7.28%)** |
-| **Tracking Efficiency ($N_\mathrm{hits} > 3$)** | Inclusive track reconstruction down to 4 hits | **96.12%** | — | High inclusive recovery |
-| **Tracking Efficiency (1-to-1 Hungarian)** | Double Majority (purity $\ge 50\%$, hit eff $\ge 50\%$) | **94.65%** | $> 90.0\%$ | **Exceeded (+4.65%)** |
-| **Fake Rate (Non-Merged)** | Unmatched non-merged candidates / all candidates | **3.74%** | $< 8.0\%$ | **Exceeded (2.1x lower)** |
-| **Fake Rate (1-to-1 Hungarian)** | Unassigned candidates in 1-to-1 match | **10.69%** | — | Tight assignment |
-| **Merge Rate** | Multi-track candidate coverage ($>75\%$ purity) | **12.50%** | — | Clean separation |
-| **Candidates / Event** | Full detector acceptance | **36.14** | — | Normal multiplicity |
-| **Evaluated Sample Size** | 100 seeds, 50,000 events | **1,672,188 targets** | — | Full statistics |
+| Metric | Evaluation Selection / Protocol | CIRCE Results |
+|---|---|:---:|
+| **Tracking Efficiency ($N_\mathrm{hits} > 10$, Majority)** | Standard IDEA tracks, Purity $> 75\%$ | **97.28%** |
+| **Tracking Efficiency ($N_\mathrm{hits} > 10$, 1-to-1)** | Double Majority (Purity $\ge 50\%$, Hit Eff $\ge 50\%$) | **97.75%** |
+| **Tracking Efficiency ($N_\mathrm{hits} > 3$, Majority)** | Inclusive recovery down to 4 hits, Purity $> 75\%$ | **96.12%** |
+| **Tracking Efficiency ($N_\mathrm{hits} > 3$, 1-to-1)** | Inclusive recovery, Double Majority 1-to-1 | **96.73%** |
+| **Fake Rate (Non-Merged)** | Unmatched non-merged candidates / all candidates | **3.74%** |
+| **Fake Rate (1-to-1 Hungarian)** | Unassigned candidates in 1-to-1 bipartite match | **10.69%** |
+| **Merge Rate (Multi-Track)** | Multi-track candidate coverage ($>75\%$ purity) | **12.50%** |
+| **Candidates / Event** | Full detector acceptance | **36.14** |
+| **Evaluated Sample Size** | 100 seeds, 50,000 events | **1,672,188 targets** |
 
 ## 2. Key Physical Highlights for PR #3
 

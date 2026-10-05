@@ -40,85 +40,59 @@ siWrapperResolution_x = 0.050 / math.sqrt(12)  # [mm]
 siWrapperResolution_y = 1.0 / math.sqrt(12)  # [mm]
 siWrapperResolution_t = 0.040  # [ns], assume 40 ps timing resolution for a single layer -> Should lead to <30 ps resolution when >1 hit
 
-# Define arguments for digitizers
-vxd_barrel_digi_args = {
-    "IsStrip": False,
-    "ResolutionU": [innerVertexResolution_x]*3 + [outerVertexResolution_x]*2,
-    "ResolutionV": [innerVertexResolution_y]*3 + [outerVertexResolution_y]*2,
-    "ResolutionT": [innerVertexResolution_t]*3 + [outerVertexResolution_t]*2,
-    "SimTrackHitCollectionName": ["VertexBarrelCollection"],
-    "SimTrkHitRelCollection": ["VTXBSimDigiLinks"],
-    "SubDetectorName": "VertexBarrel",
-    "TrackerHitCollectionName": ["VTXBDigis"],
-    "ForceHitsOntoSurface": True,
-    "CellIDBits": 32,
-}
-
-vxd_endcap_digi_args = {
-    "IsStrip": False,
-    "ResolutionU": [outerVertexResolution_x]*3,
-    "ResolutionV": [outerVertexResolution_y]*3,
-    "ResolutionT": [outerVertexResolution_t]*3,
-    "SimTrackHitCollectionName": ["VertexEndcapCollection"],
-    "SimTrkHitRelCollection": ["VTXDSimDigiLinks"],
-    "SubDetectorName": "VertexDisks",
-    "TrackerHitCollectionName": ["VTXDDigis"],
-    "ForceHitsOntoSurface": True,
-    "CellIDBits": 32,
-}
-
-siWr_barrel_digi_args = {
-    "IsStrip": False,
-    "ResolutionU": [siWrapperResolution_x]*4,
-    "ResolutionV": [siWrapperResolution_y]*4,
-    "ResolutionT": [siWrapperResolution_t]*4,
-    "SimTrackHitCollectionName": ["SiWrBCollection"],
-    "SimTrkHitRelCollection": ["SiWrBSimDigiLinks"],
-    "SubDetectorName": "SiWrB",
-    "TrackerHitCollectionName": ["SiWrBDigis"],
-    "ForceHitsOntoSurface": True,
-    "CellIDBits": 32,
-}
-
-siWr_endcap_digi_args = {
-    "IsStrip": False,
-    "ResolutionU": [siWrapperResolution_x]*4,
-    "ResolutionV": [siWrapperResolution_y]*4,
-    "ResolutionT": [siWrapperResolution_t]*4,
-    "SimTrackHitCollectionName": ["SiWrDCollection"],
-    "SimTrkHitRelCollection": ["SiWrDSimDigiLinks"],
-    "SubDetectorName": "SiWrD",
-    "TrackerHitCollectionName": ["SiWrDDigis"],
-    "ForceHitsOntoSurface": True,
-    "CellIDBits": 32,
-}
-
-# digitize vertex hits through "native" DDPlanarDigi
 from Configurables import DDPlanarDigi
 
-VXDBarrelDigitizer = DDPlanarDigi(
-    "VXDBarrelDigitizer",
-    **vxd_barrel_digi_args,
-    OutputLevel=INFO
-)
+############### Vertex Digitizer
 
-VXDEndcapDigitizer = DDPlanarDigi(
-    "VXDEndcapDigitizer",
-    **vxd_endcap_digi_args,
-    OutputLevel=INFO
-)
+vtxb_digitizer = DDPlanarDigi("VTXBdigitizer")
+vtxb_digitizer.SubDetectorName = "Vertex"
+vtxb_digitizer.CellIDBits = 32
+vtxb_digitizer.IsStrip = False
+vtxb_digitizer.ResolutionU = [innerVertexResolution_x, innerVertexResolution_x, innerVertexResolution_x, outerVertexResolution_x, outerVertexResolution_x]
+vtxb_digitizer.ResolutionV = [innerVertexResolution_y, innerVertexResolution_y, innerVertexResolution_y, outerVertexResolution_y, outerVertexResolution_y]
+vtxb_digitizer.ResolutionT = [innerVertexResolution_t, innerVertexResolution_t, innerVertexResolution_t, outerVertexResolution_t, outerVertexResolution_t]
+vtxb_digitizer.SimTrackHitCollectionName = ["VertexBarrelCollection"]
+vtxb_digitizer.SimTrkHitRelCollection = ["VTXBSimDigiLinks"]
+vtxb_digitizer.TrackerHitCollectionName = ["VTXBDigis"]
+vtxb_digitizer.ForceHitsOntoSurface = True
 
-SiWrBarrelDigitizer = DDPlanarDigi(
-    "SiWrBarrelDigitizer",
-    **siWr_barrel_digi_args,
-    OutputLevel=INFO
-)
+vtxd_digitizer = DDPlanarDigi("VTXDdigitizer")
+vtxd_digitizer.SubDetectorName = "Vertex"
+vtxd_digitizer.CellIDBits = 32
+vtxd_digitizer.IsStrip = False
+vtxd_digitizer.ResolutionU = [outerVertexResolution_x, outerVertexResolution_x, outerVertexResolution_x]
+vtxd_digitizer.ResolutionV = [outerVertexResolution_y, outerVertexResolution_y, outerVertexResolution_y]
+vtxd_digitizer.ResolutionT = [outerVertexResolution_t, outerVertexResolution_t, outerVertexResolution_t]
+vtxd_digitizer.SimTrackHitCollectionName = ["VertexEndcapCollection"]
+vtxd_digitizer.SimTrkHitRelCollection = ["VTXDSimDigiLinks"]
+vtxd_digitizer.TrackerHitCollectionName = ["VTXDDigis"]
+vtxd_digitizer.ForceHitsOntoSurface = True
 
-SiWrEndcapDigitizer = DDPlanarDigi(
-    "SiWrEndcapDigitizer",
-    **siWr_endcap_digi_args,
-    OutputLevel=INFO
-)
+############### Wrapper Digitizer
+
+siwrb_digitizer = DDPlanarDigi("SiWrBdigitizer")
+siwrb_digitizer.SubDetectorName = "SiWrB"
+siwrb_digitizer.CellIDBits = 32
+siwrb_digitizer.IsStrip = False
+siwrb_digitizer.ResolutionU = [siWrapperResolution_x]*4
+siwrb_digitizer.ResolutionV = [siWrapperResolution_y]*4
+siwrb_digitizer.ResolutionT = [siWrapperResolution_t]*4
+siwrb_digitizer.SimTrackHitCollectionName = ["SiWrBCollection"]
+siwrb_digitizer.SimTrkHitRelCollection = ["SiWrBSimDigiLinks"]
+siwrb_digitizer.TrackerHitCollectionName = ["SiWrBDigis"]
+siwrb_digitizer.ForceHitsOntoSurface = True
+
+siwrd_digitizer = DDPlanarDigi("SiWrDdigitizer")
+siwrd_digitizer.SubDetectorName = "SiWrD"
+siwrd_digitizer.CellIDBits = 32
+siwrd_digitizer.IsStrip = False
+siwrd_digitizer.ResolutionU = [siWrapperResolution_x]*4
+siwrd_digitizer.ResolutionV = [siWrapperResolution_y]*4
+siwrd_digitizer.ResolutionT = [siWrapperResolution_t]*4
+siwrd_digitizer.SimTrackHitCollectionName = ["SiWrDCollection"]
+siwrd_digitizer.SimTrkHitRelCollection = ["SiWrDSimDigiLinks"]
+siwrd_digitizer.TrackerHitCollectionName = ["SiWrDDigis"]
+siwrd_digitizer.ForceHitsOntoSurface = True
 
 from Configurables import DCHdigi_v02
 dch_digitizer = DCHdigi_v02(
@@ -141,9 +115,9 @@ dch_digitizer = DCHdigi_v02(
 
 ############### Application Manager
 
-mgr = ApplicationMgr(TopAlg = [dch_digitizer, VXDBarrelDigitizer, VXDEndcapDigitizer, SiWrBarrelDigitizer, SiWrEndcapDigitizer],
+mgr = ApplicationMgr(TopAlg = [dch_digitizer, vtxd_digitizer, vtxb_digitizer, siwrb_digitizer, siwrd_digitizer],
     EvtSel = "NONE",
     EvtMax = -1,
     ExtSvc = [geoservice,EventDataSvc("EventDataSvc"), UniqueIDGenSvc("uidSvc"), RndmGenSvc()],
     OutputLevel = INFO,
-    )
+)

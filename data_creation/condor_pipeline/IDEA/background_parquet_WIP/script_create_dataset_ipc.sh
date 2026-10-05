@@ -3,10 +3,10 @@
 set -eo pipefail
 
 usage() {
-    echo "Usage: $0 PAIRS_PATH K4GEO_PATH OUTDIR NUMFILE KEY4HEP_VERSION" >&2
+    echo "Usage: $0 PAIRS_PATH K4GEO_PATH OUTDIR NUMFILE KEY4HEP_VERSION ACCOUNTING_GROUP" >&2
 }
 
-if [[ $# -ne 5 ]]; then
+if [[ $# -ne 6 ]]; then
     usage
     exit 2
 fi
@@ -16,6 +16,7 @@ K4GEO_PATH=$2
 OUTDIR=$3
 NUMFILE=$4
 KEY4HEP_VERSION=$5
+ACCOUNTING_GROUP=$6
 
 readonly VERSION=3
 readonly OPTION=1
@@ -40,6 +41,11 @@ if [[ -z "$KEY4HEP_VERSION" ]]; then
     exit 2
 fi
 
+if [[ -z "$ACCOUNTING_GROUP" ]]; then
+    echo "ERROR: ACCOUNTING_GROUP cannot be empty" >&2
+    exit 2
+fi
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Set up both condor_submit and the Key4hep environment used by the jobs.
@@ -53,4 +59,5 @@ python3 "$SCRIPT_DIR/src/submit_jobs_IPC.py" \
     --key4hep-version "$KEY4HEP_VERSION" \
     --detector-version "$VERSION" \
     --detector-option "$OPTION" \
+    --accounting-group "$ACCOUNTING_GROUP" \
     --queue testmatch

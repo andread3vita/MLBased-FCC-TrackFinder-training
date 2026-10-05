@@ -45,6 +45,7 @@ def main(base_path):
     parser.add_argument("--mainDir", help="main directory", default="")
     parser.add_argument("--k4geoPath", help="k4geoPath", default="")
     parser.add_argument("--k4fwcorePath", help="k4fwcorePath", default="")
+    parser.add_argument("--accounting-group", required=True, help="Condor accounting group")
 
 
     parsed_args = parser.parse_args()
@@ -108,7 +109,7 @@ def main(base_path):
             error  = std/condor.$(ClusterId).$(ProcId).err
             log    = std/condor.$(ClusterId).log
 
-            +AccountingGroup = "group_u_FCC.local_gen"
+            +AccountingGroup = "{parsed_args.accounting_group}"
             +JobFlavour      = "{queue}"
 
             RequestCpus = 3

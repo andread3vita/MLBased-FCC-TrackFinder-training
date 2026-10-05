@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--detector-version", type=int, default=3)
     parser.add_argument("--detector-option", type=int, default=1)
     parser.add_argument("--queue", choices=SUPPORTED_QUEUES, default="testmatch")
+    parser.add_argument("--accounting-group", required=True, help="Condor accounting group")
     return parser.parse_args()
 
 
@@ -131,7 +132,7 @@ def main() -> None:
         f"output = {log_dir}/condor.$(ClusterId).$(ProcId).out",
         f"error = {log_dir}/condor.$(ClusterId).$(ProcId).err",
         f"log = {log_dir}/condor.$(ClusterId).log",
-        '+AccountingGroup = "group_u_FCC.local_gen"',
+        f'+AccountingGroup = "{args.accounting_group}"',
         f'+JobFlavour = "{args.queue}"',
         "RequestCpus = 3",
         "notification = Never",

@@ -41,10 +41,24 @@ class _GeometricProductFn(torch.autograd.Function):
     def backward(ctx, grad_out):
         gp, x, y = ctx.saved_tensors
         grad_x = grad_y = None
+
+        # Lightning's bf16-mixed precision autocast can produce a bf16
+        # grad_out while the Cayley table is (correctly) kept in float32.
+        # torch.einsum requires all operands to have the same dtype here;
+        # perform the analytic contraction in the table's dtype, then return
+        # gradients in the dtype of their corresponding inputs.
+        compute_dtype = gp.dtype
+        grad_out_compute = grad_out.to(dtype=compute_dtype)
+        x_compute = x.to(dtype=compute_dtype)
+        y_compute = y.to(dtype=compute_dtype)
         if ctx.needs_input_grad[1]:
-            grad_x = torch.einsum("ijk, ...i, ...k -> ...j", gp, grad_out, y)
+            grad_x = torch.einsum(
+                "ijk, ...i, ...k -> ...j", gp, grad_out_compute, y_compute
+            ).to(dtype=x.dtype)
         if ctx.needs_input_grad[2]:
-            grad_y = torch.einsum("ijk, ...i, ...j -> ...k", gp, grad_out, x)
+            grad_y = torch.einsum(
+                "ijk, ...i, ...j -> ...k", gp, grad_out_compute, x_compute
+            ).to(dtype=y.dtype)
         return None, grad_x, grad_y
 
 

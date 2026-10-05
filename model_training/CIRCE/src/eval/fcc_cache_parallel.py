@@ -11,6 +11,9 @@ Extra flag:
                         Equivalent sigmoid threshold = sigmoid(tbeta).
                         e.g. --tbeta -3.664 with raw == --tbeta 0.025 with sigmoid.
 """
+
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json

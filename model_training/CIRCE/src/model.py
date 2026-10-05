@@ -11,6 +11,8 @@ GATr's scalar output representation. The historical unconstrained blade-mixing
 readout remains only for loading old checkpoints.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import copy

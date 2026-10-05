@@ -25,6 +25,8 @@ Usage:
         --output_dir eval_results/v36ef_fcc
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import argparse

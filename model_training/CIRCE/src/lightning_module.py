@@ -650,7 +650,11 @@ class CGATrV35LightningModule(L.LightningModule):
         self._steps_per_epoch = steps_per_epoch
 
         _prec = str(getattr(self.args, "precision", "32-true"))
-        _use_fused = not _prec.startswith("16")
+        # Lightning cannot clip gradients for a fused optimizer under AMP
+        # because fused Adam/AdamW performs gradient unscaling internally.
+        # Keep the faster fused path for true FP32, and use the standard
+        # optimizer implementation for 16-mixed and bf16-mixed.
+        _use_fused = _prec == "32-true"
         # Adam rather than AdamW exists for the GGTF parity runs: their training
         # uses plain Adam, and decoupled weight decay is not a neutral
         # difference when the comparison is meant to be to their recipe.

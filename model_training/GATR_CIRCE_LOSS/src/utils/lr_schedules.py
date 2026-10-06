@@ -3,6 +3,7 @@ import math
 
 REDUCE_ON_PLATEAU_UNIT = "reduceplateau-v1"
 EPOCH_WARMUP_COSINE_UNIT = "epoch-v1"
+STEP_WARMUP_COSINE_UNIT = "step-v2"
 NO_SCHEDULER_UNIT = "none-v1"
 
 
@@ -84,7 +85,7 @@ def checkpoint_resume_metadata(checkpoint: dict) -> dict:
     elif schedule_unit == NO_SCHEDULER_UNIT:
         scheduler_name = "none"
     elif (
-        schedule_unit == EPOCH_WARMUP_COSINE_UNIT
+        schedule_unit in (EPOCH_WARMUP_COSINE_UNIT, STEP_WARMUP_COSINE_UNIT)
         and scheduler_name != "none"
     ):
         # Legacy non-plateau names all used this same epoch LambdaLR. Restore

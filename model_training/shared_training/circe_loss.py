@@ -45,10 +45,26 @@ def object_condensation_loss(
     beta = torch.nan_to_num(beta, nan=0.0)
     is_noise = mc_index == noise_index
     is_sig = ~is_noise
+
+    def connected_zero_result():
+        zero = coords.sum() * 0.0 + beta.sum() * 0.0
+        if not return_components:
+            return zero
+        component_zero = zero.detach() if detach_components else zero
+        return zero, {
+            "L_V_att": component_zero,
+            "L_V_rep": component_zero,
+            "L_beta_sig": component_zero,
+            "L_beta_noise": component_zero,
+            "L_beta_suppress": component_zero,
+            "L_var": component_zero,
+            "var_weight": torch.tensor(float(var_weight), device=device),
+        }
+
     n_hits = coords.shape[0]
     n_hits_sig = is_sig.sum().item()
     if n_hits_sig < 4:
-        return torch.tensor(0.0, device=device, requires_grad=True)
+        return connected_zero_result()
 
     sig_coords = coords[is_sig]
     sig_beta = beta[is_sig]
@@ -73,7 +89,7 @@ def object_condensation_loss(
     object_index = object_index + offsets[event_remap]
     n_objects = n_objects_per_event.sum().item()
     if n_objects < 2:
-        return torch.tensor(0.0, device=device, requires_grad=True)
+        return connected_zero_result()
     if oc_mode not in ("paper_hinge", "ggtf"):
         raise ValueError(f"Unknown object-condensation mode: {oc_mode}")
 
@@ -184,4 +200,3 @@ def object_condensation_loss(
         "L_var": component(l_var),
         "var_weight": torch.tensor(float(var_weight), device=device),
     }
-

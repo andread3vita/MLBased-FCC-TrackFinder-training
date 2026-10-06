@@ -27,14 +27,16 @@ def _normalize_time(values):
 
 
 REQUIRED_COLUMNS = (
-    "n_hit", "hit_x_true", "hit_y_true", "hit_z_true", "hit_type",
+    "event_number", "file_number", "n_hit", "n_part",
+    "hit_x_true", "hit_y_true", "hit_z_true", "hit_type",
     "hit_time", "hit_particle_index", "hit_x", "hit_y", "hit_z",
     "leftPosition_x", "leftPosition_y", "leftPosition_z",
     "rightPosition_x", "rightPosition_y", "rightPosition_z",
-    "produced_by_secondary", "drift_distance", "wire_azimuthal_angle",
+    "produced_by_secondary", "overlay", "drift_distance", "wire_azimuthal_angle",
     "wire_stereo_angle", "shared_schema_version",
-    "part_id", "part_p_t", "part_theta", "gen_status",
-    "part_vertex_x", "part_vertex_y",
+    "part_p", "part_p_t", "part_theta", "part_phi", "part_m", "part_pid",
+    "part_id", "gen_status", "part_parent",
+    "part_vertex_x", "part_vertex_y", "part_vertex_z",
 )
 
 
@@ -59,15 +61,12 @@ def _read_row_group(path, row_group):
     return ak.from_arrow(table)
 
 
-class SharedIDEAParquetDataset(Dataset):
-    """Lazy event dataset over the canonical shared CIRCE/GATr files."""
+class SharedParquetEventDataset(Dataset):
+    """Common lazy index over the canonical event-wise Parquet rows."""
 
-    def __init__(self, files, max_hits_per_event=None, with_time=False,
-                 with_drift_dir=False):
+    def __init__(self, files, max_hits_per_event=None):
         self.files = expand_parquet_inputs(files)
         self.max_hits = max_hits_per_event
-        self.with_time = bool(with_time)
-        self.with_drift_dir = bool(with_drift_dir)
         self._index = []
         for path in self.files:
             parquet = pq.ParquetFile(path)
@@ -85,7 +84,7 @@ class SharedIDEAParquetDataset(Dataset):
             raise ValueError("The shared Parquet inputs contain no events")
         sizes = sorted(item[3] for item in self._index)
         print(
-            f"SharedIDEAParquetDataset: {len(self._index)} events from "
+            f"SharedParquetEventDataset: {len(self._index)} events from "
             f"{len(self.files)} files; hits/event min={sizes[0]}, "
             f"median={sizes[len(sizes)//2]}, max={sizes[-1]}", flush=True,
         )
@@ -93,13 +92,30 @@ class SharedIDEAParquetDataset(Dataset):
     def __len__(self):
         return len(self._index)
 
+    def event(self, index):
+        path, row_group, row, _ = self._index[index]
+        return _read_row_group(path, row_group)[row]
+
+    def event_key(self, index):
+        path, row_group, row, _ = self._index[index]
+        return path, row_group, row
+
     @staticmethod
     def _array(event, name, dtype=np.float32):
         return np.asarray(ak.to_numpy(event[name]), dtype=dtype)
 
+
+class SharedIDEAParquetDataset(SharedParquetEventDataset):
+    """CIRCE feature view of the common indexed Parquet events."""
+
+    def __init__(self, files, max_hits_per_event=None, with_time=False,
+                 with_drift_dir=False):
+        super().__init__(files, max_hits_per_event=max_hits_per_event)
+        self.with_time = bool(with_time)
+        self.with_drift_dir = bool(with_drift_dir)
+
     def __getitem__(self, index):
-        path, row_group, row, _ = self._index[index]
-        event = _read_row_group(path, row_group)[row]
+        event = self.event(index)
         hit_type = self._array(event, "hit_type", np.int64)
         # Canonical schema: 1=planar (VTX/Si wrapper), 0=drift chamber.
         vtx_idx = np.flatnonzero(hit_type == 1)

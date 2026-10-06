@@ -187,13 +187,22 @@ parser.add_argument(
         "the regular state_dict (ignored for a full checkpoint resume)"
     ),
 )
-parser.add_argument("--num-epochs", type=int, default=20, help="number of epochs")
+parser.add_argument("--num-epochs", type=int, default=16, help="number of epochs")
 parser.add_argument(
     "--steps-per-epoch",
     type=int,
     default=None,
     help="number of steps (iterations) per epochs; "
     "if neither of `--steps-per-epoch` or `--samples-per-epoch` is set, each epoch will run over all loaded samples",
+)
+parser.add_argument(
+    "--limit-train-batches",
+    type=float,
+    default=None,
+    help=(
+        "shared-loader training limit: a fraction below 1 or an absolute "
+        "batch count at least 1, matching CIRCE/Lightning semantics"
+    ),
 )
 parser.add_argument(
     "--steps-per-epoch-val",
@@ -205,7 +214,7 @@ parser.add_argument(
 parser.add_argument(
     "--limit-val-batches",
     type=int,
-    default=50,
+    default=40,
     help="maximum validation batches per rank; use -1 to process all events",
 )
 parser.add_argument(
@@ -247,7 +256,7 @@ parser.add_argument(
 parser.add_argument(
     "--lr-scheduler",
     type=str,
-    default="flat+decay",
+    default="reduceplateau",
     choices=["none", "flat+decay", "reduceplateau"],
     help=(
         "learning-rate schedule: none, epoch warmup plus cosine decay "
@@ -263,14 +272,14 @@ parser.add_argument(
 parser.add_argument(
     "--plateau-patience",
     type=int,
-    default=2,
-    help="validation epochs without val_pareto_f1 improvement before reducing LR",
+    default=3,
+    help="validation epochs without validation-loss improvement before reducing LR",
 )
 parser.add_argument(
     "--plateau-threshold",
     type=float,
-    default=1e-3,
-    help="relative val_pareto_f1 improvement required by the reduceplateau scheduler",
+    default=1e-4,
+    help="relative validation-loss improvement required by the reduceplateau scheduler",
 )
 parser.add_argument(
     "--load-epoch",
@@ -278,7 +287,7 @@ parser.add_argument(
     default=None,
     help="used to resume interrupted training, load model and optimizer state saved in the `epoch-%d_state.pt` and `epoch-%d_optimizer.pt` files",
 )
-parser.add_argument("--start-lr", type=float, default=5e-3, help="start learning rate")
+parser.add_argument("--start-lr", type=float, default=4e-4, help="start learning rate")
 parser.add_argument(
     "--gradient-clip-val",
     type=float,
@@ -290,16 +299,41 @@ parser.add_argument(
 )
 parser.add_argument("--batch-size", type=int, default=128, help="batch size")
 parser.add_argument(
+    "--max-tokens",
+    type=int,
+    default=16000,
+    help=(
+        "maximum total graph nodes (hits) per batch; use 0 for "
+        "fixed --batch-size batching"
+    ),
+)
+parser.add_argument(
+    "--shared-indexed-loader",
+    action="store_true",
+    default=False,
+    help=(
+        "use CIRCE's canonical map-style event index, batch packing, DDP "
+        "division and validation order; only GATr's event-to-feature transform "
+        "remains model-specific"
+    ),
+)
+parser.add_argument(
     "--accumulate-grad-batches",
     type=int,
-    default=2,
+    default=1,
     help="mini-batches accumulated before each optimizer step",
 )
 parser.add_argument(
     "--checkpoint-every-n-train-steps",
     type=int,
-    default=5000,
-    help="optimizer-step interval for weights-only checkpoints",
+    default=0,
+    help="optimizer-step interval for weights-only checkpoints; 0 disables",
+)
+parser.add_argument(
+    "--precision",
+    choices=("32-true", "16-mixed", "bf16-mixed"),
+    default="32-true",
+    help="Lightning numerical precision shared with CIRCE",
 )
 parser.add_argument(
     "--seed",
@@ -330,6 +364,12 @@ parser.add_argument(
     type=int,
     default=2,
     help="batches prefetched by each DataLoader worker (used when --num-workers > 0)",
+)
+parser.add_argument(
+    "--cpu-threads",
+    type=int,
+    default=4,
+    help="shared PyTorch/OMP/MKL CPU thread count",
 )
 parser.add_argument(
     "--predict",
@@ -415,7 +455,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--clustering_space_dim", "--embedding-dim", "-clust_dim",
-    type=int, default=5,
+    type=int, default=4,
     help="number of learned object-condensation coordinates",
 )
 parser.add_argument("--gatr-blocks", type=int, default=10)
@@ -488,7 +528,7 @@ parser.add_argument(
     help="Cap the number of validation events",
 )
 parser.add_argument(
-    "--qmin", type=float, default=0.1, help="define qmin for condensation"
+    "--qmin", type=float, default=3.0, help="define qmin for condensation"
 )
 
 parser.add_argument(
@@ -500,7 +540,7 @@ parser.add_argument(
 parser.add_argument(
     "--L_repulsive_weight",
     type=float,
-    default=1.0,
+    default=2.0,
     help="Repulsive term of the potential weight",
 )
 
@@ -567,7 +607,7 @@ parser.add_argument(
     "--var-weight", type=float, default=0.3,
     help="within-truth-track embedding compactness weight",
 )
-parser.add_argument("--var-warmup-epochs", type=int, default=5)
+parser.add_argument("--var-warmup-epochs", type=int, default=1)
 parser.add_argument(
     "--hard-negative-weight", type=float, default=1.0,
     help="exponent for inverse nearest-truth-track delta-R repulsion weighting",
@@ -592,12 +632,21 @@ parser.add_argument(
     help="comma-separated positive track weights; requires len(edges)+1 values",
 )
 parser.add_argument(
-    "--helix-loss-weight", type=float, default=0.1,
+    "--helix-loss-weight", type=float, default=0.0,
     help="auxiliary inverse-pT and direction regression weight",
 )
 parser.add_argument("--weight-decay", type=float, default=1e-4)
-parser.add_argument("--min-lr", type=float, default=1e-6)
+parser.add_argument("--min-lr", type=float, default=1e-5)
 parser.add_argument("--warmup-epochs", type=float, default=2.0)
+parser.add_argument(
+    "--terminal-anneal-epochs",
+    type=int,
+    default=6,
+    help=(
+        "for reduceplateau, cap learning rate with a final half-cosine "
+        "anneal to --min-lr; 0 disables"
+    ),
+)
 parser.add_argument("--ema-decay", type=float, default=0.999)
 
 # Cheap post-inference validation sweep. These are strings so a complete grid

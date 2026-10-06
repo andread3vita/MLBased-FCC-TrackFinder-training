@@ -13,12 +13,22 @@ import sys
 
 
 from torch.utils.data import DataLoader
+from shared_training.event_batching import (
+    FixedEventBatchSampler,
+    TokenBudgetBatchSampler,
+)
+from src.data.config import DataConfig
+from src.dataset.shared_parquet_dataset import SharedGATrParquetDataset
 from src.logger.logger import _logger, _configLogger
 from src.dataset.dataset import SimpleIterDataset
 from src.utils.import_tools import import_module
 from src.layers.batch_operations import graph_batch_func
 from src.utils.data_loading import multiprocessing_loader_options
 from src.utils.data_sharding import shard_file_dict
+from src.utils.token_batching import (
+    TokenBudgetIterableDataset,
+    token_budget_collator,
+)
 
 
 def seed_data_worker(worker_id):
@@ -189,12 +199,118 @@ def to_filelist(args, mode="train"):
     return file_dict, filelist
 
 
+def train_load_shared(args):
+    """Build GATr loaders from CIRCE's canonical index and batch samplers."""
+    if not args.data_train or not args.data_val:
+        raise ValueError(
+            "--shared-indexed-loader requires explicit training and validation files"
+        )
+    train_paths = {
+        os.path.realpath(path.split(":", 1)[-1]) for path in args.data_train
+    }
+    val_paths = {
+        os.path.realpath(path.split(":", 1)[-1]) for path in args.data_val
+    }
+    overlap = sorted(train_paths & val_paths)
+    if overlap:
+        raise ValueError(
+            "Shared training and validation inputs overlap: "
+            + ", ".join(overlap[:3])
+        )
+    if args.class_edges:
+        raise ValueError("--shared-indexed-loader does not support edge labels")
+    if args.data_fraction != 1 or args.file_fraction != 1:
+        raise ValueError(
+            "--shared-indexed-loader requires complete files; data/file fractions "
+            "would make the two model arms consume different event plans"
+        )
+
+    train_data = SharedGATrParquetDataset(
+        args.data_train,
+        layers_per_superlayer=args.layers_per_superlayer,
+    )
+    val_data = SharedGATrParquetDataset(
+        args.data_val,
+        layers_per_superlayer=args.layers_per_superlayer,
+    )
+    if args.max_tokens > 0:
+        train_sampler = TokenBudgetBatchSampler(
+            train_data,
+            args.max_tokens,
+            shuffle=True,
+            drop_last=True,
+            stable_epoch_length=True,
+            seed=args.seed,
+        )
+        val_sampler = TokenBudgetBatchSampler(
+            val_data,
+            args.max_tokens,
+            shuffle=True,
+            drop_last=False,
+            stable_epoch_length=False,
+            seed=args.seed,
+        )
+    else:
+        train_sampler = FixedEventBatchSampler(
+            train_data,
+            args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            seed=args.seed,
+        )
+        val_sampler = FixedEventBatchSampler(
+            val_data,
+            args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            seed=args.seed,
+        )
+
+    worker_options = multiprocessing_loader_options(
+        args.num_workers,
+        args.prefetch_factor,
+        persistent_workers=True,
+    )
+    train_generator = torch.Generator().manual_seed(int(args.seed))
+    val_generator = torch.Generator().manual_seed(int(args.seed) + 10_000)
+    common_loader_options = dict(
+        pin_memory=True,
+        num_workers=args.num_workers,
+        collate_fn=graph_batch_func,
+        worker_init_fn=seed_data_worker,
+        **worker_options,
+    )
+    train_loader = DataLoader(
+        train_data,
+        batch_sampler=train_sampler,
+        generator=train_generator,
+        **common_loader_options,
+    )
+    val_loader = DataLoader(
+        val_data,
+        batch_sampler=val_sampler,
+        generator=val_generator,
+        **common_loader_options,
+    )
+
+    data_config = DataConfig.load(
+        args.data_config,
+        load_observers=False,
+        load_reweight_info=False,
+        extra_selection=args.extra_selection,
+    )
+    return train_loader, val_loader, data_config, data_config.input_names
+
+
 def train_load(args):
     """
     Loads the training data.
     :param args:
     :return: train_loader, val_loader, data_config, train_inputs
     """
+    if bool(getattr(args, "shared_indexed_loader", False)):
+        return train_load_shared(args)
+
     train_file_dict, train_files = to_filelist(args, "train")
     if args.data_val:
         val_file_dict, val_files = to_filelist(args, "val")
@@ -349,6 +465,31 @@ def train_load(args):
         collator_func = graph_batch_func_edges
     else:
         collator_func = graph_batch_func
+
+    if args.max_tokens > 0:
+        _logger.info(
+            "Using streaming token-budget batches with max_tokens=%d",
+            args.max_tokens,
+        )
+        train_data = TokenBudgetIterableDataset(
+            train_data,
+            args.max_tokens,
+            drop_last=True,
+            target_batches=args.steps_per_epoch,
+        )
+        val_data = TokenBudgetIterableDataset(
+            val_data,
+            args.max_tokens,
+            drop_last=False,
+            target_batches=args.steps_per_epoch_val,
+        )
+        loader_batch_size = None
+        loader_collator = token_budget_collator(collator_func)
+        loader_drop_last = False
+    else:
+        loader_batch_size = args.batch_size
+        loader_collator = collator_func
+        loader_drop_last = True
     # train_data_arg = train_data
     # val_data_arg = val_data
     # if args.train_cap == 1:
@@ -377,21 +518,21 @@ def train_load(args):
 
     train_loader = DataLoader(
         train_data,
-        batch_size=args.batch_size,
-        drop_last=True,
+        batch_size=loader_batch_size,
+        drop_last=loader_drop_last,
         pin_memory=True,
         num_workers=train_num_workers,
-        collate_fn=collator_func,
+        collate_fn=loader_collator,
         worker_init_fn=seed_data_worker,
         generator=train_generator,
         **train_worker_options,
     )
     val_loader = DataLoader(
         val_data,
-        batch_size=args.batch_size,
+        batch_size=loader_batch_size,
         drop_last=False,
         pin_memory=True,
-        collate_fn=collator_func,
+        collate_fn=loader_collator,
         num_workers=val_num_workers,
         worker_init_fn=seed_data_worker,
         generator=val_generator,

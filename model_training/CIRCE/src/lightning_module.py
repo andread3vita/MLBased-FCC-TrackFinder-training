@@ -135,12 +135,14 @@ class CGATrV35LightningModule(L.LightningModule):
         self._pending_ema_state: Optional[Dict[str, torch.Tensor]] = None
 
         self._val_loss_sum: float = 0.0
-        self._val_loss_n: int = 0
+        self._val_loss_event_count: int = 0
         self._val_metrics: List[Dict[str, float]] = []
         self._val_tracking_events = []
         self._train_loss_sum: float = 0.0
         self._train_loss_n: int = 0
         self._train_loss_sum_t: Optional[torch.Tensor] = None
+        self._last_train_batch_finite = False
+        self._finite_batches_since_optimizer_step = 0
 
     @property
     def embedding_dim(self) -> int:
@@ -277,7 +279,17 @@ class CGATrV35LightningModule(L.LightningModule):
         self._train_loss_n = 0
         self._train_loss_sum_t = None
 
+    def _zero_loss_for_skipped_batch(self) -> torch.Tensor:
+        """Return a finite zero connected to every trainable DDP parameter."""
+        parameter = next(self.parameters())
+        zero_loss = parameter.new_zeros(())
+        for parameter in self.parameters():
+            if parameter.requires_grad and parameter.numel() > 0:
+                zero_loss = zero_loss + parameter.reshape(-1)[0] * 0.0
+        return zero_loss
+
     def training_step(self, batch, batch_idx):
+        self._last_train_batch_finite = False
         if batch is None:
             return self._dummy_ddp_step()
 
@@ -288,9 +300,6 @@ class CGATrV35LightningModule(L.LightningModule):
             self.args.var_weight,
             self.args.var_warmup_epochs,
         )
-
-        if (s["mc_index_loss"] != s["noise_index"]).sum() < 4:
-            return (s["coords"].sum() + s["beta_val"].sum()) * 0.0
 
         loss, comp = object_condensation_loss(
             coords=s["coords"],
@@ -310,11 +319,27 @@ class CGATrV35LightningModule(L.LightningModule):
             track_separation_weight=s["track_separation_weight"],
         )
 
-        if torch.isnan(loss).any() or torch.isinf(loss).any():
+        local_bad = (~torch.isfinite(loss)) | (~torch.isfinite(s["output"]).all())
+        global_bad = local_bad.to(dtype=torch.int32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(global_bad, op=dist.ReduceOp.MAX)
+        if bool(global_bad.item()):
+            parameters_finite = torch.stack([
+                torch.isfinite(parameter.detach()).all()
+                for parameter in self.parameters()
+                if parameter.requires_grad
+            ]).all().to(dtype=torch.int32, device=loss.device)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(parameters_finite, op=dist.ReduceOp.MIN)
+            if not bool(parameters_finite.item()):
+                raise FloatingPointError(
+                    "Model parameters became non-finite; refusing to skip a "
+                    "batch after model state corruption"
+                )
             self.log("train/nan_skip", 1.0, on_step=True, on_epoch=False,
                      prog_bar=False, sync_dist=False, logger=False,
                      batch_size=n_events)
-            return (s["coords"].sum() + s["beta_val"].sum()) * 0.0
+            return self._zero_loss_for_skipped_batch()
 
         loss_d = loss.detach()
         if self._train_loss_sum_t is None:
@@ -332,9 +357,15 @@ class CGATrV35LightningModule(L.LightningModule):
             vw,
             n_events,
         )
+        self._last_train_batch_finite = True
+        self._finite_batches_since_optimizer_step += 1
         return loss
 
     # gradient clipping is handled by Trainer(gradient_clip_val=1.0)
+
+    def on_before_optimizer_step(self, optimizer):
+        if self._finite_batches_since_optimizer_step == 0:
+            optimizer.zero_grad(set_to_none=True)
 
     # ---- validation lifecycle ----------------------------------------------
     def on_validation_epoch_start(self):
@@ -344,7 +375,7 @@ class CGATrV35LightningModule(L.LightningModule):
             }
             self.model.load_state_dict(self._ema.state_dict())
         self._val_loss_sum = 0.0
-        self._val_loss_n = 0
+        self._val_loss_event_count = 0
         self._val_metrics = []
         self._val_tracking_events = []
 
@@ -353,24 +384,24 @@ class CGATrV35LightningModule(L.LightningModule):
             return
         s = self._shared_step(batch)
 
-        if (s["mc_index_loss"] != s["noise_index"]).sum() >= 4:
-            loss = object_condensation_loss(
-                coords=s["coords"],
-                beta=s["beta_val"],
-                mc_index=s["mc_index_loss"].long(),
-                batch=s["batch_ids"].long(),
-                noise_index=s["noise_index"],
-                qmin=self.args.qmin,
-                attr_weight=self.args.attr_weight,
-                repul_weight=self.args.repul_weight,
-                beta_suppress_weight=self.args.beta_suppress_weight,
-                var_weight=float(self.args.var_weight),
-                oc_mode=self.args.oc_mode,
-                track_separation_weight=s["track_separation_weight"],
-            )
-            if not (torch.isnan(loss) or torch.isinf(loss)):
-                self._val_loss_sum += float(loss.item())
-                self._val_loss_n += 1
+        loss = object_condensation_loss(
+            coords=s["coords"],
+            beta=s["beta_val"],
+            mc_index=s["mc_index_loss"].long(),
+            batch=s["batch_ids"].long(),
+            noise_index=s["noise_index"],
+            qmin=self.args.qmin,
+            attr_weight=self.args.attr_weight,
+            repul_weight=self.args.repul_weight,
+            beta_suppress_weight=self.args.beta_suppress_weight,
+            var_weight=float(self.args.var_weight),
+            oc_mode=self.args.oc_mode,
+            track_separation_weight=s["track_separation_weight"],
+        )
+        if torch.isfinite(loss):
+            n_events = len(s["seq_lens"])
+            self._val_loss_sum += float(loss.item()) * n_events
+            self._val_loss_event_count += n_events
 
         # Cache exactly the representation accepted by GATr's current metric
         # code. Truth IDs are positive and event-local; zero denotes noise.
@@ -405,7 +436,16 @@ class CGATrV35LightningModule(L.LightningModule):
             offset = end
 
     def on_validation_epoch_end(self):
-        avg_loss = self._val_loss_sum / max(self._val_loss_n, 1)
+        device = next(self.model.parameters()).device
+        loss_stats = torch.tensor(
+            [self._val_loss_sum, self._val_loss_event_count],
+            dtype=torch.float64,
+            device=device,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
+        global_loss_sum, global_loss_event_count = loss_stats.tolist()
+        avg_loss = global_loss_sum / max(global_loss_event_count, 1.0)
         tbetas = parse_grid(self.args.sweep_tbeta_grid, float)
         tds = parse_grid(self.args.sweep_td_grid, float)
         min_hits = parse_grid(self.args.sweep_min_hits_grid, int)
@@ -420,7 +460,6 @@ class CGATrV35LightningModule(L.LightningModule):
             truth_min_hits=int(self.args.sweep_truth_min_hits),
             rejected_seed_policy=self.args.rejected_seed_policy,
         )
-        device = next(self.model.parameters()).device
         count_tensor = torch.tensor(
             [[row[key] for key in TRACKING_COUNT_KEYS] for row in local_rows],
             dtype=torch.int64, device=device,
@@ -579,7 +618,7 @@ class CGATrV35LightningModule(L.LightningModule):
             print(
                 f"  {tag} | Val Loss: {avg_loss:.4f} | "
                 f"GATr metric: efficiency={avg_eff:.3f}, fake={avg_fake:.3f} | "
-                f"({self._val_loss_n} batches)",
+                f"({int(global_loss_event_count)} events)",
                 flush=True,
             )
 
@@ -612,7 +651,7 @@ class CGATrV35LightningModule(L.LightningModule):
 
     # ---- EMA + ckpt hooks ---------------------------------------------------
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        if self._ema is not None:
+        if self._ema is not None and self._last_train_batch_finite:
             self._ema.update(self.model)
 
     def on_save_checkpoint(self, checkpoint):
@@ -783,3 +822,4 @@ class CGATrV35LightningModule(L.LightningModule):
                     for pg in optimizer.param_groups:
                         pg["lr"] = min(float(pg["lr"]), cap)
         super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
+        self._finite_batches_since_optimizer_step = 0

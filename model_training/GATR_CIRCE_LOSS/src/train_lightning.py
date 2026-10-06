@@ -41,6 +41,7 @@ from src.utils.train_utils import (
     get_rank_device,
 )
 from src.utils.validation import resolve_validation_batch_limit
+from src.utils.token_batching import stable_steps_per_rank
 from shared_training.wandb_logger import build_experiment_logger
 
 import warnings
@@ -91,6 +92,16 @@ class ValidationSweepModelCheckpoint(ModelCheckpoint):
         if not getattr(pl_module, "_validation_working_points", None):
             return
         super().on_validation_end(trainer, pl_module)
+
+
+class SharedBatchSamplerEpochCallback(Callback):
+    """Advance the common CIRCE batch plan exactly once per train epoch."""
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        loader = trainer.train_dataloader
+        batch_sampler = getattr(loader, "batch_sampler", None)
+        if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
+            batch_sampler.set_epoch(trainer.current_epoch)
 
 
 class TrainingStabilityMonitor(Callback):
@@ -263,14 +274,22 @@ def main():
         parser.error("--seed must be between 0 and 4294967295")
     if args.batch_size < 1:
         parser.error("--batch-size must be a positive integer")
+    if args.max_tokens < 0:
+        parser.error("--max-tokens must be non-negative")
     if args.accumulate_grad_batches < 1:
         parser.error("--accumulate-grad-batches must be a positive integer")
     if not math.isfinite(args.gradient_clip_val) or args.gradient_clip_val < 0.0:
         parser.error("--gradient-clip-val must be a finite non-negative number")
-    if args.checkpoint_every_n_train_steps < 1:
-        parser.error("--checkpoint-every-n-train-steps must be a positive integer")
+    if args.checkpoint_every_n_train_steps < 0:
+        parser.error("--checkpoint-every-n-train-steps must be non-negative")
+    if args.terminal_anneal_epochs < 0:
+        parser.error("--terminal-anneal-epochs must be non-negative")
+    if args.terminal_anneal_epochs >= args.num_epochs:
+        parser.error("--terminal-anneal-epochs must be smaller than --num-epochs")
     if args.num_workers < 0:
         parser.error("--num-workers must be a non-negative integer")
+    if args.cpu_threads < 0:
+        parser.error("--cpu-threads must be a non-negative integer")
     if args.prefetch_factor < 1:
         parser.error("--prefetch-factor must be a positive integer")
     if not args.gpus or not args.gpus.strip():
@@ -306,6 +325,14 @@ def main():
             "--wandb-displayname, --wandb-projectname, and --wandb-entity "
             "require --log-wandb"
         )
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    if args.cpu_threads > 0:
+        torch.set_num_threads(args.cpu_threads)
+        os.environ.setdefault("OMP_NUM_THREADS", str(args.cpu_threads))
+        os.environ.setdefault("MKL_NUM_THREADS", str(args.cpu_threads))
     L.seed_everything(args.seed, workers=True)
     
     validation_data_requested = bool(args.data_val)
@@ -320,12 +347,47 @@ def main():
         sys.exit(1)
         
     args = get_samples_steps_per_epoch(args)
+    if (
+        args.max_tokens > 0
+        and args.steps_per_epoch is None
+        and not args.shared_indexed_loader
+    ):
+        (
+            args.steps_per_epoch,
+            token_event_count,
+            min_global_batches,
+            max_global_batches,
+        ) = stable_steps_per_rank(
+            args.data_train,
+            args.max_tokens,
+            len(configured_gpus),
+        )
+        print(
+            "Token-budget epoch plan: "
+            f"{token_event_count} events, max_tokens={args.max_tokens}, "
+            f"{args.steps_per_epoch} steps/rank "
+            f"(64-epoch global packing range "
+            f"{min_global_batches}-{max_global_batches})",
+            flush=True,
+        )
     try:
         validation_batch_limit = resolve_validation_batch_limit(
             args.limit_val_batches
         )
     except ValueError as error:
         parser.error(str(error))
+    if args.limit_train_batches is not None:
+        if args.limit_train_batches <= 0:
+            parser.error("--limit-train-batches must be positive")
+        training_batch_limit = (
+            int(args.limit_train_batches)
+            if args.limit_train_batches >= 1
+            else float(args.limit_train_batches)
+        )
+    else:
+        training_batch_limit = (
+            args.steps_per_epoch if args.steps_per_epoch is not None else 1.0
+        )
     training_mode = not args.predict
     
     gpus, process_device = get_rank_device(args)
@@ -352,14 +414,6 @@ def main():
     if training_mode:
         print("USING TRAINING MODE")
 
-        step_checkpoint_callback = ModelCheckpoint(
-            dirpath=args.model_prefix,
-            filename="_{epoch}_{step}",
-            every_n_train_steps=args.checkpoint_every_n_train_steps,
-            save_top_k=-1,
-            save_weights_only=True,
-        )
-
         validation_checkpoint_callback = ValidationSweepModelCheckpoint(
             dirpath=args.model_prefix,
             filename=(
@@ -375,10 +429,19 @@ def main():
         )
         
         callbacks = [
-            TQDMProgressBar(refresh_rate=10),
-            step_checkpoint_callback,
+            TQDMProgressBar(refresh_rate=50),
             validation_checkpoint_callback,
         ]
+        if args.shared_indexed_loader:
+            callbacks.append(SharedBatchSamplerEpochCallback())
+        if args.checkpoint_every_n_train_steps > 0:
+            callbacks.append(ModelCheckpoint(
+                dirpath=args.model_prefix,
+                filename="_{epoch}_{step}",
+                every_n_train_steps=args.checkpoint_every_n_train_steps,
+                save_top_k=-1,
+                save_weights_only=True,
+            ))
 
         if len(gpus) > 1:
             distributed_backend = args.backend or "nccl"
@@ -389,6 +452,10 @@ def main():
                 )
             strategy = DDPStrategy(
                 process_group_backend=distributed_backend,
+                find_unused_parameters=False,
+                broadcast_buffers=False,
+                gradient_as_bucket_view=True,
+                static_graph=True,
             )
         else:
             strategy = "auto"
@@ -400,19 +467,16 @@ def main():
             default_root_dir=args.model_prefix,
             logger=experiment_logger,
             max_epochs=args.num_epochs,
-            limit_train_batches=(
-                args.steps_per_epoch
-                if args.steps_per_epoch is not None
-                else 1.0
-            ),
+            limit_train_batches=training_batch_limit,
             strategy=strategy,
             accumulate_grad_batches=args.accumulate_grad_batches,
-            log_every_n_steps=1,
+            log_every_n_steps=50,
             limit_val_batches=validation_batch_limit,
             # Pre-training validation is explicitly opt-in below.
             num_sanity_val_steps=0,
-            precision="bf16-mixed",
+            precision=args.precision,
             gradient_clip_val=args.gradient_clip_val,
+            use_distributed_sampler=not args.shared_indexed_loader,
         )
 
         args.local_rank = trainer.global_rank

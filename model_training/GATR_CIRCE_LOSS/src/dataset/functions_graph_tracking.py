@@ -38,18 +38,31 @@ def find_cluster_id(hit_particle_link):
 
 
 def _aligned_particle_features(
-    features_particles, signal_ids, file_id=None, event_id=None
+    features_particles, signal_ids, file_id=None, event_id=None,
+    allow_empty=False, tolerate_malformed=False,
 ):
     """Select and order truth rows to match the mapped cluster-ID ordering.
 
-    Every particle referenced by a signal hit must occur exactly once in the
-    particle table. Malformed events are skipped by returning ``None`` so a
-    worker does not die on an opaque assertion failure.
+    In the legacy path every particle referenced by a signal hit must occur
+    exactly once in the particle table, otherwise the event is skipped. The
+    shared comparison path is deliberately tolerant: CIRCE does not reject an
+    event because optional particle metadata is incomplete, so GATr keeps the
+    event and retains every available metadata row for a referenced particle.
     """
     signal_ids = torch.as_tensor(signal_ids, dtype=torch.int64)
     if signal_ids.numel() == 0:
-        return None
+        return features_particles[:0] if allow_empty else None
     if features_particles.ndim != 2 or features_particles.shape[1] <= 4:
+        if tolerate_malformed:
+            print(
+                "WARNING: preserving shared event with no usable particle-ID "
+                f"column (file={file_id}, event={event_id}); particle metadata "
+                "will be empty",
+                flush=True,
+            )
+            if features_particles.ndim == 2:
+                return features_particles[:0]
+            return torch.empty((0, 0), dtype=torch.float32)
         print(
             "WARNING: skipping malformed event with no particle-ID column "
             f"(file={file_id}, event={event_id})",
@@ -62,18 +75,38 @@ def _aligned_particle_features(
         raw_particle_ids == torch.round(raw_particle_ids)
     )
     if not bool(valid_ids.all()):
-        print(
-            "WARNING: skipping event with non-finite or non-integral truth "
-            f"particle IDs (file={file_id}, event={event_id})",
-            flush=True,
-        )
-        return None
+        if tolerate_malformed:
+            print(
+                "WARNING: preserving shared event with non-finite or "
+                "non-integral truth particle IDs "
+                f"(file={file_id}, event={event_id}); invalid metadata rows "
+                "will be ignored",
+                flush=True,
+            )
+            features_particles = features_particles[valid_ids]
+            raw_particle_ids = raw_particle_ids[valid_ids]
+            if features_particles.shape[0] == 0:
+                return features_particles
+        else:
+            print(
+                "WARNING: skipping event with non-finite or non-integral truth "
+                f"particle IDs (file={file_id}, event={event_id})",
+                flush=True,
+            )
+            return None
 
     particle_ids = raw_particle_ids.to(torch.int64)
     table_ids, table_counts = torch.unique(
         particle_ids, sorted=True, return_counts=True
     )
     if table_ids.numel() == 0:
+        if tolerate_malformed:
+            print(
+                "WARNING: preserving shared event with signal hits but no "
+                f"truth particle metadata (file={file_id}, event={event_id})",
+                flush=True,
+            )
+            return features_particles[:0]
         print(
             "WARNING: skipping event with signal hits but no truth particles "
             f"(file={file_id}, event={event_id})",
@@ -91,6 +124,19 @@ def _aligned_particle_features(
     if not bool(valid_matches.all()):
         missing_ids = signal_ids[match_counts == 0].tolist()
         duplicate_ids = signal_ids[match_counts > 1].tolist()
+        if tolerate_malformed:
+            print(
+                "WARNING: preserving shared event with inconsistent hit/truth "
+                f"particle IDs: missing={missing_ids}, "
+                f"duplicates={duplicate_ids}, file={file_id}, event={event_id}; "
+                "available particle metadata rows will be retained",
+                flush=True,
+            )
+            # CIRCE builds its particle-info mapping from every stored row and
+            # naturally tolerates missing or repeated IDs. Preserve the same
+            # available rows here; the shared launcher disables the auxiliary
+            # helix regression, so these rows are validation metadata only.
+            return features_particles[torch.isin(particle_ids, signal_ids)]
         print(
             "WARNING: skipping event with inconsistent hit/truth particle IDs: "
             f"missing={missing_ids}, duplicates={duplicate_ids}, "
@@ -104,7 +150,8 @@ def _aligned_particle_features(
     return features_particles[particle_order[row_positions]]
 
 def create_inputs_from_table(
-    output, get_vtx, overlay=False, file_id=None, event_id=None
+    output, get_vtx, overlay=False, file_id=None, event_id=None,
+    allow_empty_truth=False, preserve_nonfinite_hits=False,
 ):
 
     graph_empty = False
@@ -145,13 +192,13 @@ def create_inputs_from_table(
         (1, 0),
     )
 
-    # One non-finite token contaminates its complete event through full
-    # self-attention. Remove malformed measured hits before constructing the
-    # graph, and derive the truth-object list again from the remaining links.
+    # The legacy GATr loader removes malformed hits. The shared comparison path
+    # preserves them because CIRCE feeds them forward and lets the synchronized
+    # non-finite-batch policy skip the complete batch on every DDP rank.
     finite_hits = torch.isfinite(features_hits).all(dim=1) & torch.isfinite(
         hit_particle_link
     )
-    if not bool(finite_hits.all()):
+    if not bool(finite_hits.all()) and not preserve_nonfinite_hits:
         removed_hits = int((~finite_hits).sum())
         print(
             "WARNING: dropping "
@@ -170,10 +217,22 @@ def create_inputs_from_table(
 
     hit_type = features_hits[:, 9].clone()
 
-    hit_type_one_hot = torch.nn.functional.one_hot(
-        hit_type.long(),
-        num_classes=2,
-    )
+    if preserve_nonfinite_hits:
+        # This tensor is only an intermediate graph-construction aid. CIRCE
+        # selects hit_type 0/1 and leaves any malformed type out of its feature
+        # view, so avoid failing in one_hot before the same masks are applied.
+        hit_type_one_hot = torch.zeros(
+            hit_type.shape[0], 2, dtype=torch.int64, device=hit_type.device
+        )
+        valid_hit_type = (hit_type == 0) | (hit_type == 1)
+        hit_type_one_hot[valid_hit_type] = torch.nn.functional.one_hot(
+            hit_type[valid_hit_type].long(), num_classes=2
+        )
+    else:
+        hit_type_one_hot = torch.nn.functional.one_hot(
+            hit_type.long(),
+            num_classes=2,
+        )
 
     if get_vtx:
         hit_type_one_hot = hit_type_one_hot
@@ -206,6 +265,8 @@ def create_inputs_from_table(
         signal_ids,
         file_id=file_id,
         event_id=event_id,
+        allow_empty=allow_empty_truth,
+        tolerate_malformed=allow_empty_truth,
     )
     if y_data_graph is None:
         return [None]
@@ -236,6 +297,7 @@ def create_graph_tracking_global(
     vector=False,
     overlay=False,
     layers_per_superlayer=DEFAULT_LAYERS_PER_SUPERLAYER,
+    keep_all_events=False,
 ):
     
     graph_empty = False
@@ -245,6 +307,8 @@ def create_graph_tracking_global(
         overlay=overlay,
         file_id=fileID,
         event_id=eventID,
+        allow_empty_truth=keep_all_events,
+        preserve_nonfinite_hits=keep_all_events,
     )
     
     if len(result) == 1:
@@ -281,7 +345,8 @@ def create_graph_tracking_global(
                 features_hits = features_hits[mask_not_lowEnergy]
                 hit_type = hit_type[mask_not_lowEnergy]
                 
-                y_data_graph = y_data_graph[mask_particles]
+                if not keep_all_events:
+                    y_data_graph = y_data_graph[mask_particles]
                 
                 # Compute the cluster id
                 cluster_id, unique_list_particles = find_cluster_id(hit_particle_link)    
@@ -300,7 +365,8 @@ def create_graph_tracking_global(
                 isProducedBySecondary = isProducedBySecondary[numpy_keep]
                 isOverlay = isOverlay[numpy_keep]
                 
-                y_data_graph = y_data_graph[mask_particles]
+                if not keep_all_events:
+                    y_data_graph = y_data_graph[mask_particles]
                 
                 # Compute the cluster id
                 cluster_id, unique_list_particles = find_cluster_id(hit_particle_link)    
@@ -311,7 +377,8 @@ def create_graph_tracking_global(
                 original_particle_link = hit_particle_link.clone()
                 mask_not_garbage, mask_particles = create_garbage_label(hit_particle_link, isProducedBySecondary, cluster_id, 3)
                 hit_particle_link[~mask_not_garbage] = -1
-                y_data_graph = y_data_graph[mask_particles]
+                if not keep_all_events:
+                    y_data_graph = y_data_graph[mask_particles]
                 cluster_id, unique_list_particles = find_cluster_id(hit_particle_link)
 
         else:
@@ -326,7 +393,8 @@ def create_graph_tracking_global(
                 original_particle_link = hit_particle_link.clone()
                 mask_not_garbage, mask_particles = create_garbage_label_overlay(hit_particle_link, isProducedBySecondary, isOverlay, cluster_id, 3)
                 hit_particle_link[~mask_not_garbage] = -1
-                y_data_graph = y_data_graph[mask_particles]
+                if not keep_all_events:
+                    y_data_graph = y_data_graph[mask_particles]
                 cluster_id, unique_list_particles = find_cluster_id(hit_particle_link)
 
 
@@ -511,10 +579,10 @@ def create_graph_tracking_global(
             g.ndata["is_overlay"] = is_overlay
             g.ndata["isSecondary"] = produced_from_secondary_
             
-            if len(y_data_graph) < 1:
+            if len(y_data_graph) < 1 and not keep_all_events:
                 graph_empty = True
                 
-            if features_hits.shape[0] < 10:
+            if features_hits.shape[0] < 10 and not keep_all_events:
                 graph_empty = True
         else:
             graph_empty = True
@@ -528,6 +596,8 @@ def create_graph_tracking_global(
                 signal_ids,
                 file_id=fileID,
                 event_id=eventID,
+                allow_empty=keep_all_events,
+                tolerate_malformed=keep_all_events,
             )
             if y_data_graph is None:
                 graph_empty = True

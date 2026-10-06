@@ -61,9 +61,13 @@ import signal as _signal
 
 from src.lightning_module import CGATrV35LightningModule
 from src.dataset.parquet_dataset import (
-    IDEAParquetDataset, TokenBudgetBatchSampler, collate_idea_events,
+    IDEAParquetDataset, collate_idea_events,
 )
 from shared_training.circe_parquet_dataset import SharedIDEAParquetDataset
+from shared_training.event_batching import (
+    FixedEventBatchSampler,
+    TokenBudgetBatchSampler,
+)
 from shared_training.wandb_logger import build_experiment_logger
 
 
@@ -547,6 +551,7 @@ def make_loaders(args):
             train_ds, max_tokens=args.max_tokens,
             shuffle=True, drop_last=True,
             stable_epoch_length=not args.legacy_variable_epoch_batches,
+            seed=args.seed,
         )
         # The sampler sorts by event size before packing. With shuffle=False,
         # Lightning's --limit_val_batches takes only the smallest events: for
@@ -559,6 +564,7 @@ def make_loaders(args):
             val_ds, max_tokens=args.max_tokens,
             shuffle=True, drop_last=False,
             stable_epoch_length=False,
+            seed=args.seed,
         )
         train_loader = DataLoader(
             train_ds, batch_sampler=train_sampler, **base_kwargs,
@@ -567,14 +573,20 @@ def make_loaders(args):
             val_ds, batch_sampler=val_sampler, **base_kwargs,
         )
     else:
-        print(f"DataLoader: fixed batch_size={args.batch_size}", flush=True)
+        print(f"DataLoader: shared fixed batch_size={args.batch_size}", flush=True)
+        train_sampler = FixedEventBatchSampler(
+            train_ds, args.batch_size, shuffle=True, drop_last=True,
+            seed=args.seed,
+        )
+        val_sampler = FixedEventBatchSampler(
+            val_ds, args.batch_size, shuffle=False, drop_last=False,
+            seed=args.seed,
+        )
         train_loader = DataLoader(
-            train_ds, shuffle=True, drop_last=True,
-            batch_size=args.batch_size, **base_kwargs,
+            train_ds, batch_sampler=train_sampler, **base_kwargs,
         )
         val_loader = DataLoader(
-            val_ds, shuffle=False, drop_last=False,
-            batch_size=args.batch_size, **base_kwargs,
+            val_ds, batch_sampler=val_sampler, **base_kwargs,
         )
     return train_loader, val_loader
 
@@ -807,7 +819,9 @@ def main():
     else:
         strategy = "auto"
 
-    use_distributed_sampler = (args.max_tokens == 0)
+    # Both token and fixed-size paths already divide one canonical global plan
+    # between ranks. Lightning must not replace either shared sampler.
+    use_distributed_sampler = False
 
     plugins = []
     _under_slurm = "SLURM_JOB_ID" in os.environ

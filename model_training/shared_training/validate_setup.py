@@ -11,12 +11,15 @@ import pyarrow.parquet as pq
 
 
 REQUIRED = {
+    "event_number", "file_number", "n_hit", "n_part",
+    "hit_x_true", "hit_y_true", "hit_z_true", "hit_time",
     "hit_x", "hit_y", "hit_z", "leftPosition_x", "leftPosition_y",
     "leftPosition_z", "rightPosition_x", "rightPosition_y",
     "rightPosition_z", "drift_distance", "wire_azimuthal_angle",
     "wire_stereo_angle", "hit_type", "hit_particle_index",
-    "produced_by_secondary", "part_id", "part_p_t", "part_theta", "gen_status",
-    "part_vertex_x", "part_vertex_y",
+    "produced_by_secondary", "overlay", "part_p", "part_p_t", "part_theta",
+    "part_phi", "part_m", "part_pid", "part_id", "gen_status", "part_parent",
+    "part_vertex_x", "part_vertex_y", "part_vertex_z",
     "shared_schema_version",
 }
 

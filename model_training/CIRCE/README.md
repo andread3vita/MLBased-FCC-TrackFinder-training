@@ -117,8 +117,10 @@ sbatch train.slurm
 NUM_DEVICES=4 bash run_train.sh
 ```
 
-Training checkpoints every 200 steps. Auto-resumes on SLURM requeue with
-`--resume_ckpt last` (picks up the latest `last.ckpt` or `last-v*.ckpt`).
+Full checkpoints are saved after every completed validation sweep as
+`validation_epoch=E_step=S_pareto_f1=F_max_eff=M.ckpt`. The production wrapper
+also enables periodic full safety checkpoints every 200 optimizer steps and
+auto-resumes on SLURM requeue with `--resume_ckpt last`.
 
 ## Tunables
 
@@ -137,7 +139,7 @@ Training checkpoints every 200 steps. Auto-resumes on SLURM requeue with
 
 ### 1. Built-in End-to-End Pipeline
 ```bash
-N_GPUS=4 DATA_DIR=/path/to/eval-keepall bash run_eval.sh checkpoints/circe_production/cgatr_best.ckpt
+N_GPUS=4 DATA_DIR=/path/to/eval-keepall bash run_eval.sh 'checkpoints/circe_production/validation_epoch=E_step=S_pareto_f1=F_max_eff=M.ckpt'
 ```
 The eval pipeline runs in 4 stages:
 1. Sharded GPU forward pass (one shard per GPU) producing `forward_hits.parquet`

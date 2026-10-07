@@ -42,7 +42,11 @@ CIRCE's canonical map-style Parquet index and the same global batch plan:
 events are size-bucket shuffled, packed to the shared hit budget, truncated to
 an equal DDP length, and only then divided between ranks. DataLoader workers
 receive already-planned event indices and never independently shard files or
-repack streams. Only the event-to-feature transform is model-specific. Override
+repack streams. Both loaders call the same
+`shared_training.collation.collate_shared_events` entry point. It dispatches
+only the final model representation: concatenated tensors plus particle
+metadata for CIRCE, or a batched DGL graph plus particle rows for GATr. Only
+the event-to-feature transform is model-specific. Override
 the shared defaults with `TRAIN_PRECISION`, `MAX_TOKENS`, `NUM_EPOCHS`,
 `LIMIT_VAL_BATCHES`, or the other environment variables declared near the top
 of `train_circe_gatr_shared.sh`. Set `MAX_TOKENS=0` to return both models to
@@ -67,6 +71,12 @@ implementation and supplies greedy clustering, one-to-one double-majority
 matching, count-weighted fake rate/tracking efficiency, and operating-point
 selection. CIRCE alone turns wire/radius/angle into a full CGA circle; GATr
 continues to turn wire plus left/right positions into its PGA inputs.
+
+After each validation epoch, both comparison arms also upload the same two
+interactive event-0 hit displays to W&B: one coloured by the original MC
+particle ID and one by the reconstructed particle ID at the selected Pareto-F1
+working point. The HTML copies are retained in that epoch's
+`validation_sweeps` directory.
 
 The shared evaluator supports `idea`, `double_majority`, and `hungarian`
 matching. `hungarian` performs a global one-to-one assignment that maximizes

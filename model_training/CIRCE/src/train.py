@@ -61,14 +61,37 @@ import signal as _signal
 
 from src.lightning_module import CGATrV35LightningModule
 from src.dataset.parquet_dataset import (
-    IDEAParquetDataset, collate_idea_events,
+    IDEAParquetDataset, collate_idea_events as collate_legacy_idea_events,
 )
 from shared_training.circe_parquet_dataset import SharedIDEAParquetDataset
+from shared_training.collation import collate_shared_events
 from shared_training.event_batching import (
     FixedEventBatchSampler,
     TokenBudgetBatchSampler,
 )
 from shared_training.wandb_logger import build_experiment_logger
+
+
+class ValidationSweepModelCheckpoint(ModelCheckpoint):
+    """Save one full checkpoint after each completed validation sweep."""
+
+    def _save_checkpoint(self, trainer, filepath):
+        model = trainer.lightning_module
+        previous_value = getattr(
+            model, "_saving_validation_sweep_checkpoint", False
+        )
+        model._saving_validation_sweep_checkpoint = True
+        try:
+            super()._save_checkpoint(trainer, filepath)
+        finally:
+            model._saving_validation_sweep_checkpoint = previous_value
+
+    def on_validation_end(self, trainer, pl_module):
+        # Avoid writing a checkpoint with stale filename metrics when a
+        # validation loader produced no operating-point sweep.
+        if not getattr(pl_module, "_validation_working_points", None):
+            return
+        super().on_validation_end(trainer, pl_module)
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +534,7 @@ def make_loaders(args):
         )
         train_ds = SharedIDEAParquetDataset(args.train_files, **common)
         val_ds = SharedIDEAParquetDataset(args.val_files, **common)
+        collate_fn = collate_shared_events
     else:
         train_ds = IDEAParquetDataset(args.data_dir, seed_range=(tr_a, tr_b),
                                       max_hits_per_event=max_hits,
@@ -528,11 +552,12 @@ def make_loaders(args):
                                     min_target_hits=args.min_target_hits,
                                     secondaries_as_noise=args.secondaries_as_noise,
                                     **ggtf_targets)
+        collate_fn = collate_legacy_idea_events
 
     _pin = os.environ.get("CGATR_PIN_MEMORY", "1") not in ("0", "false", "False")
     base_kwargs = dict(
         num_workers=args.num_workers,
-        collate_fn=collate_idea_events,
+        collate_fn=collate_fn,
         pin_memory=_pin,
     )
     if args.num_workers > 0:
@@ -775,23 +800,18 @@ def main():
     )
 
     callbacks = [
-        ModelCheckpoint(
+        ValidationSweepModelCheckpoint(
             dirpath=args.output_dir,
-            filename="cgatr_epoch{epoch:02d}",
+            filename=(
+                "validation_epoch={epoch}_step={step}_"
+                "pareto_f1={val_pareto_f1:.4f}_"
+                "max_eff={val_max_tracking_efficiency:.4f}"
+            ),
             auto_insert_metric_name=False,
             every_n_epochs=1,
             save_top_k=-1,
-            save_last=True,
             save_weights_only=False,
-        ),
-        ModelCheckpoint(
-            dirpath=args.output_dir,
-            filename="cgatr_best",
-            auto_insert_metric_name=False,
-            monitor="val_loss",
-            mode="min",
-            save_top_k=1,
-            save_weights_only=False,
+            save_on_train_epoch_end=False,
         ),
         _BatchSamplerEpochCallback(),
         _HeartbeatCallback(every_n_steps=50),

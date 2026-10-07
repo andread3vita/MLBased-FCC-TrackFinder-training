@@ -46,6 +46,7 @@ from shared_training.logging_contract import (
 from shared_training.wandb_logger import (
     log_wandb_media, tracking_efficiency_media, wandb_html, wandb_image,
 )
+from shared_training.validation_media import validation_event_media
 from shared_training.tracking_metrics import (
     TRACKING_COUNT_KEYS,
     TRACKING_DISPLACEMENT_BINS,
@@ -879,87 +880,13 @@ class ExampleWrapper(L.LightningModule):
 
     def _first_validation_event_media(self, event, working_point, output_dir=None):
         """Build detector- and embedding-space media for the first event."""
-        from shared_training.tracking_metrics import greedy_cluster
-        reco_labels = greedy_cluster(
-            event["beta"],
-            event["coords"],
-            float(working_point["tbeta"]),
-            float(working_point["td"]),
-            int(working_point["min_hits"]),
+        html_payloads = validation_event_media(
+            event,
+            working_point,
             rejected_seed_policy=self.rejected_seed_policy,
+            output_dir=output_dir,
+            include_embedding=True,
         )
-        hits_mc_fig = self._validation_scatter_figure(
-            event["positions"],
-            event["mc_particle_id"],
-            "MC particle index",
-            "Validation event 0: hits coloured by MC particle index",
-            ("x", "y", "z"),
-        )
-        hits_reco_fig = self._validation_scatter_figure(
-            event["positions"],
-            reco_labels,
-            "Reconstructed particle index",
-            "Validation event 0: hits coloured by reconstructed index",
-            ("x", "y", "z"),
-        )
-        embedding_points, embedding_axes, embedding_description = (
-            self._embedding_plot_coordinates(event["coords"])
-        )
-        embedding_mc_fig = self._validation_scatter_figure(
-            embedding_points,
-            event["mc_particle_id"],
-            "MC particle index",
-            (
-                "Validation event 0: embedding coloured by MC particle index "
-                f"({embedding_description})"
-            ),
-            embedding_axes,
-        )
-        embedding_reco_fig = self._validation_scatter_figure(
-            embedding_points,
-            reco_labels,
-            "Reconstructed particle index",
-            (
-                "Validation event 0: embedding coloured by reconstructed index "
-                f"({embedding_description})"
-            ),
-            embedding_axes,
-        )
-        html_payloads = {
-            "plots/validation_event_0/hits_by_mc_particle": hits_mc_fig.to_html(
-                full_html=False, include_plotlyjs="cdn"
-            ),
-            "plots/validation_event_0/hits_by_reconstructed_particle": (
-                hits_reco_fig.to_html(full_html=False, include_plotlyjs="cdn")
-            ),
-            "plots/validation_event_0/embedding_by_mc_particle": (
-                embedding_mc_fig.to_html(full_html=False, include_plotlyjs="cdn")
-            ),
-            "plots/validation_event_0/embedding_by_reconstructed_particle": (
-                embedding_reco_fig.to_html(full_html=False, include_plotlyjs="cdn")
-            ),
-        }
-        if output_dir is not None:
-            output_dir = Path(output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_names = {
-                "plots/validation_event_0/hits_by_mc_particle": (
-                    "validation_event_0_hits_by_mc_particle.html"
-                ),
-                "plots/validation_event_0/hits_by_reconstructed_particle": (
-                    "validation_event_0_hits_by_reconstructed_particle.html"
-                ),
-                "plots/validation_event_0/embedding_by_mc_particle": (
-                    "validation_event_0_embedding_by_mc_particle.html"
-                ),
-                "plots/validation_event_0/embedding_by_reconstructed_particle": (
-                    "validation_event_0_embedding_by_reconstructed_particle.html"
-                ),
-            }
-            for key, filename in output_names.items():
-                (output_dir / filename).write_text(html_payloads[key])
-        # Html preserves Plotly's interactive legend, allowing individual
-        # particle traces to be toggled in the W&B run page.
         return {key: wandb_html(html) for key, html in html_payloads.items()}
 
     def _local_validation_sweep_events(self):

@@ -17,6 +17,7 @@ from shared_training.event_batching import (
     FixedEventBatchSampler,
     TokenBudgetBatchSampler,
 )
+from shared_training.collation import collate_shared_events
 from src.data.config import DataConfig
 from src.dataset.shared_parquet_dataset import SharedGATrParquetDataset
 from src.logger.logger import _logger, _configLogger
@@ -276,7 +277,7 @@ def train_load_shared(args):
     common_loader_options = dict(
         pin_memory=True,
         num_workers=args.num_workers,
-        collate_fn=graph_batch_func,
+        collate_fn=collate_shared_events,
         worker_init_fn=seed_data_worker,
         **worker_options,
     )

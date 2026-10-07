@@ -42,7 +42,9 @@ from shared_training.tracking_metrics import (
 )
 from shared_training.wandb_logger import (
     log_wandb_media, operating_point_media, tracking_efficiency_media,
+    wandb_html,
 )
+from shared_training.validation_media import validation_event_media
 
 
 def relabel_small_targets(mc_index_loss, batch_ids, noise_index, min_hits):
@@ -138,6 +140,8 @@ class CGATrV35LightningModule(L.LightningModule):
         self._val_loss_event_count: int = 0
         self._val_metrics: List[Dict[str, float]] = []
         self._val_tracking_events = []
+        self._validation_working_points = None
+        self._saving_validation_sweep_checkpoint = False
         self._train_loss_sum: float = 0.0
         self._train_loss_n: int = 0
         self._train_loss_sum_t: Optional[torch.Tensor] = None
@@ -243,6 +247,7 @@ class CGATrV35LightningModule(L.LightningModule):
             "seq_lens": seq_lens,
             "batch_ids": batch_ids,
             "output": output,
+            "positions": batch.get("positions"),
             "noise_index": noise_index,
             "track_separation_weight": batch.get("track_separation_weight"),
             "particle_info": batch.get("particle_info"),
@@ -369,6 +374,7 @@ class CGATrV35LightningModule(L.LightningModule):
 
     # ---- validation lifecycle ----------------------------------------------
     def on_validation_epoch_start(self):
+        self._validation_working_points = None
         if self._ema is not None:
             self._saved_train_state = {
                 k: v.detach().clone() for k, v in self.model.state_dict().items()
@@ -408,6 +414,11 @@ class CGATrV35LightningModule(L.LightningModule):
         coords = s["coords"].detach().float().cpu().numpy()
         beta = s["beta_val"].detach().float().cpu().numpy()
         truth = s["mc_index_loss"].detach().cpu().numpy()
+        raw_truth = s["mc_index"].detach().cpu().numpy()
+        positions = (
+            s["positions"].detach().float().cpu().numpy()
+            if s["positions"] is not None else None
+        )
         offset = 0
         cached_particle_info = s["particle_info"] or [
             {} for _ in s["seq_lens"]
@@ -428,9 +439,13 @@ class CGATrV35LightningModule(L.LightningModule):
                     if int(raw_id) in source_info
                 }
             self._val_tracking_events.append({
+                "positions": (
+                    positions[offset:end] if positions is not None else None
+                ),
                 "coords": coords[offset:end],
                 "beta": beta[offset:end],
                 "truth": event_truth,
+                "mc_particle_id": raw_truth[offset:end],
                 "particle_info": event_particle_info,
             })
             offset = end
@@ -494,6 +509,10 @@ class CGATrV35LightningModule(L.LightningModule):
             dist.broadcast_object_list(holder, src=0)
             working_points = holder[0]
         if working_points:
+            self._validation_working_points = {
+                name: dict(working_point)
+                for name, working_point in working_points.items()
+            }
             pareto = working_points["pareto_f1"]
             avg_eff = float(pareto["efficiency"])
             avg_fake = float(pareto["fake_rate"])
@@ -507,6 +526,24 @@ class CGATrV35LightningModule(L.LightningModule):
         )
         if working_points:
             log_sweep_metrics(self, working_points)
+            # Logger-hidden aliases used only by the common validation
+            # checkpoint filename.
+            self.log(
+                "val_pareto_f1",
+                float(working_points["pareto_f1"]["f1"]),
+                on_epoch=True,
+                sync_dist=True,
+                logger=False,
+                batch_size=1,
+            )
+            self.log(
+                "val_max_tracking_efficiency",
+                float(working_points["max_efficiency"]["efficiency"]),
+                on_epoch=True,
+                sync_dist=True,
+                logger=False,
+                batch_size=1,
+            )
             comparison_order, comparison_rows, missing = (
                 matching_comparison_binned_counts(
                     self._val_tracking_events,
@@ -607,6 +644,20 @@ class CGATrV35LightningModule(L.LightningModule):
                 media.update(tracking_efficiency_media(
                     pt_image_paths, displacement_image_paths
                 ))
+                if (
+                    self._val_tracking_events
+                    and self._val_tracking_events[0]["positions"] is not None
+                ):
+                    hit_html = validation_event_media(
+                        self._val_tracking_events[0],
+                        working_points["pareto_f1"],
+                        rejected_seed_policy=self.args.rejected_seed_policy,
+                        output_dir=output_dir,
+                        include_embedding=False,
+                    )
+                    media.update({
+                        key: wandb_html(html) for key, html in hit_html.items()
+                    })
                 log_wandb_media(
                     self.logger,
                     media,
@@ -657,6 +708,16 @@ class CGATrV35LightningModule(L.LightningModule):
     def on_save_checkpoint(self, checkpoint):
         if self._ema is not None:
             checkpoint["ema_state_dict"] = self._ema.state_dict()
+        if self._saving_validation_sweep_checkpoint:
+            if not self._validation_working_points:
+                raise RuntimeError(
+                    "Cannot save a validation sweep checkpoint before "
+                    "the operating-point sweep has completed"
+                )
+            checkpoint["validation_working_points"] = {
+                name: dict(working_point)
+                for name, working_point in self._validation_working_points.items()
+            }
 
     def on_load_checkpoint(self, checkpoint):
         if "ema_state_dict" in checkpoint:

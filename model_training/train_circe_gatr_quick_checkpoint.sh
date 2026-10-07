@@ -54,9 +54,14 @@ echo "Output directory: $RUN_DIR"
 
 case "$MODEL" in
     circe)
-        CHECKPOINT="$RUN_DIR/circe/cgatr_best.ckpt"
-        if [[ ! -f "$CHECKPOINT" ]]; then
-            CHECKPOINT="$RUN_DIR/circe/cgatr_epoch00.ckpt"
+        CHECKPOINT=""
+        shopt -s nullglob
+        CIRCE_CHECKPOINTS=(
+            "$RUN_DIR"/circe/validation_epoch=0_step=*.ckpt
+        )
+        shopt -u nullglob
+        if [[ "${#CIRCE_CHECKPOINTS[@]}" -gt 0 ]]; then
+            CHECKPOINT="${CIRCE_CHECKPOINTS[0]}"
         fi
         ;;
     gatr)

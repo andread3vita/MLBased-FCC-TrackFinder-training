@@ -116,9 +116,13 @@ def log_wandb_media(logger, media):
         "plots/tracking_efficiency_vs_pt/",
         "plots/tracking_efficiency_vs_displacement/",
     )
+    common_keys = {
+        "plots/validation_event_0/hits_by_mc_particle",
+        "plots/validation_event_0/hits_by_reconstructed_particle",
+    }
     common = {
         key: value for key, value in media.items()
-        if key.startswith(common_prefixes)
+        if key in common_keys or key.startswith(common_prefixes)
     }
     if common and hasattr(logger, "experiment"):
         logger.experiment.log(common)

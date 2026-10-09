@@ -32,7 +32,8 @@ python src/submit_jobs.py \
   --minseed 1 \
   --maxseed 100 \
   --type train \
-  --key4hep_version 2026-07-29
+  --key4hep_version 2026-07-29 \
+  --accounting-group group_u_FCC.local_gen
 ```
 
 The submission scripts consider only the exact `.parquet` output complete, so

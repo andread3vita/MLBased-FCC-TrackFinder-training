@@ -34,10 +34,12 @@ variables in the launcher. The comparison copy is `GATR_CIRCE_LOSS`; `GATR`
 is untouched.
 
 The matched launcher defaults to CIRCE's production recipe for both models:
-16 epochs, `32-true` precision, a 16,000-hit batch budget, AdamW with
+16 epochs, `32-true` precision, a 20,000-hit batch budget (`MAX_TOKENS`),
+AdamW with
 gradient clipping at 1.0, two warmup epochs, validation-loss plateau scheduling
 with patience 3 and factor 0.5, a final six-epoch cosine learning-rate cap,
-40 validation batches per rank, and no step-based checkpoints. Both arms use
+100 validation batches per epoch (`LIMIT_VAL_BATCHES`),
+and no step-based checkpoints. Both arms use
 CIRCE's canonical map-style Parquet index and the same global batch plan:
 events are size-bucket shuffled, packed to the shared hit budget, truncated to
 an equal DDP length, and only then divided between ranks. DataLoader workers
@@ -83,9 +85,10 @@ matching. `hungarian` performs a global one-to-one assignment that maximizes
 shared hits and requires only positive overlap; it has no 50% efficiency or
 purity thresholds. At both selected working points, the pT and displacement
 plots contain double-majority and Hungarian curves. Displacement uses uniform
-50 mm bins from 0 to 2000 mm. Set `SWEEP_MATCH_METRIC=hungarian` to select
-operating points with the Hungarian criterion instead of the default
-double-majority criterion. Independently of that choice, every sweep row also
+50 mm bins from 0 to 2000 mm. The launcher defaults to the
+Hungarian criterion (`SWEEP_MATCH_METRIC=hungarian`); set
+`SWEEP_MATCH_METRIC=double_majority` to select operating points with the
+double-majority criterion instead. Independently of that choice, every sweep row also
 carries `fake_rate_double_majority` and `fake_rate_hungarian`, and both are
 logged to W&B at the two selected working points
 (`validation/fake_rate_{double_majority,hungarian}_at_{pareto_f1,max_efficiency}`).

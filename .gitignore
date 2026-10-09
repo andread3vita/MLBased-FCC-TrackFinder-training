@@ -1,4 +1,3 @@
-data_creation/condor_pipeline/IDEA/noBackground/std/
 *.sub
 data_train/
 data_val/

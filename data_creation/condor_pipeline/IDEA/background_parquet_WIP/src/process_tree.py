@@ -2,10 +2,9 @@
 
 """Convert an IDEA digitized, background-overlaid EDM4hep file to GATR Parquet.
 
-The extraction follows ``CIRCE/src/dataset/edm4hep_to_parquet.py``: PODIO
-collections are read directly, drift geometry is derived from the digitized
-hit, and MC relations come from the simulated hit.  Unlike the CIRCE utility,
-the result remains one row per event with jagged columns because that is the
+PODIO collections are read directly, drift geometry is derived from the
+digitized hit, and MC relations come from the simulated hit.
+The result remains one row per event with jagged columns because that is the
 schema consumed by the GATR Parquet loader.
 """
 

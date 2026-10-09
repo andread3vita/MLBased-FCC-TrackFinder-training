@@ -20,11 +20,21 @@ VALIDATION_LOSS_NAME = "validation/loss"
 SWEEP_METRIC_NAMES = {
     "pareto_f1": "validation/pareto_f1",
     "pareto_fake_rate": "validation/fake_rate_at_pareto_f1",
+    "pareto_fake_rate_double_majority": (
+        "validation/fake_rate_double_majority_at_pareto_f1"
+    ),
+    "pareto_fake_rate_hungarian": "validation/fake_rate_hungarian_at_pareto_f1",
     "pareto_efficiency": "validation/tracking_efficiency_at_pareto_f1",
     "pareto_tbeta": "validation/pareto_f1_tbeta",
     "pareto_td": "validation/pareto_f1_td",
     "max_efficiency": "validation/max_tracking_efficiency",
     "max_efficiency_fake_rate": "validation/fake_rate_at_max_efficiency",
+    "max_efficiency_fake_rate_double_majority": (
+        "validation/fake_rate_double_majority_at_max_efficiency"
+    ),
+    "max_efficiency_fake_rate_hungarian": (
+        "validation/fake_rate_hungarian_at_max_efficiency"
+    ),
     "max_efficiency_f1": "validation/f1_at_max_efficiency",
     "max_efficiency_tbeta": "validation/max_efficiency_tbeta",
     "max_efficiency_td": "validation/max_efficiency_td",
@@ -106,11 +116,23 @@ def sweep_metric_values(working_points):
     return {
         SWEEP_METRIC_NAMES["pareto_f1"]: pareto["f1"],
         SWEEP_METRIC_NAMES["pareto_fake_rate"]: pareto["fake_rate"],
+        SWEEP_METRIC_NAMES["pareto_fake_rate_double_majority"]: (
+            pareto["fake_rate_double_majority"]
+        ),
+        SWEEP_METRIC_NAMES["pareto_fake_rate_hungarian"]: (
+            pareto["fake_rate_hungarian"]
+        ),
         SWEEP_METRIC_NAMES["pareto_efficiency"]: pareto["efficiency"],
         SWEEP_METRIC_NAMES["pareto_tbeta"]: pareto["tbeta"],
         SWEEP_METRIC_NAMES["pareto_td"]: pareto["td"],
         SWEEP_METRIC_NAMES["max_efficiency"]: maximum["efficiency"],
         SWEEP_METRIC_NAMES["max_efficiency_fake_rate"]: maximum["fake_rate"],
+        SWEEP_METRIC_NAMES["max_efficiency_fake_rate_double_majority"]: (
+            maximum["fake_rate_double_majority"]
+        ),
+        SWEEP_METRIC_NAMES["max_efficiency_fake_rate_hungarian"]: (
+            maximum["fake_rate_hungarian"]
+        ),
         SWEEP_METRIC_NAMES["max_efficiency_f1"]: maximum["f1"],
         SWEEP_METRIC_NAMES["max_efficiency_tbeta"]: maximum["tbeta"],
         SWEEP_METRIC_NAMES["max_efficiency_td"]: maximum["td"],

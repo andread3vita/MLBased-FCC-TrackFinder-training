@@ -45,6 +45,8 @@ export SWEEP_TBETA_GRID="${QUICK_TBETA:-0.7}"
 export SWEEP_TD_GRID="${QUICK_TD:-0.3}"
 export SWEEP_MIN_HITS_GRID="${QUICK_MIN_HITS:-3}"
 export LOG_WANDB=0
+export CIRCE_COMPILE=1
+export CIRCE_COMPILE_MODE=default
 
 echo "Quick ${MODEL^^} smoke training: one train batch, one validation batch."
 echo "Output directory: $RUN_DIR"

@@ -85,7 +85,18 @@ purity thresholds. At both selected working points, the pT and displacement
 plots contain double-majority and Hungarian curves. Displacement uses uniform
 50 mm bins from 0 to 2000 mm. Set `SWEEP_MATCH_METRIC=hungarian` to select
 operating points with the Hungarian criterion instead of the default
-double-majority criterion.
+double-majority criterion. Independently of that choice, every sweep row also
+carries `fake_rate_double_majority` and `fake_rate_hungarian`, and both are
+logged to W&B at the two selected working points
+(`validation/fake_rate_{double_majority,hungarian}_at_{pareto_f1,max_efficiency}`).
+The pT and displacement plots print the truth selection (θ, genStatus and the
+`N_hits >= sweep_truth_min_hits` cut) and, per matching curve, its total
+efficiency over that selection and its global fake rate.
+
+Validation checkpoints are written at validation end. On resume,
+`checkpoint_resume.reset_validation_loop_progress` clears the stored
+validation-loop progress so the repeated validation of that epoch runs every
+validation batch instead of a single batch per rank.
 
 `circe_parquet_dataset.py` is only CIRCE's view of the canonical rows; keeping
 it here avoids changing CIRCE's source-tree structure. GATr continues to use

@@ -58,14 +58,16 @@ export WANDB_PROJECT='IDEA_v4_o1_CIRCE_GATR_comparison'
 EPOCHS="${NUM_EPOCHS:-16}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 WORKERS="${NUM_WORKERS:-4}"
-MAX_TOKENS="${MAX_TOKENS:-16000}"
+MAX_TOKENS="${MAX_TOKENS:-20000}"
 TRAIN_PRECISION="${TRAIN_PRECISION:-32-true}"
 CPU_THREADS="${CPU_THREADS:-4}"
 PREFETCH="${PREFETCH_FACTOR:-2}"
 GRAD_CHECKPOINTING="${GRAD_CHECKPOINTING:-0}"
+CIRCE_COMPILE="${CIRCE_COMPILE:-1}"
+CIRCE_COMPILE_MODE="${CIRCE_COMPILE_MODE:-default}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY_N_TRAIN_STEPS:-0}"
 TRAIN_BATCH_LIMIT="${LIMIT_TRAIN_BATCHES:-}"
-VAL_BATCH_LIMIT="${LIMIT_VAL_BATCHES:-40}"
+VAL_BATCH_LIMIT="${LIMIT_VAL_BATCHES:-100}"
 EMBED_DIM="${EMBED_DIM:-4}"
 BLOCKS="${NUM_BLOCKS:-10}"
 HIDDEN_MV="${HIDDEN_MV_CHANNELS:-16}"
@@ -86,15 +88,19 @@ BETA_SUPPRESS="${BETA_SUPPRESS_WEIGHT:-0.1}"
 VAR_WEIGHT="${VAR_WEIGHT:-0.3}"
 VAR_WARMUP="${VAR_WARMUP_EPOCHS:-1}"
 EMA="${EMA_DECAY:-0.999}"
-SWEEP_TBETA="${SWEEP_TBETA_GRID:-0.2,0.35,0.5,0.6,0.7,0.75,0.8,0.85,0.9,0.95}"
-SWEEP_TD="${SWEEP_TD_GRID:-0.1,0.15,0.2,0.25,0.3,0.4,0.5,0.55,0.6}"
-SWEEP_MIN_HITS="${SWEEP_MIN_HITS_GRID:-3}"
-SWEEP_EVENTS="${SWEEP_MAX_EVENTS:-1000}"
+SWEEP_TBETA="${SWEEP_TBETA_GRID:-0.05,0.1,0.15,0.2,0.35,0.5,0.6,0.7,0.75,0.8,0.85,0.9,0.95}"
+SWEEP_TD="${SWEEP_TD_GRID:-0.03,0.05,0.1,0.15,0.2,0.25,0.3,0.4,0.5}"
+SWEEP_MIN_HITS="${SWEEP_MIN_HITS_GRID:-3,5}"
+SWEEP_EVENTS="${SWEEP_MAX_EVENTS:-2000}"
 REJECTED_POLICY="${REJECTED_SEED_POLICY:-attach-after-accept}"
-MATCHING_METRIC="${SWEEP_MATCH_METRIC:-double_majority}"
+MATCHING_METRIC="${SWEEP_MATCH_METRIC:-hungarian}"
 case "$TRAIN_PRECISION" in
     32-true|16-mixed|bf16-mixed) ;;
     *) echo "TRAIN_PRECISION must be 32-true, 16-mixed, or bf16-mixed." >&2; exit 2 ;;
+esac
+case "$CIRCE_COMPILE_MODE" in
+    default|max-autotune-no-cudagraphs) ;;
+    *) echo "CIRCE_COMPILE_MODE must be default or max-autotune-no-cudagraphs." >&2; exit 2 ;;
 esac
 case "$LR_SCHEDULE" in
     plateau) GATR_LR_SCHEDULE="reduceplateau" ;;
@@ -119,9 +125,11 @@ run_circe() {
     local wandb_options=()
     local batch_limit_options=()
     local checkpoint_options=()
+    local compile_options=()
     [[ -n "$TRAIN_BATCH_LIMIT" ]] && batch_limit_options+=(--limit_train_batches "$TRAIN_BATCH_LIMIT")
     [[ "$VAL_BATCH_LIMIT" != "-1" ]] && batch_limit_options+=(--limit_val_batches "$VAL_BATCH_LIMIT")
     [[ "$GRAD_CHECKPOINTING" == "1" ]] && checkpoint_options+=(--grad_checkpoint)
+    [[ "$CIRCE_COMPILE" == "1" ]] && compile_options+=(--compile --compile_mode "$CIRCE_COMPILE_MODE")
     if [[ "$LOG_WANDB" == "1" ]]; then
         wandb_options=(--log_wandb --wandb_displayname circe_shared_resume)
         [[ -n "$WANDB_PROJECT" ]] && wandb_options+=(--wandb_projectname "$WANDB_PROJECT")
@@ -139,6 +147,7 @@ run_circe() {
         --batch_size "$BATCH_SIZE" --max_tokens "$MAX_TOKENS" \
         --num_workers "$WORKERS" --prefetch_factor "$PREFETCH" \
         --persistent_workers --cpu_threads "$CPU_THREADS" \
+        "${compile_options[@]}" \
         "${batch_limit_options[@]}" \
         --precision "$TRAIN_PRECISION" --gradient_clip_val "$CLIP" \
         --start_lr "$START_LR" --min_lr "$MIN_LR" \

@@ -15,6 +15,9 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 
 
+MATCHING_COMPARISON_METRICS = ("double_majority", "hungarian")
+# Matched/fake counts for every comparison criterion are accumulated alongside
+# the selected sweep criterion, so each operating point carries both fake rates.
 TRACKING_COUNT_KEYS = (
     "n_truth",
     "n_reco",
@@ -23,6 +26,10 @@ TRACKING_COUNT_KEYS = (
     "shared_hits",
     "matched_truth_hits",
     "matched_reco_hits",
+) + tuple(
+    f"{prefix}_{metric}"
+    for metric in MATCHING_COMPARISON_METRICS
+    for prefix in ("n_matched", "n_fake")
 )
 
 # Requested logarithmic pT binning for the validation tracking-efficiency plot.
@@ -35,7 +42,6 @@ TRACKING_DISPLACEMENT_BINS = np.arange(
     TRACKING_DISPLACEMENT_BIN_WIDTH,
 )
 MATCHING_METRICS = ("idea", "double_majority", "hungarian")
-MATCHING_COMPARISON_METRICS = ("double_majority", "hungarian")
 MATCHING_LABELS = {
     "idea": "IDEA purity",
     "double_majority": r"Double majority ($\epsilon,p>0.5$)",
@@ -212,7 +218,7 @@ def event_metrics(
     shared = sum(int(overlap[i, j]) for i, j in matches)
     matched_truth_hits = sum(int(truth_counts[i]) for i, _ in matches)
     matched_reco_hits = sum(int(reco_counts[j]) for _, j in matches)
-    return {
+    counts = {
         "n_truth": int(truth_ids.size),
         "n_reco": int(reco_ids.size),
         "n_matched": int(len(matches)),
@@ -221,6 +227,16 @@ def event_metrics(
         "matched_truth_hits": int(matched_truth_hits),
         "matched_reco_hits": int(matched_reco_hits),
     }
+    for comparison in MATCHING_COMPARISON_METRICS:
+        n_matched = (
+            len(matches) if comparison == metric
+            else len(_one_to_one_matches(
+                overlap, truth_counts, reco_counts, comparison
+            ))
+        )
+        counts[f"n_matched_{comparison}"] = int(n_matched)
+        counts[f"n_fake_{comparison}"] = int(reco_ids.size - n_matched)
+    return counts
 
 
 def evaluate_operating_point(
@@ -420,18 +436,29 @@ def matching_comparison_binned_counts(
     return order, rows, missing
 
 
-def matching_comparison_plot_series(order, count_tensor, working_point_name):
-    """Convert reduced comparison counts to the common plotting records."""
+def matching_comparison_plot_series(
+    order, count_tensor, working_point_name, working_point=None
+):
+    """Convert reduced comparison counts to the common plotting records.
+
+    When the selected ``working_point`` is given, each record also carries the
+    global fake rate of its matching criterion for the plot legend.
+    """
     series = []
     for index, (point_name, metric) in enumerate(order):
         if point_name != working_point_name:
             continue
-        series.append({
+        record = {
             "name": metric,
             "label": MATCHING_LABELS[metric],
             "total": np.asarray(count_tensor[index][0]),
             "matched": np.asarray(count_tensor[index][1]),
-        })
+        }
+        if working_point is not None:
+            fake_rate = working_point.get(f"fake_rate_{metric}")
+            if fake_rate is not None:
+                record["fake_rate"] = float(fake_rate)
+        series.append(record)
     return series
 
 
@@ -445,11 +472,18 @@ def save_tracking_efficiency_pt_plot(
     min_theta: float = 10.0,
     max_theta: float = 170.0,
     gen_status: Sequence[int] = (0, 1),
+    truth_min_hits: int = 3,
     _column_prefix: str = "pt",
     _x_label: str = r"$p_T$ [GeV]",
     _log_x: bool = True,
+    _text_y: float = 0.5,
+    _text_size: float = 17,
 ):
-    """Save binned tracking-efficiency curves for multiple working points."""
+    """Save binned tracking-efficiency curves for multiple working points.
+
+    Each legend entry reports the total efficiency over the plotted truth
+    selection and, when the series provides ``fake_rate``, the global fake rate.
+    """
     bins = np.asarray(bins, dtype=np.float64)
     if not series:
         raise ValueError("At least one pT-efficiency series is required")
@@ -480,6 +514,7 @@ def save_tracking_efficiency_pt_plot(
                 "matched": matched,
                 "efficiencies": efficiencies,
                 "errors": errors,
+                "fake_rate": item.get("fake_rate"),
             }
         )
     bin_centers = 0.5 * (bins[:-1] + bins[1:])
@@ -545,10 +580,15 @@ def save_tracking_efficiency_pt_plot(
             efficiencies = item["efficiencies"]
             errors = item["errors"]
             valid = np.isfinite(efficiencies)
+            summary = (
+                f"eff = {item['matched'].sum() / max(item['total'].sum(), 1):.3f}"
+            )
+            if item["fake_rate"] is not None:
+                summary += f", fake = {item['fake_rate']:.3f}"
             ax.scatter(
                 bin_centers[valid],
                 efficiencies[valid],
-                label=item["label"],
+                label=f"{item['label']}\n{summary}",
                 marker=marker,
                 c=[colour for _ in range(int(valid.sum()))],
                 s=30,
@@ -572,14 +612,14 @@ def save_tracking_efficiency_pt_plot(
             ax.set_xscale("log")
         ax.set_xlim([min_x, max_x])
         ax.set_ylim([0.01, 1.01])
-        ax.legend(loc="lower right")
+        ax.legend(loc="lower right", fontsize=17)
         if _log_x:
             ax.xaxis.set_major_locator(plt.LogLocator(base=10.0, numticks=4))
             ax.xaxis.set_minor_locator(
                 plt.LogLocator(base=10.0, subs="auto", numticks=10)
             )
         else:
-            ax.xaxis.set_major_locator(plt.MultipleLocator(250.0))
+            ax.xaxis.set_major_locator(plt.MultipleLocator(500.0))
             ax.xaxis.set_minor_locator(plt.MultipleLocator(50.0))
         ax.yaxis.set_major_locator(plt.MultipleLocator(0.1))
         ax.yaxis.set_minor_locator(plt.MultipleLocator(0.1))
@@ -595,14 +635,15 @@ def save_tracking_efficiency_pt_plot(
             r"$Z/\gamma^* \rightarrow q\bar{q}\ (q = u, d, s)$" "\n"
             r"$\sqrt{s} = m_Z = 91~\mathrm{GeV}$" "\n"
             rf"${min_theta:g}^\circ < \theta < {max_theta:g}^\circ$" "\n"
-            rf"$genStatus \in [{status_text}]$"
+            rf"$genStatus \in [{status_text}]$" "\n"
+            rf"$N_\mathrm{{hits}} \geq {int(truth_min_hits)}$"
         )
         ax.text(
             0.45,
-            0.3,
+            _text_y,
             textbox_text,
             transform=ax.transAxes,
-            fontsize=22,
+            fontsize=_text_size,
             verticalalignment="center",
             horizontalalignment="left",
             linespacing=1.4,
@@ -627,6 +668,7 @@ def save_tracking_efficiency_displacement_plot(
     min_theta: float = 10.0,
     max_theta: float = 170.0,
     gen_status: Sequence[int] = (0, 1),
+    truth_min_hits: int = 3,
 ):
     """Save efficiency versus transverse production-vertex displacement."""
     return save_tracking_efficiency_pt_plot(
@@ -639,9 +681,14 @@ def save_tracking_efficiency_displacement_plot(
         min_theta=min_theta,
         max_theta=max_theta,
         gen_status=gen_status,
+        truth_min_hits=truth_min_hits,
         _column_prefix="displacement_mm",
         _x_label=r"$r_\mathrm{vtx}=\sqrt{x_\mathrm{vtx}^2+y_\mathrm{vtx}^2}$ [mm]",
         _log_x=False,
+        # Displacement efficiencies reach down to ~0.5, so keep the physics
+        # text compact and between the data and the legend.
+        _text_y=0.40,
+        _text_size=15,
     )
 
 
@@ -664,6 +711,12 @@ def tracking_metrics_from_counts(
     )
     hit_efficiency = totals["shared_hits"] / max(totals["matched_truth_hits"], 1)
     hit_purity = totals["shared_hits"] / max(totals["matched_reco_hits"], 1)
+    comparison_fake_rates = {
+        f"fake_rate_{metric}": float(
+            totals[f"n_fake_{metric}"] / max(totals["n_reco"], 1)
+        )
+        for metric in MATCHING_COMPARISON_METRICS
+    }
     return {
         "tbeta": float(tbeta),
         "td": float(td),
@@ -675,6 +728,7 @@ def tracking_metrics_from_counts(
         "hit_efficiency": float(hit_efficiency),
         "hit_purity": float(hit_purity),
         "physics_score": float(efficiency - fake_rate),
+        **comparison_fake_rates,
         **totals,
     }
 

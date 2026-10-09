@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 
 from src.model import CGATrParquetModel
+from shared_training.checkpoint_resume import reset_validation_loop_progress
 from shared_training.circe_loss import (
     object_condensation_loss, sequence_lengths_to_batch, variance_weight,
 )
@@ -597,7 +598,8 @@ class CGATrV35LightningModule(L.LightningModule):
                 for point_name in ("max_efficiency", "pareto_f1"):
                     pt_image_paths[point_name] = save_tracking_efficiency_pt_plot(
                         matching_comparison_plot_series(
-                            comparison_order, pt_counts, point_name
+                            comparison_order, pt_counts, point_name,
+                            working_point=working_points[point_name],
                         ),
                         str(output_dir),
                         filename_stem=(
@@ -609,6 +611,7 @@ class CGATrV35LightningModule(L.LightningModule):
                         min_theta=10.0,
                         max_theta=170.0,
                         gen_status=(0, 1),
+                        truth_min_hits=int(self.args.sweep_truth_min_hits),
                     )
                     displacement_image_paths[point_name] = (
                         save_tracking_efficiency_displacement_plot(
@@ -616,6 +619,7 @@ class CGATrV35LightningModule(L.LightningModule):
                                 comparison_order,
                                 displacement_counts,
                                 point_name,
+                                working_point=working_points[point_name],
                             ),
                             str(output_dir),
                             filename_stem=(
@@ -628,6 +632,7 @@ class CGATrV35LightningModule(L.LightningModule):
                             min_theta=10.0,
                             max_theta=170.0,
                             gen_status=(0, 1),
+                            truth_min_hits=int(self.args.sweep_truth_min_hits),
                         )
                     )
                 print(
@@ -720,6 +725,11 @@ class CGATrV35LightningModule(L.LightningModule):
             }
 
     def on_load_checkpoint(self, checkpoint):
+        if reset_validation_loop_progress(checkpoint):
+            print(
+                "Resume: the next validation runs every validation batch.",
+                flush=True,
+            )
         if "ema_state_dict" in checkpoint:
             if self._ema is not None:
                 self._ema.load_state_dict(checkpoint["ema_state_dict"])

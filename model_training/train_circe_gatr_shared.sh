@@ -82,7 +82,7 @@ SWEEP_TD="${SWEEP_TD_GRID:-0.05,0.1,0.15,0.2,0.25,0.3,0.4,0.5,0.55,0.6}"
 SWEEP_MIN_HITS="${SWEEP_MIN_HITS_GRID:-3}"
 SWEEP_EVENTS="${SWEEP_MAX_EVENTS:-2000}"
 REJECTED_POLICY="${REJECTED_SEED_POLICY:-attach-after-accept}"
-MATCHING_METRIC="${SWEEP_MATCH_METRIC:-hungarian}"
+MATCHING_METRIC="${SWEEP_MATCH_METRIC:-double_majority}"
 case "$TRAIN_PRECISION" in
     32-true|16-mixed|bf16-mixed) ;;
     *) echo "TRAIN_PRECISION must be 32-true, 16-mixed, or bf16-mixed." >&2; exit 2 ;;

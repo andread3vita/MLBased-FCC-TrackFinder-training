@@ -86,9 +86,9 @@ shared hits and requires only positive overlap; it has no 50% efficiency or
 purity thresholds. At both selected working points, the pT and displacement
 plots contain double-majority and Hungarian curves. Displacement uses uniform
 50 mm bins from 0 to 2000 mm. The launcher defaults to the
-Hungarian criterion (`SWEEP_MATCH_METRIC=hungarian`); set
-`SWEEP_MATCH_METRIC=double_majority` to select operating points with the
-double-majority criterion instead. Independently of that choice, every sweep row also
+double-majority criterion (`SWEEP_MATCH_METRIC=double_majority`), matching the
+default of both `train.py` entry points; set `SWEEP_MATCH_METRIC=hungarian` to
+select operating points with the Hungarian criterion instead. Independently of that choice, every sweep row also
 carries `fake_rate_double_majority` and `fake_rate_hungarian`, and both are
 logged to W&B at the two selected working points
 (`validation/fake_rate_{double_majority,hungarian}_at_{pareto_f1,max_efficiency}`).

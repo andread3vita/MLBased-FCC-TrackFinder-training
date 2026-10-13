@@ -4,15 +4,6 @@ Converts a GATR_CIRCE_LOSS Light­ning checkpoint (`.ckpt`) into a standalone
 ONNX model for GGTFTrackFinder-style inference, without needing the training
 stack (no DGL, no Lightning).
 
-## Files
-
-| File | Role |
-|---|---|
-| `convert_to_onnx.py` | rebuilds the model from the checkpoint's stored hyperparameters, loads EMA weights by default, exports ONNX |
-| `validate_onnx.py` | compares ONNX Runtime output against the checkpoint's eager PyTorch inference (float64 reference) |
-| `dump_model_input.py` | builds the model input of one event from an EDM4hep ROOT file, exactly as `GGTFTrackFinder.cpp` does, and writes it to CSV |
-| `model_input_event0.csv` | one real event (4245 hits × 7 features) for `validate_onnx.py -i`, produced by `dump_model_input.py` |
-
 ## Environment
 
 ```bash

@@ -1,6 +1,6 @@
-# GGTF track finder training (IDEA)
+# GGTF track finder training
 
-Repository for training the GGTF track finder for the FCC-ee IDEA drift chamber.
+Repository for training the GGTF track finder for the FCC-ee.
 It covers three steps: creating the training dataset, training the models
 (**CIRCE** and **GATr**), and converting a trained checkpoint to ONNX for C++
 inference.

@@ -17,6 +17,15 @@ TRAIN_METRIC_NAMES = {
 
 VALIDATION_LOSS_NAME = "validation/loss"
 
+# Optional GATr-only auxiliary helix regression (``--helix-loss-weight > 0``).
+# CIRCE never logs these, so they do not affect the matched comparison keys.
+HELIX_TRAIN_METRIC_NAMES = {
+    "helix": "train/loss_helix",
+    "helix_weighted": "train/loss_helix_weighted",
+    "total": "train/loss_total",
+}
+HELIX_VALIDATION_LOSS_NAME = "validation/loss_helix"
+
 SWEEP_METRIC_NAMES = {
     "pareto_f1": "validation/pareto_f1",
     "pareto_fake_rate": "validation/fake_rate_at_pareto_f1",
@@ -155,8 +164,12 @@ def allowed_wandb_metric(name):
     """Whether a scalar key belongs to the matched comparison contract."""
     if name in ("epoch", "trainer/global_step"):
         return True
-    bases = set(TRAIN_METRIC_NAMES.values())
-    if name in bases or name in {VALIDATION_LOSS_NAME, *SWEEP_METRIC_NAMES.values()}:
+    bases = {*TRAIN_METRIC_NAMES.values(), *HELIX_TRAIN_METRIC_NAMES.values()}
+    if name in bases or name in {
+        VALIDATION_LOSS_NAME,
+        HELIX_VALIDATION_LOSS_NAME,
+        *SWEEP_METRIC_NAMES.values(),
+    }:
         return True
     return any(name == f"{base}_{suffix}" for base in bases for suffix in ("step", "epoch"))
 

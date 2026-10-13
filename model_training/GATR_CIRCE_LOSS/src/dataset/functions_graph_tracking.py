@@ -134,8 +134,8 @@ def _aligned_particle_features(
             )
             # CIRCE builds its particle-info mapping from every stored row and
             # naturally tolerates missing or repeated IDs. Preserve the same
-            # available rows here; the shared launcher disables the auxiliary
-            # helix regression, so these rows are validation metadata only.
+            # available rows here; the auxiliary helix regression matches hits
+            # to rows by particle ID and skips hits without a matching row.
             return features_particles[torch.isin(particle_ids, signal_ids)]
         print(
             "WARNING: skipping event with inconsistent hit/truth particle IDs: "

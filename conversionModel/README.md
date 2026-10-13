@@ -1,53 +1,52 @@
-# GATr checkpoint conversion to ONNX and TorchScript
+# GATr checkpoint → ONNX conversion
 
-These scripts convert geometry-only tracking checkpoints to either ONNX or a
-LibTorch-loadable TorchScript `.pt` file.
+Converts a GATR_CIRCE_LOSS Light­ning checkpoint (`.ckpt`) into a standalone
+ONNX model for GGTFTrackFinder-style inference, without needing the training
+stack (no DGL, no Lightning).
 
-The model implementation is always imported directly from the repository's
-training source tree:
+## Files
 
-```text
-model_training/GATR/src/gatr_v142
-```
+| File | Role |
+|---|---|
+| `convert_to_onnx.py` | rebuilds the model from the checkpoint's stored hyperparameters, loads EMA weights by default, exports ONNX |
+| `validate_onnx.py` | compares ONNX Runtime output against the checkpoint's eager PyTorch inference (float64 reference) |
+| `dump_model_input.py` | builds the model input of one event from an EDM4hep ROOT file, exactly as `GGTFTrackFinder.cpp` does, and writes it to CSV |
+| `model_input_event0.csv` | one real event (4245 hits × 7 features) for `validate_onnx.py -i`, produced by `dump_model_input.py` |
 
-Do **not** install `gatr`, `GATr`, or `ggtf` in the conversion environment.  The
-exporter prepends the local source directory to `sys.path` and refuses to run
-unless the imported package is version 1.4.2 and comes from the path above.
-
-The exported model accepts a float32 tensor with shape `[num_hits, 7]`:
-
-```text
-x, y, z, hit_type, vector_x, vector_y, vector_z
-```
-
-Its output shape is `[num_hits, clustering_space_dim + 5]`.  The first hit
-dimension remains dynamic.
-
-## Create a dedicated Conda environment
-
-Run these commands from the repository root.  This creates a named environment
-in Conda's normal environment directory,
+## Environment
 
 ```bash
-conda create --name ggtf-conversion-v142 python=3.10 pip -y
-conda activate ggtf-conversion-v142
-python -m pip install --upgrade pip
-python -m pip install -r conversionModel/requirements.txt
+conda create -n model-conversion python=3.10
+conda activate model-conversion
+pip install torch==2.6.0 onnx==1.17.0 onnxruntime==1.20.1 einops xformers==0.0.29.post3 opt-einsum
 ```
 
-Activate it in later shells with:
+(No GPU is needed; everything runs on CPU.)
+
+## Usage
 
 ```bash
-conda activate ggtf-conversion-v142
+conda activate model-conversion
+cd efficientConversion
+python convert_to_onnx.py -w model.ckpt -o model.onnx
+python validate_onnx.py -w model.ckpt -o model.onnx                 # seeded random 30x7 input
+python validate_onnx.py -w model.ckpt -o model.onnx -i model_input_event0.csv   # real event
 ```
 
-Confirm both the dependency versions and the local GATr import:
+## Creating the input CSV from an EDM4hep file
+
+`dump_model_input.py` reads the digitized hits of one event from an EDM4hep
+ROOT file and writes the `[N, 7]` model input (`x,y,z,planar_flag,u,v,w`) with
+the same encoding and hit ordering as `GGTFTrackFinder.cpp` (planar collections
+first, then wire collections). It needs the podio/EDM4hep Python bindings, so
+run it in a key4hep environment (not the conda one):
 
 ```bash
-cd conversionModel
-python -c 'import torch, onnx, onnxruntime; print(torch.__version__, onnx.__version__, onnxruntime.__version__)'
-python -c 'import export_tracking_onnx as e; import gatr; print(gatr.__version__, gatr.__file__)'
+source /cvmfs/sw.hsf.org/key4hep/setup.sh
+python dump_model_input.py -i digitized_events.root -o model_input_event0.csv -e 0
 ```
 
-The second command must print version `1.4.2` and a path below
-`model_training/GATR/src/gatr_v142/gatr`.
+Options: `-e` selects the event index (default 0); `--planar` and `--wire`
+override the collection names (defaults: `VTXBDigis VTXDDigis SiWrBDigis SiWrDDigis`
+and `DCH_DigiCollection`, as in `runTestTrackFinder.py`).
+

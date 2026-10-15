@@ -33,7 +33,7 @@ first, then wire collections). It needs the podio/EDM4hep Python bindings, so
 run it in a key4hep environment (not the conda one):
 
 ```bash
-source /cvmfs/sw.hsf.org/key4hep/setup.sh
+source /cvmfs/sw-nightlies.hsf.org/key4hep/setup.sh
 python dump_model_input.py -i digitized_events.root -o model_input_event0.csv -e 0
 ```
 

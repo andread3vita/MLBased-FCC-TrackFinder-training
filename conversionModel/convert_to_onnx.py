@@ -148,9 +148,10 @@ class GatrTrackingModel(nn.Module):
         if self._use_helix_proxy:
             helix_prediction = self.helix_proxy(latent)
         else:
-            helix_prediction = hits.new_zeros(
-                (*hits.shape[:-1], self.helix_proxy_dim)
-            )
+            # zeros_like of a constant slice keeps the width static in the ONNX
+            # graph; new_zeros(hits.shape[...]) exports a runtime shape tensor
+            # and leaves the output dimension dynamic (-1).
+            helix_prediction = torch.zeros_like(latent[..., : self.helix_proxy_dim])
         return torch.cat(
             (self.clustering(latent), self.beta(latent), helix_prediction), dim=-1
         )
@@ -489,6 +490,13 @@ def convert(weight_path: str, onnx_path: str, weights_source: str = "ema") -> No
     import onnx
 
     model_proto = onnx.load(onnx_path)
+    # The exporter cannot propagate the static width through the GATr blocks
+    # and leaves it symbolic (e.g. "Castoutput_dim_1"), which ONNX Runtime
+    # reports as -1. Only the hit axis is dynamic: pin the per-hit width.
+    output_dims = model_proto.graph.output[0].type.tensor_type.shape.dim
+    output_dims[1].Clear()
+    output_dims[1].dim_value = model.output_dim
+    onnx.save(model_proto, onnx_path)
     onnx.checker.check_model(model_proto)
     size_mb = os.path.getsize(onnx_path) / 1e6
     print(f"wrote {onnx_path} ({size_mb:.2f} MB), opset "

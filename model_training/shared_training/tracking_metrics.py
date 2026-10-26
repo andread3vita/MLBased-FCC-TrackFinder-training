@@ -442,7 +442,8 @@ def matching_comparison_plot_series(
     """Convert reduced comparison counts to the common plotting records.
 
     When the selected ``working_point`` is given, each record also carries the
-    global fake rate of its matching criterion for the plot legend.
+    global efficiency and fake rate of its matching criterion for the legend,
+    so every plot annotates the same numbers reported in ``summary.json``.
     """
     series = []
     for index, (point_name, metric) in enumerate(order):
@@ -458,6 +459,10 @@ def matching_comparison_plot_series(
             fake_rate = working_point.get(f"fake_rate_{metric}")
             if fake_rate is not None:
                 record["fake_rate"] = float(fake_rate)
+            n_truth = int(working_point.get("n_truth", 0) or 0)
+            n_matched = working_point.get(f"n_matched_{metric}")
+            if n_truth > 0 and n_matched is not None:
+                record["efficiency"] = float(int(n_matched)) / n_truth
         series.append(record)
     return series
 
@@ -481,8 +486,11 @@ def save_tracking_efficiency_pt_plot(
 ):
     """Save binned tracking-efficiency curves for multiple working points.
 
-    Each legend entry reports the total efficiency over the plotted truth
-    selection and, when the series provides ``fake_rate``, the global fake rate.
+    Each legend entry reports the global efficiency of the working point for
+    that matching criterion when the series provides ``efficiency`` (the same
+    numbers written to ``summary.json``); otherwise it falls back to the total
+    efficiency over the plotted truth selection. When the series provides
+    ``fake_rate``, the global fake rate is shown alongside.
     """
     bins = np.asarray(bins, dtype=np.float64)
     if not series:
@@ -514,6 +522,7 @@ def save_tracking_efficiency_pt_plot(
                 "matched": matched,
                 "efficiencies": efficiencies,
                 "errors": errors,
+                "efficiency": item.get("efficiency"),
                 "fake_rate": item.get("fake_rate"),
             }
         )
@@ -580,9 +589,12 @@ def save_tracking_efficiency_pt_plot(
             efficiencies = item["efficiencies"]
             errors = item["errors"]
             valid = np.isfinite(efficiencies)
-            summary = (
-                f"eff = {item['matched'].sum() / max(item['total'].sum(), 1):.3f}"
-            )
+            legend_efficiency = item["efficiency"]
+            if legend_efficiency is None:
+                legend_efficiency = (
+                    item["matched"].sum() / max(item["total"].sum(), 1)
+                )
+            summary = f"eff = {legend_efficiency:.3f}"
             if item["fake_rate"] is not None:
                 summary += f", fake = {item['fake_rate']:.3f}"
             ax.scatter(

@@ -17,11 +17,10 @@ def find_project_root(start_dir: Path) -> Path:
         "Could not find project root containing data_creation"
     )
 
-
 def main():
 
-    TRAIN_OR_TEST = sys.argv[1]              # train or test
-    TYPE  = sys.argv[2]                     # noBackground, noBackground_parquet, background, background_parquet, loopers
+    TRAIN_OR_TEST = sys.argv[1]             # train or test
+    TYPE  = sys.argv[2]                     # noBackground, noBackground_parquet, noBackgroundDisplacement_parquet, background, background_parquet, loopers
     DETECTOR = sys.argv[3]                  # IDEA or CLD
     MINSEED = sys.argv[4]                   # min seed
     MAXSEED = sys.argv[5]                   # max seed
@@ -43,11 +42,13 @@ def main():
         OPTION = "noBackground"
     elif type_normalized == "nobackground_parquet":
         OPTION = "noBackground_parquet"
+    elif type_normalized == "nobackgrounddisplacement_parquet": 
+        OPTION = "noBackground_parquet"            
     else:
         raise ValueError(
             f"Invalid pipeline option: {TYPE}. Must be 'noBackground', "
-            "'noBackground_parquet', 'background', 'background_parquet', "
-            "or 'loopers'."
+            "'noBackground_parquet', 'background', 'noBackgroundDisplacement_parquet', "
+            "'background_parquet', or 'loopers'."
         )
     
     main_dir = main_dir / OPTION
@@ -107,6 +108,20 @@ def main():
             "--k4geoPath", K4GEO_PATH,
             "--k4fwcorePath", K4FWCORE_PATH,
             "--accounting-group", ACCOUNTING_GROUP
+        ])
+
+    elif type_normalized == "nobackgrounddisplacement_parquet":
+        
+        subprocess.run([
+            "python", f"{main_dir}/src/submit_jobsZbb.py",
+            "--mainDir", main_dir,
+            "--queue", "testmatch",
+            "--outdir", outdir,
+            "--minseed", MINSEED,
+            "--maxseed", MAXSEED,
+            "--type", TRAIN_OR_TEST,
+            "--key4hep_version", KEY4HEP_VERSION,
+            "--accounting-group", ACCOUNTING_GROUP,
         ])
 
 if __name__ == "__main__":

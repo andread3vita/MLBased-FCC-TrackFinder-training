@@ -15,7 +15,7 @@ if [ "$#" -ne 10 ]; then
     echo "Usage:"
     echo " $0 TRAIN_OR_TEST PIPELINE DETECTOR MINSEED MAXSEED OUTDIR KEY4HEP_VERSION K4GEO_PATH K4FWCORE_PATH ACCOUNTING_GROUP"
     echo ""
-    echo "PIPELINE choices: noBackground, noBackground_parquet, background, background_parquet, loopers"
+    echo "PIPELINE choices: noBackground, noBackground_parquet, noBackgroundDisplacement_parquet, background, background_parquet, loopers"
     exit 1
 fi
 
@@ -31,11 +31,11 @@ K4FWCORE_PATH=$9
 ACCOUNTING_GROUP=${10}
 
 case "${PIPELINE}" in
-    noBackground|noBackground_parquet|background|background_parquet|loopers)
+    noBackground|noBackground_parquet|noBackgroundDisplacement_parquet|background|background_parquet|loopers)
         ;;
     *)
         echo "Invalid pipeline '${PIPELINE}'." >&2
-        echo "Choose one of: noBackground, noBackground_parquet, background, background_parquet, loopers" >&2
+        echo "Choose one of: noBackground, noBackground_parquet, noBackgroundDisplacement_parquet, background, background_parquet, loopers" >&2
         exit 2
         ;;
 esac

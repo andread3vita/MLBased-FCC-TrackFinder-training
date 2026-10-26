@@ -24,12 +24,12 @@ eventHeaderCreator = EventHeaderCreator(
 ApplicationMgr().TopAlg += [eventHeaderCreator]
 
 
-from Configurables import GaussSmearVertex
-smeartool = GaussSmearVertex()
-smeartool.xVertexSigma = 5.96e-3 * units.mm
-smeartool.yVertexSigma = 23.8e-6 * units.mm
-smeartool.zVertexSigma = 0.397 * units.mm
-smeartool.tVertexSigma = 36.3 * units.picosecond
+# from Configurables import GaussSmearVertex
+# smeartool = GaussSmearVertex()
+# smeartool.xVertexSigma = 5.96e-3 * units.mm
+# smeartool.yVertexSigma = 23.8e-6 * units.mm
+# smeartool.zVertexSigma = 0.397 * units.mm
+# smeartool.tVertexSigma = 36.3 * units.picosecond
 
 from Configurables import PythiaInterface
 pythia8gentool = PythiaInterface()
@@ -48,7 +48,7 @@ pythia8gentool.pythiaExtraSettings = [""]
 from Configurables import GenAlg
 pythia8gen = GenAlg("Pythia8")
 pythia8gen.SignalProvider = pythia8gentool
-pythia8gen.VertexSmearingTool = smeartool
+# pythia8gen.VertexSmearingTool = smeartool
 pythia8gen.hepmc.Path = "hepmc"
 ApplicationMgr().TopAlg += [pythia8gen]
 

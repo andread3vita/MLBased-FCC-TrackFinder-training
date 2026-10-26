@@ -306,16 +306,131 @@ def _math_sdpa(query, key, value, attn_mask=None):
     )
 
 
-def _export_sdpa_wrapper(q, k, v, attn_mask):
-    """Un-wrapped replacement for gatr's ``_sdpa_graph_breaking``.
+def _math_sdpa_fp32core(query, key, value, attn_mask=None):
+    """float32 attention core for ONNX export (selectable with --attention-dtype float32).
+
+    The quadratic attention core (scores, softmax, attention-weighted average)
+    is well-conditioned in float32: its inputs are softmax-normalized features,
+    unlike the geometric-algebra contractions elsewhere in GATr that need
+    float64. Measured on real 4k-hit events the attention core is ~4x faster
+    per-event in float32 (fp64 has no fused kernels in ONNX Runtime), while
+    the model output shifts by ~6e-4 on the embedding coordinates and ~2e-3
+    on the beta sigmoid (both far below the clustering thresholds Td, Tbeta).
+    """
+    if attn_mask is not None:
+        raise NotImplementedError("export path expects attention_mask=None")
+    query32 = query.to(torch.float32)
+    key32 = key.to(torch.float32)
+    value32 = value.to(torch.float32)
+    # matmul+transpose, not einsum: in float32 ORT fuses it into the
+    # com.microsoft.FusedMatMul kernel, which is ~2.5x faster than the generic
+    # batched-Einsum fallback for the attention core (float64 has no such
+    # kernel, hence the einsum form in _math_sdpa).
+    # The 1/sqrt(d) scale is folded into the query rows: scaling q (N x d) is
+    # elementwise-identical to scaling the N x N score matrix but avoids one
+    # full N^2 read+write pass in the exported graph.
+    query32 = query32 / math.sqrt(float(query.shape[-1]))
+    scores = torch.matmul(query32, key32.transpose(-2, -1))
+    out = torch.matmul(torch.softmax(scores, dim=-1), value32)
+    return out.to(query.dtype)
+
+
+def _float64_sdpa(query, key, value, attn_mask=None):
+    """Attention core inside fp32-cast attention blocks: matmul-form float32 path.
+
+    The inputs are already float32 inside the casted blocks, so the cast in
+    ``_math_sdpa_fp32core`` is a no-op and its matmul+transpose form is what
+    ONNX Runtime needs to emit the fast com.microsoft.FusedMatMul kernel.
+    """
+    return _math_sdpa_fp32core(query, key, value, attn_mask=attn_mask)
+
+
+def _self_attention_fp32_forward(self, multivectors, additional_qk_features_mv=None, scalars=None,
+                                 additional_qk_features_s=None, attention_mask=None):
+    """SelfAttention.forward computing the whole attention block in float32.
+
+    Bound per-module by ``_use_fp32_attention_blocks`` after converting the
+    module parameters to float32 (selectable with --attention-dtype float32_block):
+    inputs arrive in the model's float64 compute precision and are cast at the
+    boundary, outputs are cast back. This puts the QKV projections, the geometric
+    feature assembly, and the attention core in float32; validated on real
+    4k-hit events against the float64 model (max embedding shift ~3e-3, well
+    below the clustering thresholds Td and Tbeta).
+    """
+    orig = multivectors.dtype
+    sc = scalars.to(torch.float32) if scalars is not None else None
+    out_mv, out_s = _ORIG_SELF_ATTENTION_FORWARD(
+        self, multivectors.to(torch.float32), scalars=sc, attention_mask=attention_mask
+    )
+    return out_mv.to(orig), (out_s.to(orig) if out_s is not None else None)
+
+
+_ORIG_SELF_ATTENTION_FORWARD = None  # set by _use_fp32_attention_blocks
+
+
+def _use_fp32_attention_blocks(model: nn.Module) -> int:
+    """Convert all SelfAttention modules (weights included) to float32 compute."""
+    from gatr.layers.attention.self_attention import SelfAttention
+
+    global _ORIG_SELF_ATTENTION_FORWARD
+    if _ORIG_SELF_ATTENTION_FORWARD is None:
+        _ORIG_SELF_ATTENTION_FORWARD = SelfAttention.forward
+    for module in model.modules():
+        if isinstance(module, SelfAttention):
+            module.to(torch.float32)
+            module.forward = _self_attention_fp32_forward.__get__(module)
+    return sum(isinstance(m, SelfAttention) for m in model.modules())
+
+
+def _math_sdpa_fp32core_einsum(query, key, value, attn_mask=None):
+    """float32 attention core in einsum form (no FusedMatMul fusion).
+
+    ONNX Runtime's com.microsoft.FusedMatMul (produced when matmul+transpose is
+    exported) retains per-shape allocations for every distinct hit count seen,
+    which shows up as a per-event heap creep in dynamic-N batch jobs. The einsum
+    form avoids that fusion: the heap stays perfectly flat at the cost of ~6%
+    slower attention cores.
+    """
+    if attn_mask is not None:
+        raise NotImplementedError("export path expects attention_mask=None")
+    query32 = query.to(torch.float32)
+    key32 = key.to(torch.float32)
+    value32 = value.to(torch.float32)
+    scores = torch.einsum("... i d, ... j d -> ... i j", query32, key32)
+    scores = scores / math.sqrt(float(query.shape[-1]))
+    out = torch.einsum(
+        "... i j, ... j d -> ... i d", torch.softmax(scores, dim=-1), value32
+    )
+    return out.to(query.dtype)
+
+
+# Selectable attention precisions for the exported graph:
+# - float64:        everything in float64
+# - float32:        only the softmax core of attention in float32 (FusedMatMul fusion)
+# - float32_einsum: only the softmax core in float32, einsum form (flat heap, no FusedMatMul)
+# - float32_block:  the whole attention sub-block in float32 (FusedMatMul fusion)
+ATTENTION_DTYPES = {
+    "float64": _math_sdpa,
+    "float32": _math_sdpa_fp32core,
+    "float32_einsum": _math_sdpa_fp32core_einsum,
+    "float32_block": _float64_sdpa,
+}
+
+
+def _make_export_sdpa_wrapper(sdpa_fn):
+    """Return an un-wrapped replacement for gatr's ``_sdpa_graph_breaking``.
 
     The original is decorated with ``@torch.compiler.disable``, which hard
     stops the dynamo-based ONNX exporter. The content is identical.
     """
-    from gatr.utils.tensors import expand_pairwise
 
-    q, k, v = expand_pairwise(q, k, v, exclude_dims=(-2,))
-    return q, k, _math_sdpa(q, k, v, attn_mask=attn_mask)
+    def _export_sdpa_wrapper(q, k, v, attn_mask):
+        from gatr.utils.tensors import expand_pairwise
+
+        q, k, v = expand_pairwise(q, k, v, exclude_dims=(-2,))
+        return q, k, sdpa_fn(q, k, v, attn_mask=attn_mask)
+
+    return _export_sdpa_wrapper
 
 
 def _replace_erf_gelu(model: nn.Module) -> int:
@@ -391,14 +506,15 @@ def _patch_for_export(model: nn.Module) -> None:
 
 
 class _OnnxExportWrapper(nn.Module):
-    """float32 I/O around the float64-computing model."""
+    """float32 input/output around the model (internal compute ``dtype``)."""
 
-    def __init__(self, model: nn.Module) -> None:
+    def __init__(self, model: nn.Module, compute_dtype: torch.dtype = COMPUTE_DTYPE) -> None:
         super().__init__()
         self.model = model
+        self.compute_dtype = compute_dtype
 
     def forward(self, hits: torch.Tensor) -> torch.Tensor:
-        return self.model(hits.to(COMPUTE_DTYPE)).float()
+        return self.model(hits.to(self.compute_dtype)).float()
 
 
 def select_weights(checkpoint: dict, weights_source: str) -> dict:
@@ -438,17 +554,37 @@ def build_model(weight_path: str, weights_source: str = "ema"):
     return model, description
 
 
-def convert(weight_path: str, onnx_path: str, weights_source: str = "ema") -> None:
+def convert(
+    weight_path: str,
+    onnx_path: str,
+    weights_source: str = "ema",
+    attention_dtype: str = "float64",
+    compute_dtype: str = "float64",
+) -> None:
     model, description = build_model(weight_path, weights_source)
     print(f"checkpoint weights: {description}")
+    sdpa_fn = ATTENTION_DTYPES[attention_dtype]
+    print(f"attention core precision: {attention_dtype}")
+    full_fp32 = compute_dtype == "float32"
+    print(f"internal compute precision: {compute_dtype}")
 
-    # Internal float64 compute; fp32 tensors at the graph boundary.
+    # Internal compute precision; fp32 tensors at the graph boundary.
     model = model.to(COMPUTE_DTYPE)
+    if attention_dtype == "float32_block":
+        # after the float64 cast: convert whole SelfAttention blocks (weights
+        # and compute) to float32, keeping everything else in float64
+        n = _use_fp32_attention_blocks(model)
+        print(f"converted {n} attention blocks to float32 compute")
     n_erf = _replace_erf_gelu(model)
     _patch_for_export(model)
     print(f"replaced erf-GELU with fdlibm float64 erf in {n_erf} MLP blocks")
+    if full_fp32:
+        # whole-model float32: validated against the float64 reference on real
+        # events (max embedding shift ~5e-3, below the clustering thresholds);
+        # halves tensor memory and enables fp32 fused kernels everywhere.
+        model = model.to(torch.float32)
 
-    exportable = _OnnxExportWrapper(model).eval()
+    exportable = _OnnxExportWrapper(model, torch.float32 if full_fp32 else COMPUTE_DTYPE).eval()
     dummy = torch.zeros(8, 7, dtype=torch.float32)
     dynamic_axes = {"hits": {0: "N"}, "output": {0: "N"}}
 
@@ -467,8 +603,8 @@ def convert(weight_path: str, onnx_path: str, weights_source: str = "ema") -> No
             # exporter does not stop at it.
             import gatr.primitives.attention as _gatr_attn
 
-            _gatr_attn.scaled_dot_product_attention = _math_sdpa
-            _gatr_attn._sdpa_graph_breaking = _export_sdpa_wrapper
+            _gatr_attn.scaled_dot_product_attention = sdpa_fn
+            _gatr_attn._sdpa_graph_breaking = _make_export_sdpa_wrapper(sdpa_fn)
             with torch.no_grad():
                 torch.onnx.export(
                     exportable,
@@ -502,17 +638,17 @@ def convert(weight_path: str, onnx_path: str, weights_source: str = "ema") -> No
     print(f"wrote {onnx_path} ({size_mb:.2f} MB), opset "
           + ",".join(str(o.version) for o in model_proto.opset_import))
 
-    # Smoke check: ORT vs float64 eager reference on a seeded random event.
+    # Smoke check: ORT vs eager reference (same compute precision) on a seeded random event.
     import onnxruntime as ort
 
     torch.manual_seed(42)
     hits = torch.randn(30, 7, dtype=torch.float32)
     with torch.no_grad():
-        reference = model(hits.to(COMPUTE_DTYPE)).float()
+        reference = model(hits.to(torch.float32 if full_fp32 else COMPUTE_DTYPE)).float()
     session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
     (output,) = session.run(None, {"hits": hits.numpy()})
     diff = (torch.from_numpy(output) - reference).abs().max().item()
-    print(f"smoke check 30x7 random hits: max |ORT - fp64 eager| = {diff:.3e}")
+    print(f"smoke check 30x7 random hits: max |ORT - eager| = {diff:.3e}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -528,12 +664,30 @@ def parse_args() -> argparse.Namespace:
         help="which checkpoint weights to convert (default: ema, the "
         "validation/inference weights used in training)",
     )
+    parser.add_argument(
+        "--attention-dtype",
+        choices=tuple(ATTENTION_DTYPES),
+        default="float32",
+        help="attention precision in the exported graph (default: float32, fused; "
+        "float64: whole model in float64; float32_einsum: softmax core in float32 "
+        "without FusedMatMul fusion; float32_block: entire attention sub-block in "
+        "float32). float64 is for reference/validation of new checkpoints; see README.",
+    )
+    parser.add_argument(
+        "--compute-dtype",
+        choices=("float64", "float32"),
+        default="float32",
+        help="internal compute precision of the exported graph (default: float32 — "
+        "whole model in float32, measured ~2x faster and half the transient memory, "
+        "validated max embedding shift ~5e-3 vs float64, below the clustering "
+        "thresholds; use float64 only to produce validation references)",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    convert(args.weightPath, args.onnxPath, args.weights_source)
+    convert(args.weightPath, args.onnxPath, args.weights_source, args.attention_dtype, args.compute_dtype)
     return 0
 
 

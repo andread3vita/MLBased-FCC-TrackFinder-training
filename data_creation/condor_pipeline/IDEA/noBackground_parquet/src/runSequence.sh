@@ -45,6 +45,7 @@ then
             --outputFile out_sim_edm4hep_${SEED}.root \
             --inputFiles out_${SEED}.hepmc \
             --numberOfEvents $NEV \
+            --vertexSigma 5.96e-3 23.8e-6 0.397 36.3 \
             --random.seed $SEED \
             --steeringFile  $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground_parquet/utils/SteeringFile_IDEA_o1_v04.py \
             --part.minimalKineticEnergy "0.00*MeV"   
@@ -57,6 +58,7 @@ then
             --outputFile out_sim_edm4hep_${SEED}.root \
             --inputFiles out_${SEED}.hepmc \
             --numberOfEvents $NEV \
+            --vertexSigma 5.96e-3 23.8e-6 0.397 36.3 \
             --random.seed $SEED \
             --steeringFile $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground_parquet/utils/SteeringFile_IDEA_o1_v04.py \
             --part.userParticleHandler='' \

@@ -674,7 +674,14 @@ parser.add_argument(
     "--sweep-match-metric", choices=("idea", "double_majority", "hungarian"),
     default="double_majority",
 )
-parser.add_argument("--sweep-truth-min-hits", type=int, default=3)
+parser.add_argument(
+    "--sweep-truth-min-hits",
+    type=int,
+    default=3,
+    help="truth N_hits cut for the binned efficiency curves (post-reconstruction; "
+    "also selects the clustering min_hits working point). The scalar "
+    "efficiency/fake-rate metrics apply no truth cuts.",
+)
 parser.add_argument("--validation-sweep-max-events", type=int, default=500)
 parser.add_argument(
     "--loss-regularization",

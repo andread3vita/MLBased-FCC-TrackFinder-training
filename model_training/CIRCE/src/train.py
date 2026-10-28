@@ -188,7 +188,11 @@ def parse_args():
     p.add_argument("--sweep_match_metric",
                    choices=("idea", "double_majority", "hungarian"),
                    default="double_majority")
-    p.add_argument("--sweep_truth_min_hits", type=int, default=3)
+    p.add_argument("--sweep_truth_min_hits", type=int, default=3,
+                   help="truth N_hits cut for the binned efficiency curves "
+                   "(post-reconstruction; also selects the clustering min_hits "
+                   "working point). The scalar efficiency/fake-rate metrics "
+                   "apply no truth cuts.")
     p.add_argument("--validation_sweep_max_events", type=int, default=500)
     p.add_argument("--rejected_seed_policy",
                    choices=("discard", "keep", "attach-after-accept"),

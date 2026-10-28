@@ -34,12 +34,20 @@ TRACKING_COUNT_KEYS = (
 
 # Requested logarithmic pT binning for the validation tracking-efficiency plot.
 TRACKING_PT_BINS = np.exp(np.arange(np.log(0.1), np.log(60.0), 0.2))
-# Explicit uniform 50 mm bins over the tracker-scale displacement range.
-TRACKING_DISPLACEMENT_BIN_WIDTH = 50.0
+# Explicit uniform 20 mm bins over the tracker-scale displacement range.
+TRACKING_DISPLACEMENT_BIN_WIDTH = 20.0
 TRACKING_DISPLACEMENT_BINS = np.arange(
     0.0,
     2000.0 + TRACKING_DISPLACEMENT_BIN_WIDTH,
     TRACKING_DISPLACEMENT_BIN_WIDTH,
+)
+# Uniform 5-degree polar-angle bins spanning the acceptance cut applied to
+# all binned efficiency curves (theta values are binned in degrees).
+TRACKING_THETA_BIN_WIDTH_DEG = 5.0
+TRACKING_THETA_BINS_DEG = np.arange(
+    10.0,
+    170.0 + TRACKING_THETA_BIN_WIDTH_DEG,
+    TRACKING_THETA_BIN_WIDTH_DEG,
 )
 MATCHING_METRICS = ("idea", "double_majority", "hungarian")
 MATCHING_LABELS = {
@@ -204,15 +212,20 @@ def event_metrics(
     labels: np.ndarray,
     truth: np.ndarray,
     metric: str = "double_majority",
-    truth_min_hits: int = 3,
 ) -> Dict[str, float]:
-    """Return event-level counts for aggregating efficiency and fake rate."""
+    """Event-level counts for aggregating efficiency and fake rate.
+
+    All truth particles and all clusters count — no N_hits/theta/genStatus
+    cuts. The fake rate is cluster-based and cannot take truth-side cuts, so
+    the paired global efficiency takes none either; the extra cuts live only
+    in the binned efficiency curves.
+    """
     labels = np.asarray(labels).reshape(-1)
     truth = np.asarray(truth).reshape(-1)
     if labels.shape != truth.shape:
         raise ValueError("labels and truth must have identical shapes")
     truth_ids, truth_counts, reco_ids, reco_counts, overlap = _overlap_tables(
-        labels, truth, truth_min_hits
+        labels, truth, 1
     )
     matches = _one_to_one_matches(overlap, truth_counts, reco_counts, metric)
     shared = sum(int(overlap[i, j]) for i, j in matches)
@@ -245,7 +258,6 @@ def evaluate_operating_point(
     td: float,
     min_hits: int,
     metric: str = "double_majority",
-    truth_min_hits: int = 3,
     rejected_seed_policy: str = "discard",
 ) -> Dict[str, float]:
     totals = {key: 0 for key in TRACKING_COUNT_KEYS}
@@ -258,7 +270,7 @@ def evaluate_operating_point(
             min_hits,
             rejected_seed_policy=rejected_seed_policy,
         )
-        counts = event_metrics(labels, event["truth"], metric, truth_min_hits)
+        counts = event_metrics(labels, event["truth"], metric)
         for key in totals:
             totals[key] += counts[key]
 
@@ -284,6 +296,11 @@ def tracking_efficiency_binned_counts(
     event-local truth-cluster ID. Particle records contain ``theta`` (in
     radians), ``gen_status``, and the requested observable values. The track
     matching and selection are evaluated once and shared by all observables.
+
+    All truth particles enter the matching. ``truth_min_hits``, the theta
+    window, and the genStatus list are all post-reconstruction cuts applied
+    only when filling the binned counts, so a sub-threshold particle can be
+    reconstructed and matched but is excluded from the efficiency curves.
     """
     if not observables:
         raise ValueError("At least one binned observable is required")
@@ -312,13 +329,16 @@ def tracking_efficiency_binned_counts(
             rejected_seed_policy=rejected_seed_policy,
         )
         truth_ids, truth_counts, _, reco_counts, overlap = _overlap_tables(
-            labels, event["truth"], truth_min_hits
+            labels, event["truth"], 1
         )
         matches = _one_to_one_matches(overlap, truth_counts, reco_counts, metric)
         matched_truth_ids = {int(truth_ids[i]) for i, _ in matches}
         particle_info = event.get("particle_info", {})
 
-        for truth_id in truth_ids:
+        for i, truth_id in enumerate(truth_ids):
+            # Post-reconstruction N_hits cut, same level as theta/genStatus.
+            if truth_counts[i] < truth_min_hits:
+                continue
             info = particle_info.get(int(truth_id))
             if info is None:
                 for name in checked_bins:
@@ -336,10 +356,12 @@ def tracking_efficiency_binned_counts(
                 continue
 
             for name, bins in checked_bins.items():
-                if name not in info:
+                if name != "theta" and name not in info:
                     missing_particle_info[name] += 1
                     continue
-                value = float(info[name])
+                # ``theta`` is stored in radians in particle_info; binned in
+                # degrees to match TRACKING_THETA_BINS_DEG and the plot axes.
+                value = theta_degrees if name == "theta" else float(info[name])
                 if not np.isfinite(value) or value < 0:
                     continue
                 # Include an entry exactly on the upper boundary in the final
@@ -481,8 +503,10 @@ def save_tracking_efficiency_pt_plot(
     _column_prefix: str = "pt",
     _x_label: str = r"$p_T$ [GeV]",
     _log_x: bool = True,
+    _x_major_locator: float = 500.0,
+    _x_minor_locator: float = 50.0,
     _text_y: float = 0.5,
-    _text_size: float = 17,
+    _text_size: int = 17,
 ):
     """Save binned tracking-efficiency curves for multiple working points.
 
@@ -631,8 +655,8 @@ def save_tracking_efficiency_pt_plot(
                 plt.LogLocator(base=10.0, subs="auto", numticks=10)
             )
         else:
-            ax.xaxis.set_major_locator(plt.MultipleLocator(500.0))
-            ax.xaxis.set_minor_locator(plt.MultipleLocator(50.0))
+            ax.xaxis.set_major_locator(plt.MultipleLocator(_x_major_locator))
+            ax.xaxis.set_minor_locator(plt.MultipleLocator(_x_minor_locator))
         ax.yaxis.set_major_locator(plt.MultipleLocator(0.1))
         ax.yaxis.set_minor_locator(plt.MultipleLocator(0.1))
         ax.minorticks_on()
@@ -704,6 +728,41 @@ def save_tracking_efficiency_displacement_plot(
     )
 
 
+def save_tracking_efficiency_theta_plot(
+    series: Sequence[Dict],
+    output_dir: str,
+    filename_stem: str = "tracking_efficiency_vs_theta",
+    bins: np.ndarray = TRACKING_THETA_BINS_DEG,
+    min_x: float = 10.0,
+    max_x: float = 170.0,
+    min_theta: float = 10.0,
+    max_theta: float = 170.0,
+    gen_status: Sequence[int] = (0, 1),
+    truth_min_hits: int = 3,
+):
+    """Save efficiency versus truth polar angle theta in degrees."""
+    return save_tracking_efficiency_pt_plot(
+        series,
+        output_dir,
+        filename_stem=filename_stem,
+        bins=bins,
+        min_x=min_x,
+        max_x=max_x,
+        min_theta=min_theta,
+        max_theta=max_theta,
+        gen_status=gen_status,
+        truth_min_hits=truth_min_hits,
+        _column_prefix="theta_deg",
+        _x_label=r"$\theta$ [deg]",
+        _log_x=False,
+        _x_major_locator=30.0,
+        _x_minor_locator=5.0,
+        # Same compact physics-text placement as the displacement curve.
+        _text_y=0.40,
+        _text_size=15,
+    )
+
+
 def tracking_metrics_from_counts(
     tbeta: float,
     td: float,
@@ -751,7 +810,6 @@ def run_operating_point_sweep(
     td_grid: Iterable[float],
     min_hits_grid: Iterable[int],
     metric: str = "double_majority",
-    truth_min_hits: int = 3,
     rejected_seed_policy: str = "discard",
 ) -> List[Dict[str, float]]:
     return [
@@ -761,7 +819,6 @@ def run_operating_point_sweep(
             td,
             min_hits,
             metric=metric,
-            truth_min_hits=truth_min_hits,
             rejected_seed_policy=rejected_seed_policy,
         )
         for min_hits in min_hits_grid

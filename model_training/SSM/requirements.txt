@@ -1,0 +1,12 @@
+# SSM track finder — training + ONNX environment (pip; no singularity).
+# For CPU-only: use the default torch wheel below (or the cpu index).
+# For GPU training: replace with the CUDA build, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+torch>=2.6
+onnx>=1.17
+onnxruntime>=1.19
+polars>=1.0
+numpy>=1.26
+scipy>=1.10
+matplotlib>=3.8
+tqdm>=4.66

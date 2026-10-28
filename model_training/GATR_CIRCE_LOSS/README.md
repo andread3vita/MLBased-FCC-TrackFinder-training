@@ -23,6 +23,9 @@ filtered logger in `../shared_training/wandb_logger.py`. Consequently their
 W&B runs expose the same canonical configuration fields, scalar metric keys,
 and operating-point sweep images; GATr-only diagnostics are not uploaded.
 
-The common pT and displacement efficiency plots compare double-majority
-matching with threshold-free one-to-one Hungarian matching. The displacement
-axis uses uniform 50 mm bins over 0--2000 mm.
+The common pT, displacement, and theta efficiency plots compare
+double-majority matching with threshold-free one-to-one Hungarian matching.
+The displacement axis uses uniform 20 mm bins over 0--2000 mm and the theta
+axis uses uniform 5-degree bins over 10--170 degrees. Truth cuts
+($N_\mathrm{hits} \geq 3$, 10° < $\theta$ < 170°, genStatus in {0,1}) are
+post-reconstruction selections applied only when filling the curves.

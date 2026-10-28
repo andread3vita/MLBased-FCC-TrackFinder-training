@@ -53,12 +53,14 @@ from shared_training.tracking_metrics import (
     TRACKING_COUNT_KEYS,
     TRACKING_DISPLACEMENT_BINS,
     TRACKING_PT_BINS,
+    TRACKING_THETA_BINS_DEG,
     matching_comparison_binned_counts,
     matching_comparison_plot_series,
     parse_grid,
     run_operating_point_sweep,
     save_tracking_efficiency_displacement_plot,
     save_tracking_efficiency_pt_plot,
+    save_tracking_efficiency_theta_plot,
     save_sweep_results,
     tracking_metrics_from_counts,
 )
@@ -983,7 +985,6 @@ class ExampleWrapper(L.LightningModule):
                 tds,
                 min_hits,
                 metric=self.args.sweep_match_metric,
-                truth_min_hits=int(self.args.sweep_truth_min_hits),
                 rejected_seed_policy=self.rejected_seed_policy,
             )
 
@@ -1161,6 +1162,7 @@ class ExampleWrapper(L.LightningModule):
                         {
                             "pt": TRACKING_PT_BINS,
                             "displacement": TRACKING_DISPLACEMENT_BINS,
+                            "theta": TRACKING_THETA_BINS_DEG,
                         },
                         truth_min_hits=int(self.args.sweep_truth_min_hits),
                         min_theta=10.0,
@@ -1185,8 +1187,17 @@ class ExampleWrapper(L.LightningModule):
                     dtype=torch.int64,
                     device=reduction_device,
                 )
+                theta_count_tensor = torch.tensor(
+                    np.stack([
+                        np.stack(pair, axis=0)
+                        for pair in comparison_rows["theta"]
+                    ], axis=0),
+                    dtype=torch.int64,
+                    device=reduction_device,
+                )
                 missing_tensor = torch.tensor(
-                    [missing_info["pt"], missing_info["displacement"]],
+                    [missing_info["pt"], missing_info["displacement"],
+                     missing_info["theta"]],
                     dtype=torch.int64,
                     device=reduction_device,
                 )
@@ -1196,14 +1207,17 @@ class ExampleWrapper(L.LightningModule):
                 if dist.is_available() and dist.is_initialized():
                     dist.all_reduce(pt_count_tensor, op=dist.ReduceOp.SUM)
                     dist.all_reduce(displacement_count_tensor, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(theta_count_tensor, op=dist.ReduceOp.SUM)
                     dist.all_reduce(missing_tensor, op=dist.ReduceOp.SUM)
                     dist.all_reduce(pt_event_count, op=dist.ReduceOp.SUM)
 
                 if self.trainer.is_global_zero:
                     pt_image_paths = {}
                     displacement_image_paths = {}
+                    theta_image_paths = {}
                     pt_counts = pt_count_tensor.cpu().numpy()
                     displacement_counts = displacement_count_tensor.cpu().numpy()
+                    theta_counts = theta_count_tensor.cpu().numpy()
                     for name in ("max_efficiency", "pareto_f1"):
                         pt_image_paths[name] = save_tracking_efficiency_pt_plot(
                             matching_comparison_plot_series(
@@ -1243,19 +1257,44 @@ class ExampleWrapper(L.LightningModule):
                                 ),
                             )
                         )
+                        theta_image_paths[name] = (
+                            save_tracking_efficiency_theta_plot(
+                                matching_comparison_plot_series(
+                                    comparison_order,
+                                    theta_counts,
+                                    name,
+                                    working_point=working_points[name],
+                                ),
+                                str(output_dir),
+                                filename_stem=(
+                                    f"tracking_efficiency_vs_theta_{name}"
+                                ),
+                                bins=TRACKING_THETA_BINS_DEG,
+                                min_x=10.0,
+                                max_x=170.0,
+                                min_theta=10.0,
+                                max_theta=170.0,
+                                gen_status=(0, 1),
+                                truth_min_hits=int(
+                                    self.args.sweep_truth_min_hits
+                                ),
+                            )
+                        )
                     print(
                         "Saved double-majority and Hungarian tracking "
-                        "efficiency versus pT and uniformly binned "
-                        "displacement from "
+                        "efficiency versus pT, uniformly binned "
+                        "displacement, and theta from "
                         f"{int(pt_event_count.item())} validation events; "
-                        "missing pT/displacement metadata for "
+                        "missing pT/displacement/theta metadata for "
                         f"{int(missing_tensor[0].item())}/"
-                        f"{int(missing_tensor[1].item())} eligible truth tracks.",
+                        f"{int(missing_tensor[1].item())}/"
+                        f"{int(missing_tensor[2].item())} eligible truth tracks.",
                         flush=True,
                     )
                     if hasattr(self.logger, "log_image"):
                         wandb_media.update(tracking_efficiency_media(
-                            pt_image_paths, displacement_image_paths
+                            pt_image_paths, displacement_image_paths,
+                            theta_image_paths
                         ))
 
             if (

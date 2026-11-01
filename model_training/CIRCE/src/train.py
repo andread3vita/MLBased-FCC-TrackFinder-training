@@ -50,6 +50,7 @@ from lightning.pytorch.plugins.environments import SLURMEnvironment
 from lightning.pytorch.strategies import DDPStrategy
 from torch.utils.data import DataLoader
 from src.lightning_module import CGATrV35LightningModule
+from src.cpu_export import CPUExportModelCheckpoint
 from src.dataset.parquet_dataset import (
     IDEAParquetDataset, collate_idea_events as collate_legacy_idea_events,
 )
@@ -61,7 +62,7 @@ from shared_training.event_batching import (
 from shared_training.wandb_logger import build_experiment_logger
 
 
-class ValidationSweepModelCheckpoint(ModelCheckpoint):
+class ValidationSweepModelCheckpoint(CPUExportModelCheckpoint):
     """Save one full checkpoint after each completed validation sweep."""
     def _save_checkpoint(self, trainer, filepath):
         model = trainer.lightning_module
@@ -199,6 +200,10 @@ def parse_args():
                    default="discard")
     p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--output_dir", default="checkpoints/cgatr_fcc_prod")
+    p.add_argument("--cpu_export_library", default=os.path.join(
+        os.path.dirname(__file__), "../build/libcirce_cpu.so"),
+        help="CPU operator built once with tools/build_cpu_gp.py; enables .cpu.pt validation exports")
+    p.add_argument("--no_cpu_export", action="store_true", help="skip automatic CPU inference exports")
     p.add_argument("--epoch_csv_path", default=None)
     p.add_argument("--run_tag", default="cgatr_fcc_prod")
     p.add_argument("--log_wandb", action="store_true", default=False)
@@ -479,8 +484,17 @@ def main():
     csv_path = args.epoch_csv_path or os.path.join(
         args.output_dir, "epoch_metrics.csv",
     )
+    cpu_export_library = None
+    if (not args.no_cpu_export and module.model.num_blades == 32
+            and module.model.invariant_output_head and not module.model.use_time):
+        if os.path.isfile(args.cpu_export_library):
+            cpu_export_library = os.path.abspath(args.cpu_export_library)
+        else:
+            print("[cgatr_fcc] CPU export unavailable: build tools/build_cpu_gp.py once "
+                  "to save .cpu.pt alongside future validation checkpoints", flush=True)
     callbacks = [
         ValidationSweepModelCheckpoint(
+            cpu_export_library=cpu_export_library,
             dirpath=args.output_dir,
             filename=(
                 "validation_epoch={epoch}_step={step}_"

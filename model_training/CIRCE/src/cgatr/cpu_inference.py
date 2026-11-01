@@ -1,6 +1,8 @@
 """Optional CPU/FP32 inference preparation; call after loading checkpoint weights."""
 
 from pathlib import Path
+import argparse
+import json
 
 import torch
 from torch import nn
@@ -94,3 +96,64 @@ def prepare_cpu_inference(model: nn.Module, library: str | Path) -> nn.Module:
 
     replace(model)
     return model.requires_grad_(False)
+
+
+class SingleEvent(nn.Module):
+    """Measured [N,10] features to clustering coordinates and raw beta logit."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, features):
+        mv, scalars = self.model.embed(features)
+        _, output = self.model.cgatr(mv, scalars=scalars, attention_mask=None)
+        return output
+
+
+def export_cpu_checkpoint(checkpoint_path, features, library, output):
+    """Save a LibTorch graph and packed algebra constants; prefer EMA weights.
+
+    Builds a separate CPU model so export never modifies the training model.
+    The same function handles old checkpoints and automatic training exports.
+    """
+    from src.model import CGATrParquetModel
+    from src.eval.forward_pass import _load_state_dict_tolerating_derived_buffers
+
+    features = features.detach().cpu().float().contiguous()
+    if features.ndim != 2 or features.shape[1] != 10 or not torch.isfinite(features).all():
+        raise ValueError("Expected finite measured float32 [N,10] features")
+    vertex, drift = features[features[:, 3] == 0], features[features[:, 3] == 1]
+    if not len(vertex) or not len(drift):
+        raise ValueError("Export requires an example with both vertex and drift hits")
+    output = Path(output)
+    if output.resolve() == Path(checkpoint_path).resolve():
+        raise ValueError("Inference output must differ from the training checkpoint")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state = checkpoint.get("ema_state_dict")
+    weights_source = "ema" if state else "model"
+    if not state:
+        state = {k[6:]: v for k, v in checkpoint["state_dict"].items() if k.startswith("model.")}
+        if not state:
+            raise ValueError("Checkpoint has neither EMA nor Lightning model weights")
+    # Model construction initializes weights before loading them. Preserve the
+    # training process's CPU RNG sequence when exporting during a run.
+    with torch.random.fork_rng(devices=[]), torch.inference_mode():
+        config = dict(checkpoint["hyper_parameters"], grad_checkpoint=False, equi_init="default")
+        model = CGATrParquetModel(argparse.Namespace(**config))
+        if not model.invariant_output_head or model.num_blades != 32 or model.needs_drift_dir:
+            raise ValueError("CPU export requires the 32-blade CGA invariant head with 10 input features")
+        _load_state_dict_tolerating_derived_buffers(model, state)
+        runner = SingleEvent(prepare_cpu_inference(model.cpu().float().eval(), library)).eval()
+        traced = torch.jit.trace(runner, (features,), check_trace=False, strict=False)
+        traced = torch.jit.freeze(traced.eval())
+        for example in (features, features[:128], vertex[:17], drift[:17]):
+            torch.testing.assert_close(traced(example), runner(example), atol=1e-4, rtol=1e-4)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_name(output.name + ".tmp")
+        try:
+            traced.save(str(temporary), _extra_files={"circe_cpu.json": json.dumps({"weights_source": weights_source})})
+            temporary.replace(output)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return weights_source

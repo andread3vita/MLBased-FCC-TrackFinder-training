@@ -8,3 +8,4 @@ wandb/
 *.pyc
 gun/
 tests/
+/model_training/CIRCE/build/

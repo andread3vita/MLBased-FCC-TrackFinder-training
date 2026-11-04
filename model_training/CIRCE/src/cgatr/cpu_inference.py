@@ -115,7 +115,7 @@ def export_cpu_checkpoint(checkpoint_path, features, library, output):
     """Save a LibTorch graph and packed algebra constants; prefer EMA weights.
 
     Builds a separate CPU model so export never modifies the training model.
-    The same function handles old checkpoints and automatic training exports.
+    Loads existing checkpoints and packs the algebra constants into the graph.
     """
     from src.model import CGATrParquetModel
     from src.eval.forward_pass import _load_state_dict_tolerating_derived_buffers
@@ -137,7 +137,7 @@ def export_cpu_checkpoint(checkpoint_path, features, library, output):
         if not state:
             raise ValueError("Checkpoint has neither EMA nor Lightning model weights")
     # Model construction initializes weights before loading them. Preserve the
-    # training process's CPU RNG sequence when exporting during a run.
+    # caller's CPU RNG sequence while exporting.
     with torch.random.fork_rng(devices=[]), torch.inference_mode():
         config = dict(checkpoint["hyper_parameters"], grad_checkpoint=False, equi_init="default")
         model = CGATrParquetModel(argparse.Namespace(**config))

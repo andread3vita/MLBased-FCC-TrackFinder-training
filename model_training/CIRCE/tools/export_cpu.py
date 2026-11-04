@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert existing checkpoints; new training can save the CPU graph automatically."""
+"""Export an existing CIRCE checkpoint for CPU/FP32 LibTorch inference."""
 
 import argparse
 from pathlib import Path
@@ -10,7 +10,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.cgatr.cpu_inference import SingleEvent, export_cpu_checkpoint
+from src.cgatr.cpu_inference import export_cpu_checkpoint
 from src.dataset.parquet_dataset import IDEAParquetDataset
 
 

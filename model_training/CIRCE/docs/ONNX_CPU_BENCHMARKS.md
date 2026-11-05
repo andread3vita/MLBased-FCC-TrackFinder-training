@@ -80,9 +80,9 @@ A separate matched **50-event** screen uses the same events, four-core groups, O
 | Original PyTorch | 17.052 | 10.418 | Baseline |
 | ONNX + matrix product + folded linears | 11.579 | 7.481 | Bundles conversion and algebra/linear rewrites; no isolated ONNX-only attribution |
 | + blocked full attention | 8.986 | 5.993 | 256 query rows, all keys; numerical stabilization still absent |
-| + portable graph guards | pending | 2.231 | Zero tiny constants/QKV and relative-logit floor; default export |
-| Alternative: ORT built-in attention | pending | 6.355 | Branches from matrix/linear stage, without FTZ |
-| + flush subnormals | pending | 1.736 | Same native graph, session.set_denormal_as_zero=1; runtime-tuned export |
+| + portable graph guards | 3.301 | 2.231 | Zero tiny constants/QKV and relative-logit floor; default export |
+| Alternative: ORT built-in attention | 9.093 | 6.355 | Branches from matrix/linear stage, without FTZ |
+| + flush subnormals | 2.653 | 1.736 | Same native graph, session.set_denormal_as_zero=1; runtime-tuned export |
 
 For 6/8/96 on this 50-event screen, peak process RSS fell from 15,459.9 MiB in the untiled matrix/linear export to 407.9 MiB with blocking (452.4 MiB with the final guards). RSS includes runtime/model/input memory, not only attention scratch.
 
@@ -92,7 +92,7 @@ The standard and runtime-tuned rows follow different attention branches. Their g
 
 Every completed ONNX timing run from this study is included below and in [onnx_cpu_benchmarks.csv](onnx_cpu_benchmarks.csv), including unsuccessful optimization candidates. Three-event probes deliberately use the sample's small/median/P95-size events, so their means do **not** estimate population latency. Fifty-event screens select candidates; the two-pass 1,000-event rows are confirmations. Two-event rows measure size extremes separately. Runtime versions, sample sizes and FTZ are shown to prevent mixing unlike comparisons. Earlier probes used other spare core groups and changing host load; use the controlled progression above for attribution.
 
-Historical names: `baseline` = original dense GP export; `gather` = indexed Cayley contraction; `matrix` = matrix GP (`matrix_packed` used sparse sign/add projection maps, later `matrix_dense_packed` uses MatMul projections); `packed` = folded equivariant linears; `tileNNN` = query blocking; `native`/`mha` = built-in ORT attention; `ftz` = runtime flush-to-zero; `constants` = only tiny-constant cleanup; `clean` = earlier probability-tail cleanup; `scaled` = power-of-two attention rescaling; `guard18` = earlier numerical guard. These diagnostic variants are not additional production options. Exact model hashes, peak process RSS and original case identifiers are retained in the CSV.
+Historical names: `baseline` = original dense GP export; `gather` = indexed Cayley contraction; `matrix` = matrix GP (`matrix_packed` used sparse sign/add projection maps, later `matrix_dense_packed` uses MatMul projections); `packed` = folded equivariant linears; `tileNNN` = query blocking; `native`/`mha` = built-in ORT attention; `ftz` = runtime flush-to-zero; `constants` = only tiny-constant cleanup; `clean` = earlier probability-tail cleanup; `scaled` = power-of-two attention rescaling; `guard18` = earlier numerical guard. Historical `standard_quick`/`standard_screen` names predate the final portable guards and refer to unguarded blocked attention. `portable_*` and `pr_ablation_*_standard` identify the guarded default; the exact model filename in the CSV disambiguates each run. These diagnostic variants are not additional production options. Exact model hashes, peak process RSS and original case identifiers are retained in the CSV.
 
 | Case | Events × passes | ORT | FTZ | Mean s | Median s | Min s | Max s | P95 s | Reconstruction gate |
 |---|---:|---|---|---:|---:|---:|---:|---:|---|
@@ -133,6 +133,9 @@ Historical names: `baseline` = original dense GP export; `gather` = indexed Cayl
 | `pr_ablation_current96_standard` | 50 × 1 | 1.21.1 | no | 2.231 | 1.582 | 0.435 | 14.928 | 4.637 | not scored |
 | `pr_ablation_teacher_blocked` | 50 × 1 | 1.21.1 | no | 8.986 | 6.645 | 1.216 | 58.895 | 20.761 | not scored |
 | `pr_ablation_teacher_matrix_linear` | 50 × 1 | 1.21.1 | no | 11.579 | 8.506 | 1.535 | 74.387 | 25.659 | not scored |
+| `pr_ablation_teacher_native` | 50 × 1 | 1.21.1 | no | 9.093 | 6.887 | 1.194 | 56.346 | 20.037 | not scored |
+| `pr_ablation_teacher_native_ftz` | 50 × 1 | 1.21.1 | yes | 2.653 | 2.020 | 0.560 | 14.378 | 5.422 | not scored |
+| `pr_ablation_teacher_standard` | 50 × 1 | 1.21.1 | no | 3.301 | 2.396 | 0.646 | 21.298 | 6.836 | not scored |
 | `teacher_baseline_tile256_quick` | 3 × 1 | 1.23.2 | no | 18.824 | 13.961 | 0.569 | 41.943 | 39.145 | not scored |
 | `teacher_gather_tile256_quick` | 3 × 1 | 1.23.2 | no | 14.969 | 10.281 | 0.397 | 34.231 | 31.836 | not scored |
 | `teacher_matrix_packed_mha_quick` | 3 × 1 | 1.23.2 | no | 12.149 | 8.097 | 0.245 | 28.105 | 26.104 | not scored |

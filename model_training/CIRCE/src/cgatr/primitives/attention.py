@@ -237,6 +237,8 @@ class geometric_attention(nn.Module):
         self.num_s_channels_qk = num_s_channels_qk
         self.num_mv_channels_v = num_mv_channels_v
         self.num_s_channels_v = num_s_channels_v
+        # Enabled only on a disposable model by prepare_cpu_inference().
+        self._expand_cpu_heads = False
 
     # Exclude this method from any torch.compile graph: the xformers
     # memory_efficient_attention backward kernel cannot be traced by Dynamo.
@@ -407,6 +409,11 @@ class geometric_attention(nn.Module):
 
         # Scale keys to correct for zero padding
         k = k * math.sqrt(num_channels / num_channels_qk)
+
+        if self._expand_cpu_heads and q.device.type == "cpu":
+            # Views with equal head counts permit the CPU flash-SDPA backend.
+            k = k.expand(*q.shape[:-2], k.shape[-2], k.shape[-1])
+            v = v.expand(*q.shape[:-2], v.shape[-2], v.shape[-1])
 
         # Attention. Three accepted forms for `attn_mask`:
         #   * None                 -> single dense self-attention (one event).

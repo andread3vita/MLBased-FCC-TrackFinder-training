@@ -124,7 +124,8 @@ fi
 usage() {
     echo "Usage: $0 CIRCE|GATR TRAIN_GLOB VAL_GLOB OUTPUT_DIR CHECKPOINT_PATH [GPU_IDS]"
     echo "Quote the two globs so the identical file specifications reach both loaders."
-    echo "CHECKPOINT_PATH restores model, optimizer, scheduler, epoch, and step."
+    echo "CHECKPOINT_PATH restores model, optimizer, scheduler, epoch, and step." >&2
+    echo "Optional: MAX_TRAIN_FILES=<n> MAX_VAL_FILES=<m> cap the first-n sorted matches per set." >&2
 }
 if [[ $# -lt 5 || $# -gt 6 ]]; then usage >&2; exit 2; fi
 MODEL="${1,,}"
@@ -145,6 +146,13 @@ fi
 CHECKPOINT_PATH="$(readlink -f "$CHECKPOINT_PATH")"
 mapfile -t TRAIN_PATHS < <(compgen -G "$TRAIN_FILES" | sort)
 mapfile -t VAL_PATHS < <(compgen -G "$VAL_FILES" | sort)
+# Matches are sorted, so taking the first N is deterministic across workers.
+if [[ -n "${MAX_TRAIN_FILES:-}" ]]; then
+    TRAIN_PATHS=("${TRAIN_PATHS[@]:0:${MAX_TRAIN_FILES}}")
+fi
+if [[ -n "${MAX_VAL_FILES:-}" ]]; then
+    VAL_PATHS=("${VAL_PATHS[@]:0:${MAX_VAL_FILES}}")
+fi
 if [[ "${#TRAIN_PATHS[@]}" -eq 0 || "${#VAL_PATHS[@]}" -eq 0 ]]; then
     echo "The training or validation file specification matched no files." >&2
     exit 2
@@ -344,7 +352,7 @@ run_gatr() {
     [[ -n "$TRAIN_BATCH_LIMIT" ]] && train_limit_options+=(--limit-train-batches "$TRAIN_BATCH_LIMIT")
     [[ "$GRAD_CHECKPOINTING" == "1" ]] && checkpoint_options+=(--gradient-checkpointing)
     if [[ "$LOG_WANDB" == "1" ]]; then
-        wandb_options=(--log-wandb --wandb-displayname gatr_4gpus)
+        wandb_options=(--log-wandb --wandb-displayname "${WANDB_DISPLAYNAME:-gatr_4gpus_resume}")
         [[ -n "$WANDB_PROJECT" ]] && wandb_options+=(--wandb-projectname "$WANDB_PROJECT")
         [[ -n "$WANDB_ENTITY" ]] && wandb_options+=(--wandb-entity "$WANDB_ENTITY")
     fi
@@ -395,3 +403,4 @@ case "$MODEL" in
     circe) run_circe ;;
     gatr) run_gatr ;;
 esac
+

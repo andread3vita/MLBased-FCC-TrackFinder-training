@@ -1,0 +1,89 @@
+GATR pruning sweep (GATR_CIRCE_LOSS) via slurmTrain.sh
+=======================================================
+
+Purpose
+-------
+Prune the GATR model to reduce inference time per event while keeping the
+baseline physics (tracking) performance. Two pruning axes are swept:
+
+  - depth : NUM_BLOCKS            (baseline: 10)
+  - width : HIDDEN_MV_CHANNELS    (baseline: 16)
+            HIDDEN_S_CHANNELS     (baseline: 64)
+
+Architecture compute/parameter count grows linearly in NUM_BLOCKS and
+superlinearly in the hidden channel counts, so configs moving down either axis
+shrink inference cost.
+
+LR decision (START_LR / MIN_LR)
+-------------------------------
+Kept at the tuned baseline START_LR=4e-4, MIN_LR=1e-5 in ALL configs:
+capacity is reduced, not increased, so no LR rescaling is required a priori
+and results stay comparable to the baseline recipe. The values are repeated
+explicitly in every command to keep each line self-contained.
+If an aggressively pruned config (b2, b4/mv8/s32) underfits, rerun it with
+START_LR=6e-4 as a follow-up.
+
+Fixed everywhere: EMBED_DIM=4 (script default), same train/val globs,
+4 GPUs (script default GPU_IDS). Each config has a distinct OUTPUT_DIR,
+--wandb-displayname and --job-name matching its architecture.
+
+Data: training uses the first 600 sorted matches of the train glob
+(MAX_TRAIN_FILES=600 in every --export list); validation uses the full glob
+(already capped at 100 batches/epoch by the script's LIMIT_VAL_BATCHES=100).
+For smoke tests before queueing the full set, lower MAX_TRAIN_FILES (e.g. 5)
+
+Configuration list
+------------------
+ # | blocks | hidden_mv | hidden_s | intent
+---|--------|-----------|----------|--------------------------------
+ 1 |   8    |    16     |    64    | mild depth cut (80% of baseline)
+ 2 |   6    |    16     |    64    | moderate depth cut
+ 3 |   4    |    16     |    64    | strong depth cut
+ 4 |   2    |    16     |    64    | aggressive depth cut
+ 5 |  10    |     8     |    64    | mild width cut (MV axis)
+ 6 |  10    |    16     |    32    | mild width cut (S axis)
+ 7 |  10    |     8     |    32    | width cut on both axes
+ 8 |   8    |     8     |    32    | combined mild
+ 9 |   6    |     8     |    32    | combined moderate
+10 |   4    |     8     |    32    | combined aggressive
+
+Commands
+--------
+
+# 1) b8 mv16 s64
+sbatch --job-name=gatr_b8mv16s64 --export=ALL,MAX_TRAIN_FILES=600,NUM_BLOCKS=8,HIDDEN_MV_CHANNELS=16,HIDDEN_S_CHANNELS=64,START_LR=4e-4,MIN_LR=1e-5,WANDB_DISPLAYNAME=gatr_b8_mv16_s64 slurmTrain.sh GATR '/gpfs/scratch/ehpc1013/adevita/Zuds/graph/Graphs_*_train.parquet' '/gpfs/scratch/ehpc1013/adevita/Zuds_validation/graph/Graphs_*_test.parquet' /home/cern/cern406903/trainingFolder/prunedGATR/b8_mv16_s64/
+
+# 2) b6 mv16 s64
+sbatch --job-name=gatr_b6mv16s64 --export=ALL,MAX_TRAIN_FILES=600,NUM_BLOCKS=6,HIDDEN_MV_CHANNELS=16,HIDDEN_S_CHANNELS=64,START_LR=4e-4,MIN_LR=1e-5,WANDB_DISPLAYNAME=gatr_b6_mv16_s64 slurmTrain.sh GATR '/gpfs/scratch/ehpc1013/adevita/Zuds/graph/Graphs_*_train.parquet' '/gpfs/scratch/ehpc1013/adevita/Zuds_validation/graph/Graphs_*_test.parquet' /home/cern/cern406903/trainingFolder/prunedGATR/b6_mv16_s64/
+
+# 3) b4 mv16 s64
+sbatch --job-name=gatr_b4mv16s64 --export=ALL,MAX_TRAIN_FILES=600,NUM_BLOCKS=4,HIDDEN_MV_CHANNELS=16,HIDDEN_S_CHANNELS=64,START_LR=4e-4,MIN_LR=1e-5,WANDB_DISPLAYNAME=gatr_b4_mv16_s64 slurmTrain.sh GATR '/gpfs/scratch/ehpc1013/adevita/Zuds/graph/Graphs_*_train.parquet' '/gpfs/scratch/ehpc1013/adevita/Zuds_validation/graph/Graphs_*_test.parquet' /home/cern/cern406903/trainingFolder/prunedGATR/b4_mv16_s64/
+
+# 4) b2 mv16 s64
+sbatch --job-name=gatr_b2mv16s64 --export=ALL,MAX_TRAIN_FILES=600,NUM_BLOCKS=2,HIDDEN_MV_CHANNELS=16,HIDDEN_S_CHANNELS=64,START_LR=4e-4,MIN_LR=1e-5,WANDB_DISPLAYNAME=gatr_b2_mv16_s64 slurmTrain.sh GATR '/gpfs/scratch/ehpc1013/adevita/Zuds/graph/Graphs_*_train.parquet' '/gpfs/scratch/ehpc1013/adevita/Zuds_validation/graph/Graphs_*_test.parquet' /home/cern/cern406903/trainingFolder/prunedGATR/b2_mv16_s64/
+
+# 5) b10 mv8 s64
+sbatch --job-name=gatr_b10mv8s64 --export=ALL,MAX_TRAIN_FILES=600,NUM_BLOCKS=10,HIDDEN_MV_CHANNELS=8,HIDDEN_S_CHANNELS=64,START_LR=4e-4,MIN_LR=1e-5,WANDB_DISPLAYNAME=gatr_b10_mv8_s64 slurmTrain.sh GATR '/gpfs/scratch/ehpc1013/adevita/Zuds/graph/Graphs_*_train.parquet' '/gpfs/scratch/ehpc1013/adevita/Zuds_validation/graph/Graphs_*_test.parquet' /home/cern/cern406903/trainingFolder/prunedGATR/b10_mv8_s64/
+
+# 6) b10 mv16 s32
+sbatch --job-name=gatr_b10mv16s32 --export=ALL,MAX_TRAIN_FILES=600,NUM_BLOCKS=10,HIDDEN_MV_CHANNELS=16,HIDDEN_S_CHANNELS=32,START_LR=4e-4,MIN_LR=1e-5,WANDB_DISPLAYNAME=gatr_b10_mv16_s32 slurmTrain.sh GATR '/gpfs/scratch/ehpc1013/adevita/Zuds/graph/Graphs_*_train.parquet' '/gpfs/scratch/ehpc1013/adevita/Zuds_validation/graph/Graphs_*_test.parquet' /home/cern/cern406903/trainingFolder/prunedGATR/b10_mv16_s32/
+
+# 7) b10 mv8 s32
+sbatch --job-name=gatr_b10mv8s32 --export=ALL,MAX_TRAIN_FILES=600,NUM_BLOCKS=10,HIDDEN_MV_CHANNELS=8,HIDDEN_S_CHANNELS=32,START_LR=4e-4,MIN_LR=1e-5,WANDB_DISPLAYNAME=gatr_b10_mv8_s32 slurmTrain.sh GATR '/gpfs/scratch/ehpc1013/adevita/Zuds/graph/Graphs_*_train.parquet' '/gpfs/scratch/ehpc1013/adevita/Zuds_validation/graph/Graphs_*_test.parquet' /home/cern/cern406903/trainingFolder/prunedGATR/b10_mv8_s32/
+
+# 8) b8 mv8 s32
+sbatch --job-name=gatr_b8mv8s32 --export=ALL,MAX_TRAIN_FILES=600,NUM_BLOCKS=8,HIDDEN_MV_CHANNELS=8,HIDDEN_S_CHANNELS=32,START_LR=4e-4,MIN_LR=1e-5,WANDB_DISPLAYNAME=gatr_b8_mv8_s32 slurmTrain.sh GATR '/gpfs/scratch/ehpc1013/adevita/Zuds/graph/Graphs_*_train.parquet' '/gpfs/scratch/ehpc1013/adevita/Zuds_validation/graph/Graphs_*_test.parquet' /home/cern/cern406903/trainingFolder/prunedGATR/b8_mv8_s32/
+
+# 9) b6 mv8 s32
+sbatch --job-name=gatr_b6mv8s32 --export=ALL,MAX_TRAIN_FILES=600,NUM_BLOCKS=6,HIDDEN_MV_CHANNELS=8,HIDDEN_S_CHANNELS=32,START_LR=4e-4,MIN_LR=1e-5,WANDB_DISPLAYNAME=gatr_b6_mv8_s32 slurmTrain.sh GATR '/gpfs/scratch/ehpc1013/adevita/Zuds/graph/Graphs_*_train.parquet' '/gpfs/scratch/ehpc1013/adevita/Zuds_validation/graph/Graphs_*_test.parquet' /home/cern/cern406903/trainingFolder/prunedGATR/b6_mv8_s32/
+
+# 10) b4 mv8 s32
+sbatch --job-name=gatr_b4mv8s32 --export=ALL,MAX_TRAIN_FILES=600,NUM_BLOCKS=4,HIDDEN_MV_CHANNELS=8,HIDDEN_S_CHANNELS=32,START_LR=4e-4,MIN_LR=1e-5,WANDB_DISPLAYNAME=gatr_b4_mv8_s32 slurmTrain.sh GATR '/gpfs/scratch/ehpc1013/adevita/Zuds/graph/Graphs_*_train.parquet' '/gpfs/scratch/ehpc1013/adevita/Zuds_validation/graph/Graphs_*_test.parquet' /home/cern/cern406903/trainingFolder/prunedGATR/b4_mv8_s32/
+
+Evaluation guidance
+-------------------
+Compare each run against the b10/mv16/s64 baseline on tracking
+efficiency/fake rate (validation) and measure inference time per event of the
+exported model. Pick the smallest config whose physics metrics match baseline
+within tolerance; expected ordering of inference cost follows the table rows
+1 -> 4 and 5 -> 10 from near-baseline to smallest.

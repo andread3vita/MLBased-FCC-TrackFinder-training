@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Inputs:
-#   TRAIN_OR_TEST: train or test
+#   TRAIN_OR_TEST: train, val or test (val simulates like train, test keeps all particles)
 #   PIPELINE: noBackground, noBackground_parquet, background_parquet
 #   DETECTOR: IDEA or CLD
 #   MINSEED/MAXSEED: non-negative seed range

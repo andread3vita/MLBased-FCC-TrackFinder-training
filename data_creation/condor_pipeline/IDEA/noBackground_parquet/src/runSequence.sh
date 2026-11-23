@@ -39,7 +39,7 @@ k4run $WORK_DIR/data_creation/utils/Pythia_generation/pythia.py \
       --Pythia8.PythiaInterface.pythiacard Zcard_${SEED}.cmd
 rm Zcard_${SEED}.cmd
 
-if [[ "${TRAIN_OR_TEST}" == "train" ]]
+if [[ "${TRAIN_OR_TEST}" == "train" || "${TRAIN_OR_TEST}" == "val" ]]
 then
       
       ddsim --compactFile $K4GEO/FCCee/IDEA/compact/IDEA_o1_v04/IDEA_o1_v04.xml \
@@ -49,10 +49,8 @@ then
             --vertexSigma 5.96e-3 23.8e-6 0.397 36.3 \
             --random.seed $SEED \
             --steeringFile  $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground_parquet/utils/SteeringFile_IDEA_o1_v04.py \
-            --part.minimalKineticEnergy "0.00*MeV"   
-fi
-
-if [[ "${TRAIN_OR_TEST}" == "test" ]]
+            --part.minimalKineticEnergy "0.00*MeV"
+elif [[ "${TRAIN_OR_TEST}" == "test" ]]
 then
 
       ddsim --compactFile $K4GEO/FCCee/IDEA/compact/IDEA_o1_v04/IDEA_o1_v04.xml \
@@ -63,8 +61,11 @@ then
             --random.seed $SEED \
             --steeringFile $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground_parquet/utils/SteeringFile_IDEA_o1_v04.py \
             --part.userParticleHandler='' \
-            --part.keepAllParticles true 
-fi        
+            --part.keepAllParticles true
+else
+      echo "ERROR: unknown dataset type '${TRAIN_OR_TEST}', expected train, val or test" >&2
+      exit 2
+fi
 rm out_${SEED}.root out_${SEED}.hepmc
       
 k4run $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground_parquet/utils/runIDEA_v4o1_trackerDigitizer.py --inputFile out_sim_edm4hep_${SEED}.root --outputFile digi/output_IDEA_DIGI_${SEED}_${TRAIN_OR_TEST}.root

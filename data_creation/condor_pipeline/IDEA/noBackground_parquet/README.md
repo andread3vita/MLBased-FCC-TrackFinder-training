@@ -14,7 +14,7 @@ arms of `model_training/train_circe_gatr_shared.sh`.
 This is an independent copy of `noBackground` that writes the final graph
 dataset directly as Parquet. The EDM4hep simulation and digitization products
 remain ROOT files because those applications require ROOT; only
-`graph/Graphs_<seed>_<train-or-test>.parquet` is the training artifact.
+`graph/Graphs_<seed>_<train-val-test>.parquet` is the training artifact.
 
 `src/process_tree.py` writes incrementally in 25-event row groups using
 Zstandard level 1. Incremental output bounds conversion memory and the row

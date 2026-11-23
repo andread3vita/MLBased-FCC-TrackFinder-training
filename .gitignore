@@ -8,3 +8,4 @@ wandb/
 *.pyc
 gun/
 tests/
+data_creation/*.cc

@@ -19,7 +19,7 @@ def find_project_root(start_dir: Path) -> Path:
 
 def main():
 
-    TRAIN_OR_TEST = sys.argv[1]             # train or test
+    TRAIN_OR_TEST = sys.argv[1]             # train, val or test
     TYPE  = sys.argv[2]                     # noBackground, noBackground_parquet, noBackgroundDisplacement_parquet, background, background_parquet, loopers
     DETECTOR = sys.argv[3]                  # IDEA or CLD
     MINSEED = sys.argv[4]                   # min seed

@@ -5,11 +5,12 @@ TRAIN_OR_TEST=${2}
 SEED=${3}
 WORK_DIR=${4}
 KEY4HEP_VERSION=${5}
+KEY4HEP_MODE=${6:-spack}
 NEV=500
 
 ORIG_PARAMS=("$@")
 set --
-source /cvmfs/sw-nightlies.hsf.org/key4hep/setup.sh --spack -r "$KEY4HEP_VERSION"
+source /cvmfs/sw-nightlies.hsf.org/key4hep/setup.sh "--$KEY4HEP_MODE" -r "$KEY4HEP_VERSION"
 setup_status=$?
 set -- "${ORIG_PARAMS[@]}"
 

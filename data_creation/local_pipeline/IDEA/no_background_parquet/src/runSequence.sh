@@ -1,15 +1,16 @@
 #!/bin/bash
 
-OUTDIR=${1} 
-TRAIN_OR_TEST=${2} 
+OUTDIR=${1}
+TRAIN_OR_TEST=${2}
 SEED=${3}
 WORK_DIR=${4}
 KEY4HEP_VERSION=${5}
+KEY4HEP_MODE=${6:-spack}
 NEV=500
 
 ORIG_PARAMS=("$@")
 set --
-source /cvmfs/sw-nightlies.hsf.org/key4hep/setup.sh --spack -r "$KEY4HEP_VERSION"
+source /cvmfs/sw-nightlies.hsf.org/key4hep/setup.sh "--$KEY4HEP_MODE" -r "$KEY4HEP_VERSION"
 setup_status=$?
 set -- "${ORIG_PARAMS[@]}"
 
@@ -28,7 +29,7 @@ set -e
 
 cd $OUTDIR
 
-cp $WORK_DIR/data_creation/utils/Pythia_generation/ZcardZbb.cmd Zcard_${SEED}.cmd
+cp $WORK_DIR/data_creation/utils/Pythia_generation/Zcard.cmd Zcard_${SEED}.cmd
 printf '\nRandom:setSeed=on\nRandom:seed=%s\n' "$SEED" >> Zcard_${SEED}.cmd
 
 k4run $WORK_DIR/data_creation/utils/Pythia_generation/pythia.py \
@@ -40,15 +41,15 @@ rm Zcard_${SEED}.cmd
 
 if [[ "${TRAIN_OR_TEST}" == "train" ]]
 then
-      
+
       ddsim --compactFile $K4GEO/FCCee/IDEA/compact/IDEA_o1_v04/IDEA_o1_v04.xml \
             --outputFile out_sim_edm4hep_${SEED}.root \
             --inputFiles out_${SEED}.hepmc \
             --numberOfEvents $NEV \
             --vertexSigma 5.96e-3 23.8e-6 0.397 36.3 \
             --random.seed $SEED \
-            --steeringFile  $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground_parquet/utils/SteeringFile_IDEA_o1_v04.py \
-            --part.minimalKineticEnergy "0.00*MeV"   
+            --steeringFile  $WORK_DIR/data_creation/local_pipeline/IDEA/no_background_parquet/utils/SteeringFile_IDEA_o1_v04.py \
+            --part.minimalKineticEnergy "0.00*MeV"
 fi
 
 if [[ "${TRAIN_OR_TEST}" == "test" ]]
@@ -60,16 +61,16 @@ then
             --numberOfEvents $NEV \
             --vertexSigma 5.96e-3 23.8e-6 0.397 36.3 \
             --random.seed $SEED \
-            --steeringFile $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground_parquet/utils/SteeringFile_IDEA_o1_v04.py \
+            --steeringFile $WORK_DIR/data_creation/local_pipeline/IDEA/no_background_parquet/utils/SteeringFile_IDEA_o1_v04.py \
             --part.userParticleHandler='' \
-            --part.keepAllParticles true 
-fi        
+            --part.keepAllParticles true
+fi
 rm out_${SEED}.root out_${SEED}.hepmc
-      
-k4run $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground_parquet/utils/runIDEA_v4o1_trackerDigitizer.py --inputFile out_sim_edm4hep_${SEED}.root --outputFile digi/output_IDEA_DIGI_${SEED}_${TRAIN_OR_TEST}.root
+
+k4run $WORK_DIR/data_creation/local_pipeline/IDEA/no_background_parquet/utils/runIDEA_v4o1_trackerDigitizer.py --inputFile out_sim_edm4hep_${SEED}.root --outputFile digi/output_IDEA_DIGI_${SEED}_${TRAIN_OR_TEST}.root
 rm out_sim_edm4hep_${SEED}.root
 
-python $WORK_DIR/data_creation/condor_pipeline/IDEA/noBackground_parquet/src/process_tree.py \
+python $WORK_DIR/data_creation/local_pipeline/IDEA/no_background_parquet/src/process_tree.py \
       digi/output_IDEA_DIGI_${SEED}_${TRAIN_OR_TEST}.root \
       graph/Graphs_${SEED}_${TRAIN_OR_TEST}.parquet \
       --file-number "$SEED" \

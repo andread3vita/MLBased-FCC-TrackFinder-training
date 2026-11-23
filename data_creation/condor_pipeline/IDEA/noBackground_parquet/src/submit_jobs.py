@@ -39,8 +39,15 @@ def main(base_path):
     parser.add_argument("--detector", help="IDEA or CLD", default="IDEA")
     parser.add_argument(
         "--key4hep_version",
-        help="Key4hep version to use",
-        default="2026-07-29",
+        help="Key4hep release: date (e.g. 2026-10-20) for --key4hep_mode spack, "
+        "weekday (Mon..Sat) or 'latest' for --key4hep_mode lcg",
+        default="2026-10-20",
+    )
+    parser.add_argument(
+        "--key4hep_mode",
+        choices=("spack", "lcg"),
+        default="spack",
+        help="Key4hep stack: frozen spack nightlies (spack) or the rolling LCG view (lcg)",
     )
     parser.add_argument("--mainDir", help="main directory", default="")
     parser.add_argument("--accounting-group", required=True, help="Condor accounting group")
@@ -58,6 +65,7 @@ def main(base_path):
     minseed = int(parsed_args.minseed)
     train_or_val = parsed_args.type
     key4hep_version = parsed_args.key4hep_version
+    key4hep_mode = parsed_args.key4hep_mode
 
     script = f"{mainDir}/src/runSequence.sh"
 
@@ -82,7 +90,7 @@ def main(base_path):
 
             print(f"{output_pattern} : missing file")
 
-            argts = (f"{outdir} {train_or_val} {seed} {base_path} {key4hep_version}")
+            argts = (f"{outdir} {train_or_val} {seed} {base_path} {key4hep_version} {key4hep_mode}")
             arguments_list.append(argts)
 
 

@@ -631,10 +631,6 @@ parser.add_argument(
     default="1.5,1.2,0.75,2.0",
     help="comma-separated positive track weights; requires len(edges)+1 values",
 )
-parser.add_argument(
-    "--helix-loss-weight", type=float, default=0.0,
-    help="auxiliary inverse-pT and direction regression weight",
-)
 parser.add_argument("--weight-decay", type=float, default=1e-4)
 parser.add_argument("--min-lr", type=float, default=1e-5)
 parser.add_argument("--warmup-epochs", type=float, default=2.0)

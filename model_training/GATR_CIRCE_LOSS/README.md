@@ -13,9 +13,10 @@ vendored runtime, and Lightning training/validation code needed by:
 
 The training step imports and calls CIRCE's object-condensation loss directly
 from `../shared_training/circe_loss.py`; it does not call GATr's composite loss
-with selected terms disabled. The unchanged GATr architecture still contains
-its auxiliary helix output head, but the comparison launcher freezes that
-unused head. Tracking metrics and plots are the current GATr implementation,
+with selected terms disabled. The auxiliary helix output head of the original
+GATr tracking model is removed: the network outputs only the clustering
+coordinates and the beta logit. Older checkpoints that still contain the
+head resume normally (its tensors are dropped on load). Tracking metrics and plots are the current GATr implementation,
 shared with CIRCE from `../shared_training/tracking_metrics.py`.
 
 Both comparison arms use `../shared_training/logging_contract.py` and the

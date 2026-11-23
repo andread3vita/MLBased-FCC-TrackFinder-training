@@ -116,7 +116,6 @@ class TrainingStabilityMonitor(Callback):
         ("gatr", "gatr"),
         ("clustering", "clustering"),
         ("beta", "beta"),
-        ("helix", "helix_proxy"),
     )
 
     def __init__(self, beta_seed_threshold=0.85):

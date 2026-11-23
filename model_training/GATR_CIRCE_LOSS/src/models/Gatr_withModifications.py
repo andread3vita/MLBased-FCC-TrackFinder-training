@@ -42,7 +42,6 @@ from src.layers.batch_operations import obtain_batch_numbers
 from shared_training.checkpoint_resume import reset_validation_loop_progress
 from shared_training.circe_loss import object_condensation_loss
 from shared_training.logging_contract import (
-    HELIX_TRAIN_METRIC_NAMES, HELIX_VALIDATION_LOSS_NAME,
     log_sweep_metrics, log_training_metrics, log_validation_loss,
 )
 from shared_training.wandb_logger import (
@@ -85,8 +84,12 @@ from src.utils.track_weighting import (
 from src.utils.validation import validation_output_name
 
 
+# Parameters of the removed auxiliary helix head, still present in older
+# checkpoints; dropped when such a checkpoint is resumed.
+_LEGACY_HELIX_PREFIX = "helix_proxy."
+
+
 class ExampleWrapper(L.LightningModule):
-    helix_proxy_dim = 4
     lr_schedule_unit = "epoch-v1"
 
     @staticmethod
@@ -198,10 +201,7 @@ class ExampleWrapper(L.LightningModule):
                 f"be {expected_detector_scalar_dim}; received "
                 f"{self.detector_scalar_dim}."
             )
-        self._use_helix_proxy = (
-            float(getattr(args, "helix_loss_weight", 0.0)) > 0.0
-        )
-        self.output_dim = self.embedding_dim + 1 + self.helix_proxy_dim
+        self.output_dim = self.embedding_dim + 1
         self.position_scale = float(getattr(args, "position_scale", 1000.0))
         self._val_cache = []
         self._val_loss_sum = 0.0
@@ -249,9 +249,6 @@ class ExampleWrapper(L.LightningModule):
         )
         self.clustering = nn.Linear(16, self.embedding_dim, bias=False)
         self.beta = nn.Linear(16, 1)
-        self.helix_proxy = nn.Linear(16, self.helix_proxy_dim)
-        if not self._use_helix_proxy:
-            self.helix_proxy.requires_grad_(False)
 
     def _detector_scalars(self, graph, dtype):
         """Return detector scalars unchanged, or ``None`` in geometry mode."""
@@ -344,21 +341,12 @@ class ExampleWrapper(L.LightningModule):
             inverse = torch.empty_like(order)
             inverse[order] = torch.arange(order.numel(), device=order.device)
             latent = latent[inverse]
-        if self._use_helix_proxy:
-            helix_prediction = self.helix_proxy(latent)
-        else:
-            helix_prediction = latent.new_zeros(
-                (latent.shape[0], self.helix_proxy_dim)
-            )
-        return torch.cat(
-            (self.clustering(latent), self.beta(latent), helix_prediction), dim=1
-        )
+        return torch.cat((self.clustering(latent), self.beta(latent)), dim=1)
 
     def _split_output(self, output):
         coords = output[:, : self.embedding_dim]
         beta_logits = output[:, self.embedding_dim]
-        auxiliary = output[:, self.embedding_dim + 1 :]
-        return coords, beta_logits, auxiliary
+        return coords, beta_logits
 
     def _variance_weight(self):
         target = float(getattr(self.args, "var_weight", 0.0))
@@ -371,129 +359,10 @@ class ExampleWrapper(L.LightningModule):
         """Use CIRCE's final variance weight for every validation epoch."""
         return float(getattr(self.args, "var_weight", 0.0))
 
-    def _helix_proxy_loss(self, graph, y, prediction):
-        """Auxiliary inverse-pT/direction regression using available particle labels."""
-        weight = float(getattr(self.args, "helix_loss_weight", 0.0))
-        if weight <= 0 or prediction.numel() == 0:
-            return prediction.sum() * 0.0
-
-        # Match nodes to truth particles entirely on the accelerator.  The old
-        # implementation built a Python dictionary for every event and called
-        # .tolist()/.item() for every signal node, forcing repeated GPU-to-CPU
-        # synchronization in every training batch.
-        node_counts = graph.batch_num_nodes().to(device=prediction.device)
-        batch_numbers = torch.repeat_interleave(
-            torch.arange(node_counts.numel(), device=prediction.device),
-            node_counts,
-        )
-        particle_ids = graph.ndata["particle_number_nomap"].reshape(-1)
-        signal = graph.ndata["particle_number"].reshape(-1) > 0
-        signal_indices = torch.nonzero(signal, as_tuple=False).flatten()
-        if y.shape[0] == 0 or signal_indices.numel() == 0:
-            return prediction.sum() * 0.0
-
-        truth_event_ids = y[:, -1].long()
-        truth_particle_ids = y[:, 4].long()
-        signal_particle_ids = particle_ids[signal_indices].long()
-
-        # A dynamic stride gives each (event, particle ID) pair a unique int64
-        # key without assuming that particle IDs are consecutive or positive.
-        minimum_particle_id = torch.minimum(
-            truth_particle_ids.min(), signal_particle_ids.min()
-        )
-        maximum_particle_id = torch.maximum(
-            truth_particle_ids.max(), signal_particle_ids.max()
-        )
-        key_stride = maximum_particle_id - minimum_particle_id + 1
-        truth_keys = (
-            truth_event_ids * key_stride
-            + truth_particle_ids
-            - minimum_particle_id
-        )
-        signal_keys = (
-            batch_numbers[signal_indices] * key_stride
-            + signal_particle_ids
-            - minimum_particle_id
-        )
-
-        sorted_truth_keys, truth_order = torch.sort(truth_keys)
-        match_positions = torch.searchsorted(sorted_truth_keys, signal_keys)
-        safe_positions = match_positions.clamp(max=sorted_truth_keys.numel() - 1)
-        matched = (match_positions < sorted_truth_keys.numel()) & (
-            sorted_truth_keys[safe_positions] == signal_keys
-        )
-        matched_node_indices = signal_indices[matched]
-        matched_truth_positions = safe_positions[matched]
-        particle_rows = y[truth_order[matched_truth_positions]]
-
-        theta = particle_rows[:, 0]
-        phi = particle_rows[:, 1]
-        pt = particle_rows[:, 6].abs().clamp(min=1e-3)
-        targets = torch.stack(
-            (
-                torch.log1p(1.0 / pt),
-                torch.sin(phi),
-                torch.cos(phi),
-                torch.reciprocal(torch.tan(theta)).clamp(-10, 10) / 10.0,
-            ),
-            dim=1,
-        ).to(dtype=prediction.dtype)
-
-        # Ignore malformed truth rows rather than allowing one NaN direction
-        # or momentum value to invalidate the complete mini-batch.
-        finite_targets = torch.isfinite(targets).all(dim=1)
-        matched_node_indices = matched_node_indices[finite_targets]
-        matched_truth_positions = matched_truth_positions[finite_targets]
-        targets = targets[finite_targets]
-        if matched_node_indices.numel() == 0:
-            return prediction.sum() * 0.0
-
-        if self.pt_track_weighting:
-            elementwise_loss = torch.nn.functional.smooth_l1_loss(
-                prediction[matched_node_indices], targets, reduction="none"
-            )
-            loss_per_hit = elementwise_loss.mean(dim=1)
-            loss_sum_per_track = torch.zeros(
-                y.shape[0], dtype=loss_per_hit.dtype, device=loss_per_hit.device
-            )
-            hit_count_per_track = torch.zeros_like(loss_sum_per_track)
-            loss_sum_per_track.scatter_add_(
-                0, matched_truth_positions, loss_per_hit
-            )
-            hit_count_per_track.scatter_add_(
-                0,
-                matched_truth_positions,
-                torch.ones_like(loss_per_hit),
-            )
-            represented = hit_count_per_track > 0
-            loss_per_track = (
-                loss_sum_per_track[represented]
-                / hit_count_per_track[represented]
-            )
-            sorted_pt = y[truth_order, 6].to(device=prediction.device)
-            track_weights = pt_track_weights(
-                sorted_pt[represented],
-                self.pt_track_weight_bin_edges,
-                self.pt_track_weight_bin_weights,
-                dtype=loss_per_track.dtype,
-            )
-            return weighted_mean(loss_per_track, track_weights)
-
-        loss_sum = torch.nn.functional.smooth_l1_loss(
-            prediction[matched_node_indices], targets, reduction="sum"
-        )
-        # Match PyTorch's original reduction="mean": average over both the
-        # matched hits and the four helix target components.
-        normalizer = max(
-            matched_node_indices.numel() * prediction.shape[1],
-            1,
-        )
-        return loss_sum / normalizer
-
     def _shared_step(self, batch, stage):
         graph, y = batch
         output = self(graph)
-        coords, beta_logits, helix_prediction = self._split_output(output)
+        coords, beta_logits = self._split_output(output)
         variance_weight = (
             self._validation_variance_weight()
             if stage == "val"
@@ -521,16 +390,6 @@ class ExampleWrapper(L.LightningModule):
             oc_mode="paper_hinge",
         )
         batch_size = len(graph.batch_num_nodes())
-        # ``loss`` stays the object-condensation loss shared with CIRCE (it is
-        # logged under the common keys and drives validation/loss); the
-        # optional helix regression is added only to the optimized objective.
-        total_loss = loss
-        helix_loss = None
-        if self._use_helix_proxy:
-            helix_loss = self._helix_proxy_loss(
-                graph, y, helix_prediction.float()
-            )
-            total_loss = loss + float(self.args.helix_loss_weight) * helix_loss
         if stage == "train":
             loss_metrics = log_training_metrics(
                 self,
@@ -541,24 +400,6 @@ class ExampleWrapper(L.LightningModule):
                 variance_weight,
                 batch_size,
             )
-            if helix_loss is not None:
-                helix_metrics = {
-                    HELIX_TRAIN_METRIC_NAMES["helix"]: helix_loss,
-                    HELIX_TRAIN_METRIC_NAMES["helix_weighted"]: (
-                        float(self.args.helix_loss_weight) * helix_loss
-                    ),
-                    HELIX_TRAIN_METRIC_NAMES["total"]: total_loss,
-                }
-                for metric_name, metric_value in helix_metrics.items():
-                    self.log(
-                        metric_name,
-                        metric_value,
-                        on_step=True,
-                        on_epoch=True,
-                        sync_dist=True,
-                        batch_size=batch_size,
-                    )
-                loss_metrics = {**loss_metrics, **helix_metrics}
             self._latest_loss_metrics = {
                 metric_name: (
                     metric_value.detach()
@@ -567,16 +408,6 @@ class ExampleWrapper(L.LightningModule):
                 )
                 for metric_name, metric_value in loss_metrics.items()
             }
-            return total_loss, output
-        if helix_loss is not None:
-            self.log(
-                HELIX_VALIDATION_LOSS_NAME,
-                helix_loss,
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=batch_size,
-            )
         return loss, output
 
     def _nonfinite_batch_details(self, graph, output):
@@ -735,7 +566,7 @@ class ExampleWrapper(L.LightningModule):
         The operating-point sweep takes a configured prefix of this cache;
         the pT-dependent efficiency uses the complete cache.
         """
-        coords, beta_logits, _ = self._split_output(output)
+        coords, beta_logits = self._split_output(output)
         truth = graph.ndata["particle_number"].detach().cpu().numpy()
         truth_particle_id = (
             graph.ndata["particle_number_nomap"].detach().cpu().numpy()
@@ -1036,7 +867,6 @@ class ExampleWrapper(L.LightningModule):
                     "beta_suppress_weight": float(self.args.beta_suppress_weight),
                     "beta_second_weight": float(self.args.beta_second_weight),
                     "variance_weight": self._validation_variance_weight(),
-                    "helix_loss_weight": float(self.args.helix_loss_weight),
                     "hard_negative_weight": float(self.args.hard_negative_weight),
                     "pt_track_weighting": self.pt_track_weighting,
                     "pt_track_weight_bin_edges": list(
@@ -1405,7 +1235,45 @@ class ExampleWrapper(L.LightningModule):
                 for name, working_point in self._validation_working_points.items()
             }
 
+    def _drop_legacy_helix_state(self, checkpoint):
+        """Make a checkpoint saved with the old helix head resumable.
+
+        Removes its ``helix_proxy.*`` tensors from the raw and EMA weights and
+        its two (frozen, state-less) parameters from the optimizer groups.
+        They were registered last, so they are the trailing parameter ids.
+        """
+        state = checkpoint.get("state_dict") or {}
+        legacy = [key for key in state if key.startswith(_LEGACY_HELIX_PREFIX)]
+        if not legacy:
+            return
+        for key in legacy:
+            del state[key]
+        ema_state = checkpoint.get("ema_state_dict")
+        if isinstance(ema_state, dict):
+            for key in [k for k in ema_state if k.startswith(_LEGACY_HELIX_PREFIX)]:
+                del ema_state[key]
+        current_parameters = sum(1 for _ in self.parameters())
+        for optimizer_state in checkpoint.get("optimizer_states", []):
+            groups = optimizer_state.get("param_groups", [])
+            saved_ids = [i for group in groups for i in group["params"]]
+            if len(saved_ids) != current_parameters + len(legacy):
+                raise RuntimeError(
+                    "Cannot map the optimizer state of a checkpoint with the "
+                    f"removed helix head: {len(saved_ids)} saved parameters, "
+                    f"{current_parameters} current, {len(legacy)} legacy tensors."
+                )
+            dropped = set(saved_ids[-len(legacy):])
+            for group in groups:
+                group["params"] = [i for i in group["params"] if i not in dropped]
+            for index in dropped:
+                optimizer_state.get("state", {}).pop(index, None)
+        print(
+            f"Resume: dropped {len(legacy)} tensors of the removed helix head.",
+            flush=True,
+        )
+
     def on_load_checkpoint(self, checkpoint):
+        self._drop_legacy_helix_state(checkpoint)
         if reset_validation_loop_progress(checkpoint):
             print(
                 "Resume: the next validation runs every validation batch.",

@@ -23,7 +23,7 @@ if [[ "${1:-}" != "--worker" && ( -z "${SLURM_JOB_ID:-}" || -z "${SLURM_JOB_NODE
         exit 1
     fi
     if [[ $# -lt 4 ]]; then
-        echo "Usage: $0 CIRCE|GATR TRAIN_GLOB VAL_GLOB OUTPUT_DIR [GPU_IDS]" >&2
+        echo "Usage: $0 CIRCE|GATR|GATR_EXPERIMENT TRAIN_GLOB VAL_GLOB OUTPUT_DIR [GPU_IDS]" >&2
         exit 2
     fi
     # Slurm logs go next to the run outputs, not in logs-torchrun.
@@ -44,6 +44,20 @@ set -eo pipefail
 # MN5 environment initialization
 # Conda/MPI scripts may reference unset environment variables.
 set +u
+echo "======== Module diagnostics ========"
+echo "Host: $(hostname)"
+echo "Inherited MODULEPATH: ${MODULEPATH:-unset}"
+# sbatch inherits MODULEPATH from the submitting login node, which may lack
+# the ACC (GPU) module tree; salloc shells get it from the node profile.
+for acc_modpath in /apps/ACC/modulefiles/{applications,compilers,environment,libs}; do
+    if [[ -d "$acc_modpath" && ":${MODULEPATH:-}:" != *":$acc_modpath:"* ]]; then
+        module use --append "$acc_modpath"
+    fi
+done
+echo "Final MODULEPATH: ${MODULEPATH:-unset}"
+echo "Available cuda modules:"
+module -t avail cuda 2>&1 || true
+echo "===================================="
 module load miniforge/24.3.0-0
 source "/gpfs/apps/MN5/ACC/MINIFORGE/24.3.0-0/etc/profile.d/conda.sh"
 conda activate /gpfs/apps/MN5/ACC/MINIFORGE/24.3.0-0/envs/mlpf
@@ -116,7 +130,7 @@ if [[ "${1:-}" == "--worker" ]]; then
     shift
 fi
 usage() {
-    echo "Usage: $0 CIRCE|GATR TRAIN_GLOB VAL_GLOB OUTPUT_DIR [GPU_IDS]"
+    echo "Usage: $0 CIRCE|GATR|GATR_EXPERIMENT TRAIN_GLOB VAL_GLOB OUTPUT_DIR [GPU_IDS]"
     echo "Quote the two globs so the identical file specifications reach both loaders."
     echo "Optional: MAX_TRAIN_FILES=<n> MAX_VAL_FILES=<m> cap the first-n sorted matches per set."
 }
@@ -127,7 +141,7 @@ VAL_FILES="$3"
 OUTPUT_DIR="$4"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 GPU_IDS="${5:-${TRAIN_GPUS:-$(seq -s, 0 $((GPUS_PER_NODE - 1)))}}"
-case "$MODEL" in circe|gatr) ;; *) usage >&2; exit 2 ;; esac
+case "$MODEL" in circe|gatr|gatr_experiment) ;; *) usage >&2; exit 2 ;; esac
 if [[ "$TRAIN_FILES" == "$VAL_FILES" ]]; then
     echo "Training and validation specifications must differ." >&2; exit 2
 fi
@@ -214,11 +228,17 @@ PREFETCH="${PREFETCH_FACTOR:-2}"
 GRAD_CHECKPOINTING="${GRAD_CHECKPOINTING:-0}"
 CIRCE_COMPILE="${CIRCE_COMPILE:-0}"
 CIRCE_COMPILE_MODE="${CIRCE_COMPILE_MODE:-default}"
+GATR_COMPILE="${GATR_COMPILE:-1}"  # GATR_EXPERIMENT only
+GATR_COMPILE_MODE="${GATR_COMPILE_MODE:-default}"
+# GATR_EXPERIMENT only: FP32 matmuls on TF32 tensor cores (highest = exact FP32).
+GATR_MATMUL_PRECISION="${GATR_MATMUL_PRECISION:-high}"
+# Padded hit-count sizes per factor of two (fewer: less compilation, more padding).
+GATR_COMPILE_BUCKETS="${GATR_COMPILE_BUCKETS:-4}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY_N_TRAIN_STEPS:-0}"
 TRAIN_BATCH_LIMIT="${LIMIT_TRAIN_BATCHES:-}"
 VAL_BATCH_LIMIT="${LIMIT_VAL_BATCHES:-100}"
 EMBED_DIM="${EMBED_DIM:-4}"
-BLOCKS="${NUM_BLOCKS:-6}"
+BLOCKS="${NUM_BLOCKS:-10}"
 HIDDEN_MV="${HIDDEN_MV_CHANNELS:-16}"
 HIDDEN_S="${HIDDEN_S_CHANNELS:-64}"
 START_LR="${START_LR:-4e-4}"
@@ -251,6 +271,61 @@ case "$CIRCE_COMPILE_MODE" in
     default|max-autotune-no-cudagraphs) ;;
     *) echo "CIRCE_COMPILE_MODE must be default or max-autotune-no-cudagraphs." >&2; exit 2 ;;
 esac
+case "$GATR_MATMUL_PRECISION" in
+    highest|high|medium) ;;
+    *) echo "GATR_MATMUL_PRECISION must be highest, high, or medium." >&2; exit 2 ;;
+esac
+case "$GATR_COMPILE_MODE" in
+    default|max-autotune-no-cudagraphs) ;;
+    *) echo "GATR_COMPILE_MODE must be default or max-autotune-no-cudagraphs." >&2; exit 2 ;;
+esac
+if [[ "$MODEL" == "gatr_experiment" && "$GATR_COMPILE" == "1" ]]; then
+    # torch.compile/Triton need a CUDA 12 ptxas (the cu118 wheel has none).
+    # Resolution order: preset TRITON_PTXAS_PATH, then $CUDA_MODULE (if set),
+    # then the first CUDA 12 module that loads, then a pip-installed ptxas.
+    if [[ -z "${TRITON_PTXAS_PATH:-}" ]]; then
+        set +u
+        for cuda_mod in ${CUDA_MODULE:-cuda/12.1 cuda/12.2 cuda/12.4 cuda/12.6 cuda/12.8 cuda/12 cuda}; do
+            if module load "$cuda_mod" 2>/dev/null && [[ -n "${CUDA_HOME:-}" && -x "$CUDA_HOME/bin/ptxas" ]]; then
+                export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
+                echo "CUDA module for torch.compile: $cuda_mod ($CUDA_HOME)"
+                break
+            fi
+        done
+        set -u
+    fi
+    if [[ -z "${TRITON_PTXAS_PATH:-}" ]]; then
+        TRITON_PTXAS_PATH="$(python - <<'PY' 2>/dev/null || true
+import glob, os, site
+roots = site.getsitepackages() + [site.getusersitepackages()]
+for root in roots:
+    for pat in ("nvidia/cuda_nvcc/bin/ptxas", "triton/backends/nvidia/bin/ptxas", "triton/third_party/cuda/bin/ptxas"):
+        for hit in glob.glob(os.path.join(root, pat)):
+            if os.access(hit, os.X_OK):
+                print(hit); raise SystemExit
+PY
+)"
+        [[ -n "$TRITON_PTXAS_PATH" ]] && echo "Using pip-provided ptxas: $TRITON_PTXAS_PATH"
+    fi
+    if [[ -z "${TRITON_PTXAS_PATH:-}" || ! -x "$TRITON_PTXAS_PATH" ]]; then
+        echo "ERROR: no CUDA 12 ptxas found for torch.compile." >&2
+        echo "  host=$(hostname) MODULEPATH=${MODULEPATH:-unset}" >&2
+        echo "  Run 'module spider cuda' and resubmit with CUDA_MODULE=<name>," >&2
+        echo "  or set TRITON_PTXAS_PATH=/path/to/ptxas, or disable with GATR_COMPILE=0." >&2
+        exit 1
+    fi
+    export TRITON_PTXAS_PATH
+    # Keep compiled graphs/kernels across jobs (the default is a per-job
+    # /scratch/tmp directory, so every job recompiled every padding bucket).
+    export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$HOME/.cache/torchinductor_gatr_experiment}"
+    export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
+    mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
+    echo "TorchInductor cache: $TORCHINDUCTOR_CACHE_DIR"
+    # Triton builds its kernel launchers with $CC; MN5 modules set CC=icc
+    # (deprecated, prints remark #10441 per kernel). Use gcc when available.
+    if command -v gcc >/dev/null 2>&1; then export CC="$(command -v gcc)"; fi
+    echo "ptxas for torch.compile: $TRITON_PTXAS_PATH"
+fi
 case "$LR_SCHEDULE" in
     plateau) GATR_LR_SCHEDULE="reduceplateau" ;;
     cosine) GATR_LR_SCHEDULE="flat+decay" ;;
@@ -330,9 +405,19 @@ run_circe() {
     )
 }
 run_gatr() {
+    # $1: GATR_CIRCE_LOSS or GATR_EXPERIMENT (same options; the latter adds --compile)
+    local gatr_dir="$1"
     local wandb_options=()
     local train_limit_options=()
     local checkpoint_options=()
+    local compile_options=()
+    local model_prefix="$OUTPUT_DIR/simplifiedModel/"
+    if [[ "$gatr_dir" == "GATR_EXPERIMENT" ]]; then
+        model_prefix="$OUTPUT_DIR/gatrExperiment/"
+        compile_options+=(--float32-matmul-precision "$GATR_MATMUL_PRECISION")
+        [[ "$GATR_COMPILE" == "1" ]] && compile_options+=(--compile --compile-mode "$GATR_COMPILE_MODE" \
+            --compile-buckets-per-octave "$GATR_COMPILE_BUCKETS")
+    fi
     [[ -n "$TRAIN_BATCH_LIMIT" ]] && train_limit_options+=(--limit-train-batches "$TRAIN_BATCH_LIMIT")
     [[ "$GRAD_CHECKPOINTING" == "1" ]] && checkpoint_options+=(--gradient-checkpointing)
     if [[ "$LOG_WANDB" == "1" ]]; then
@@ -344,12 +429,12 @@ run_gatr() {
         "$PYTHON_BIN" "$ROOT_DIR/shared_training/validate_setup.py" \
         --train "${TRAIN_PATHS[@]}" --val "${VAL_PATHS[@]}" --gatr
     fi
-    cd "$ROOT_DIR/GATR_CIRCE_LOSS"
+    cd "$ROOT_DIR/$gatr_dir"
     launch_torchrun -m src.train_lightning \
         --data-train "${TRAIN_PATHS[@]}" --data-val "${VAL_PATHS[@]}" \
         --data-config config_files/config_tracking_parquet.yaml \
         --network-config src/models/wrapper/model_tracking_gatr.py \
-        --model-prefix "$OUTPUT_DIR/simplifiedModel/" \
+        --model-prefix "$model_prefix" \
         --clustering_loss_only --clustering_space_dim "$EMBED_DIM" \
         --gatr-blocks "$BLOCKS" --hidden-mv-channels "$HIDDEN_MV" \
         --hidden-s-channels "$HIDDEN_S" --gpus "$LOGICAL_GPUS" \
@@ -372,15 +457,17 @@ run_gatr() {
         --qmin "$QMIN" --L_attractive_weight "$ATTR" \
         --L_repulsive_weight "$REPUL" --beta-suppress-weight "$BETA_SUPPRESS" \
         --var-weight "$VAR_WEIGHT" --var-warmup-epochs "$VAR_WARMUP" \
-        --helix-loss-weight 0 --sweep-tbeta-grid "$SWEEP_TBETA" \
+        --sweep-tbeta-grid "$SWEEP_TBETA" \
         --sweep-td-grid "$SWEEP_TD" --sweep-min-hits-grid "$SWEEP_MIN_HITS" \
         --validation-sweep-max-events "$SWEEP_EVENTS" \
         --sweep-match-metric "$MATCHING_METRIC" --sweep-truth-min-hits 3 \
         --rejected-seed-policy "$REJECTED_POLICY" \
         "${checkpoint_options[@]}" \
+        "${compile_options[@]}" \
         "${wandb_options[@]}"
 }
 case "$MODEL" in
     circe) run_circe ;;
-    gatr) run_gatr ;;
+    gatr) run_gatr GATR_CIRCE_LOSS ;;
+    gatr_experiment) run_gatr GATR_EXPERIMENT ;;
 esac

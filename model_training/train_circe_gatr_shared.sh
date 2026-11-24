@@ -207,7 +207,7 @@ run_gatr() {
         --qmin "$QMIN" --L_attractive_weight "$ATTR" \
         --L_repulsive_weight "$REPUL" --beta-suppress-weight "$BETA_SUPPRESS" \
         --var-weight "$VAR_WEIGHT" --var-warmup-epochs "$VAR_WARMUP" \
-        --helix-loss-weight 0 --sweep-tbeta-grid "$SWEEP_TBETA" \
+        --sweep-tbeta-grid "$SWEEP_TBETA" \
         --sweep-td-grid "$SWEEP_TD" --sweep-min-hits-grid "$SWEEP_MIN_HITS" \
         --validation-sweep-max-events "$SWEEP_EVENTS" \
         --sweep-match-metric "$MATCHING_METRIC" --sweep-truth-min-hits 3 \

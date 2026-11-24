@@ -1,0 +1,86 @@
+graph_config:
+  only_hits: true
+  tracking: true
+  global: true
+  VTX: true
+  vector: true
+  # Always load and store the per-hit overlay label. When false, overlay hits
+  # are not remapped to noise; switch to true for overlay-aware training.
+  overlay: false
+
+custom_model_kwargs:
+  clust_space_norm: none
+
+selection:
+test_time_selection:
+
+new_variables:
+  hit_mask: ak.ones_like(hit_x)
+  part_mask: ak.ones_like(part_p)
+
+preprocess:
+  method: auto
+  data_fraction: 0.1
+
+inputs:
+  hits_features:
+    pad_mode: wrap
+    length: 25000
+    vars:
+      # Geometric measurements. Truth positions are deliberately excluded.
+      - [hit_x, null]
+      - [hit_y, null]
+      - [hit_z, null]
+      - [leftPosition_x, null]
+      - [leftPosition_y, null]
+      - [leftPosition_z, null]
+      - [rightPosition_x, null]
+      - [rightPosition_y, null]
+      - [rightPosition_z, null]
+      - [hit_type, null]
+      # Source columns for detector scalars. The graph builder replaces layer
+      # and superLayer with one cumulative global_layer before model input.
+      - [hit_time, null]
+      - [layer, null]
+      - [superLayer, null]
+      - [stereo, null]
+      - [cluster_count, null]
+
+  particle_features:
+    length: 25000
+    pad_mode: wrap
+    vars:
+      - [part_theta, null]
+      - [part_phi, null]
+      - [part_m, null]
+      - [part_pid, null]
+      - [part_id, null]
+      - [part_p, null]
+      - [part_p_t, null]
+      - [gen_status, null]
+      - [part_parent, null]
+      # Production vertex in EDM4hep length units (mm for this dataset).
+      # Keep these at the end: validation relies on the preceding indices.
+      - [part_vertex_x, null]
+      - [part_vertex_y, null]
+      - [part_vertex_z, null]
+
+  hits_labels:
+    length: 25000
+    pad_mode: wrap
+    vars:
+      - [hit_particle_index, null]
+
+  mask:
+    length: 25000
+    pad_mode: constant
+    vars:
+      - [hit_mask, null]
+      - [part_mask, null]
+      - [produced_by_secondary, null]
+      - [event_number, null]
+      - [file_number, null]
+      - [overlay, null]
+
+labels:
+observers:

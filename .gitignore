@@ -9,3 +9,4 @@ wandb/
 gun/
 tests/
 /model_training/CIRCE/build/
+data_creation/*.cc

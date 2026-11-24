@@ -78,3 +78,44 @@ Options: `-e` selects the event index (default 0); `--planar` and `--wire`
 override the collection names (defaults: `VTXBDigis VTXDDigis SiWrBDigis SiWrDDigis`
 and `DCH_DigiCollection`, as in `runTestTrackFinder.py`).
 
+
+## Fast FP32 export (`convert_to_onnx_fast.py`)
+
+Same input/output contract (`hits [N,7]` -> `output [N,9]`), built from
+`model_training/GATR_EXPERIMENT/src/models/onnx_export.py` (folded/fused
+linears, outer-product + GEMM geometric product and join, affine embedding, multi-query
+attention). Works for GATR_EXPERIMENT and GATR_CIRCE_LOSS checkpoints; uses
+the same conversion environment as above, nothing extra.
+
+```bash
+python convert_to_onnx_fast.py -w model.ckpt -o model_fast.onnx -i model_input_event0.csv
+python convert_to_onnx_fast.py -w model.ckpt -o model_mha.onnx --attention ort-mha
+python benchmark_onnx.py model_fp32full.onnx model_fast.onnx -i model_input_event0.csv --threads 4
+```
+
+| `--attention` | ONNX | notes |
+|---|---|---|
+| `blocked` (default) | standard | Loop over 256-row query blocks, every query sees all keys; bounded memory for large events |
+| `ort-mha` | ONNX Runtime only (`com.microsoft.MultiHeadAttention`) | run with `session.set_denormal_as_zero=1` |
+| `dense` | standard | plain MatMul/Softmax/MatMul |
+
+`blocked`/`dense` also add guards (|Q|,|K|,|V| < 1e-12 -> 0, logits floored
+at row max - 30) unless `--no-guards` is given. The converter prints the max
+difference to the checkpoint's float64 eager model (with the FP32 eager
+difference for scale) and the ONNX time per event, and writes a `.json`
+sidecar with the settings. `benchmark_onnx.py` times several models on the
+same events (`--flush-denormals` sets `session.set_denormal_as_zero=1`,
+`--profile` writes ONNX Runtime profiles).
+
+On the development machine (AMD EPYC 7302, 4 pinned threads, random-weight
+10/16/64 model, synthetic 4,000-hit event, shared and loaded host): current
+FP32 export 9.1 s, `blocked` ~3.6 s, `ort-mha` ~3.1-3.5 s (flush denormals
+on). About 2.2 s of this is the attention core itself (10 blocks x 8 heads x
+N^2). Exact rewrites behind it: the geometric product and join are an outer
+product + GEMM (a gathered sparse form was memory bound, ~1.7 s); wide
+equivariant linears use blade-sparse batched GEMMs (the 9 basis maps touch
+24 of 256 entries per 16x16 block, 1.5-2x faster than the dense fold); Q/K
+are no longer zero-padded to the value width (64 instead of 80 features in
+the score MatMul). Re-measure with a trained
+checkpoint and real events, and re-check efficiency/fake rate, before use;
+subnormal effects in particular depend on the trained weights.

@@ -19,7 +19,7 @@ def find_project_root(start_dir: Path) -> Path:
 
 def main():
 
-    TRAIN_OR_TEST = sys.argv[1]             # train or test
+    TRAIN_OR_TEST = sys.argv[1]             # train, val or test
     TYPE  = sys.argv[2]                     # noBackground, noBackground_parquet, noBackgroundDisplacement_parquet, background, background_parquet, loopers
     DETECTOR = sys.argv[3]                  # IDEA or CLD
     MINSEED = sys.argv[4]                   # min seed
@@ -29,6 +29,7 @@ def main():
     K4GEO_PATH = sys.argv[8]                # k4geo path to use
     K4FWCORE_PATH = sys.argv[9]             # k4fwcore path to use
     ACCOUNTING_GROUP = sys.argv[10]         # Condor accounting group
+    KEY4HEP_MODE = sys.argv[11] if len(sys.argv) > 11 else "spack"  # Key4hep stack: spack or lcg
 
 
     base_dir = find_project_root(Path(__file__).parent)
@@ -65,6 +66,7 @@ def main():
     print(f"  Max Seed: {MAXSEED}")
     print(f"  Output Directory: {OUTDIR}")
     print(f"  Key4hep Version: {KEY4HEP_VERSION}")
+    print(f"  Key4hep Mode: {KEY4HEP_MODE}")
 
     if type_normalized == "loopers":
 
@@ -81,8 +83,8 @@ def main():
         ])
 
     elif type_normalized in ("nobackground", "nobackground_parquet"):
-    
-        subprocess.run([
+
+        submit_cmd = [
             "python", f"{main_dir}/src/submit_jobs.py",
             "--mainDir", main_dir,
             "--queue", "testmatch",
@@ -92,7 +94,10 @@ def main():
             "--type", TRAIN_OR_TEST,
             "--key4hep_version", KEY4HEP_VERSION,
             "--accounting-group", ACCOUNTING_GROUP,
-        ])
+        ]
+        if OPTION == "noBackground_parquet":
+            submit_cmd += ["--key4hep_mode", KEY4HEP_MODE]
+        subprocess.run(submit_cmd)
 
     elif type_normalized in ("background", "background_parquet"):
 
